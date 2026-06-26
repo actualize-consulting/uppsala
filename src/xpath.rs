@@ -1068,7 +1068,7 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let mut nodes = left_val.as_node_set().to_vec();
             nodes.extend_from_slice(right_val.as_node_set());
             ctx.budget.charge(nodes.len())?;
-            Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
+            Ok(XPathValue::NodeSet(dedup_document_order(ctx.doc, nodes)))
         }
         Expr::Or(left, right) => {
             let l = evaluate_expr(left, ctx)?.to_boolean();
@@ -1252,7 +1252,7 @@ fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlRe
         }
         result.extend(step_nodes);
     }
-    Ok(dedup_document_order(result))
+    Ok(dedup_document_order(ctx.doc, result))
 }
 
 fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
@@ -1797,11 +1797,49 @@ fn collect_elements_with_id(
     Ok(())
 }
 
-/// Remove duplicate NodeIds and maintain document order.
-fn dedup_document_order(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
-    nodes.sort_by_key(|n| n.0);
+/// Remove duplicate NodeIds and return them in the document's current tree order.
+fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeId> {
+    nodes.sort_by_cached_key(|&node| document_order_key(doc, node));
     nodes.dedup();
     nodes
+}
+
+fn document_order_key(doc: &Document<'_>, node: NodeId) -> (u8, Vec<(u8, usize)>, usize) {
+    let mut path = Vec::new();
+    let mut current = node;
+
+    loop {
+        if current == doc.root() {
+            path.reverse();
+            return (0, path, node.index());
+        }
+
+        let Some(parent) = doc.parent(current) else {
+            return (1, Vec::new(), node.index());
+        };
+
+        if matches!(doc.node_kind(current), Some(NodeKind::Attribute(_, _))) {
+            let Some(index) = doc
+                .get_attribute_nodes(parent)
+                .iter()
+                .position(|&attr| attr == current)
+            else {
+                return (1, Vec::new(), node.index());
+            };
+            path.push((0, index));
+        } else {
+            let Some(index) = doc
+                .children(parent)
+                .iter()
+                .position(|&child| child == current)
+            else {
+                return (1, Vec::new(), node.index());
+            };
+            path.push((1, index));
+        }
+
+        current = parent;
+    }
 }
 
 #[cfg(test)]

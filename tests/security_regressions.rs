@@ -171,6 +171,33 @@ fn dom_mutation_rejects_invalid_and_cyclic_node_ids() {
 }
 
 #[test]
+fn xpath_node_sets_follow_mutated_document_order() {
+    // Arena allocation order is not necessarily document order after DOM
+    // mutation. XPath node-sets must follow the current tree links.
+    let mut doc = parse("<root><a/><b/><c/></root>").unwrap();
+    let root = doc.document_element().unwrap();
+    let children = doc.children(root);
+    let a = children[0];
+    let c = children[2];
+    doc.insert_before(root, c, a);
+
+    let eval = XPathEvaluator::new();
+    let nodes = eval.select_nodes(&doc, root, "*").unwrap();
+    let names: Vec<&str> = nodes
+        .iter()
+        .map(|&node| doc.element(node).unwrap().name.local_name.as_ref())
+        .collect();
+    assert_eq!(names, vec!["c", "a", "b"]);
+
+    let nodes = eval.select_nodes(&doc, root, "a | b | c").unwrap();
+    let names: Vec<&str> = nodes
+        .iter()
+        .map(|&node| doc.element(node).unwrap().name.local_name.as_ref())
+        .collect();
+    assert_eq!(names, vec!["c", "a", "b"]);
+}
+
+#[test]
 fn xpath_name_tests_are_namespace_aware() {
     // XPath prefixes are expression bindings, not document prefix text. This
     // verifies unprefixed tests match only no-namespace nodes and unbound
