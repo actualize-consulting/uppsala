@@ -94,11 +94,13 @@ impl XmlWriter {
     /// assert_eq!(w.into_string(), r#"<div class="main" id="content">Hello</div>"#);
     /// ```
     pub fn start_element(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         for &(key, val) in attrs {
+            let key = safe_xml_qname(key);
             self.buf.push(' ');
-            self.buf.push_str(key);
+            self.buf.push_str(&key);
             self.buf.push_str("=\"");
             write_escaped_attr_to_string(&mut self.buf, val);
             self.buf.push('"');
@@ -118,11 +120,13 @@ impl XmlWriter {
     /// assert_eq!(w.into_string(), "<br/>");
     /// ```
     pub fn empty_element(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         for &(key, val) in attrs {
+            let key = safe_xml_qname(key);
             self.buf.push(' ');
-            self.buf.push_str(key);
+            self.buf.push_str(&key);
             self.buf.push_str("=\"");
             write_escaped_attr_to_string(&mut self.buf, val);
             self.buf.push('"');
@@ -153,11 +157,13 @@ impl XmlWriter {
         K: AsRef<str>,
         V: AsRef<str>,
     {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         for (key, val) in attrs {
+            let key = safe_xml_qname(key.as_ref());
             self.buf.push(' ');
-            self.buf.push_str(key.as_ref());
+            self.buf.push_str(&key);
             self.buf.push_str("=\"");
             write_escaped_attr_to_string(&mut self.buf, val.as_ref());
             self.buf.push('"');
@@ -186,11 +192,13 @@ impl XmlWriter {
         K: AsRef<str>,
         V: AsRef<str>,
     {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         for (key, val) in attrs {
+            let key = safe_xml_qname(key.as_ref());
             self.buf.push(' ');
-            self.buf.push_str(key.as_ref());
+            self.buf.push_str(&key);
             self.buf.push_str("=\"");
             write_escaped_attr_to_string(&mut self.buf, val.as_ref());
             self.buf.push('"');
@@ -202,24 +210,27 @@ impl XmlWriter {
     ///
     /// This is the form required by W3C Canonical XML (C14N).
     pub fn empty_element_expanded(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         for &(key, val) in attrs {
+            let key = safe_xml_qname(key);
             self.buf.push(' ');
-            self.buf.push_str(key);
+            self.buf.push_str(&key);
             self.buf.push_str("=\"");
             write_escaped_attr_to_string(&mut self.buf, val);
             self.buf.push('"');
         }
         self.buf.push_str("></");
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         self.buf.push('>');
     }
 
     /// Close an element: `</name>`.
     pub fn end_element(&mut self, name: &str) {
+        let name = safe_xml_qname(name);
         self.buf.push_str("</");
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         self.buf.push('>');
     }
 
@@ -439,6 +450,54 @@ fn is_valid_xml_encoding(s: &str) -> bool {
         _ => return false,
     }
     bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Return a safe XML QName for structural markup names. Invalid names are
+/// replaced by `_` so programmatic name input cannot break out of tag or
+/// attribute-name position and smuggle markup into serialized output.
+pub(crate) fn safe_xml_qname(s: &str) -> Cow<'_, str> {
+    if is_valid_xml_qname(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
+    }
+}
+
+/// Return a safe XML NCName for namespace declaration prefixes.
+pub(crate) fn safe_xml_ncname(s: &str) -> Cow<'_, str> {
+    if is_valid_xml_ncname(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
+    }
+}
+
+pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return is_valid_xml_ncname(first);
+    };
+    parts.next().is_none() && is_valid_xml_ncname(first) && is_valid_xml_ncname(second)
+}
+
+pub(crate) fn is_valid_xml_ncname(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if is_xml_name_start_byte(b) => {}
+        _ => return false,
+    }
+    bytes.all(is_xml_name_char_byte)
+}
+
+fn is_xml_name_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_xml_name_char_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
 
 // ─── Internal escaping helpers (write directly to String, no allocation) ───

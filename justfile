@@ -22,6 +22,10 @@ test-ns:
 test-xpath:
     cargo test --test xpath_conformance
 
+# Run XPath 2.0 focused conformance tests
+test-xpath2:
+    cargo test --test xpath2_conformance
+
 # Run XSD conformance tests (38 tests)
 test-xsd:
     cargo test --test xsd_conformance

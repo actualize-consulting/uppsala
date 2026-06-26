@@ -16,6 +16,7 @@
 //! - Operators: `=`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `+`, `-`, `*`,
 //!   `div`, `mod`, `|`
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::dom::{Document, NodeId, NodeKind};
@@ -133,6 +134,8 @@ pub struct XPathEvaluator {
     /// Maximum expression-nesting depth enforced by the parser. Defaults
     /// to [`DEFAULT_MAX_XPATH_DEPTH`]; override via [`Self::with_max_depth`].
     max_depth: u32,
+    /// Maximum number of axis/predicate node visits per evaluation.
+    max_node_visits: usize,
 }
 
 impl XPathEvaluator {
@@ -142,6 +145,7 @@ impl XPathEvaluator {
         XPathEvaluator {
             namespaces: HashMap::new(),
             max_depth: DEFAULT_MAX_XPATH_DEPTH,
+            max_node_visits: DEFAULT_MAX_XPATH_NODE_VISITS,
         }
     }
 
@@ -157,6 +161,13 @@ impl XPathEvaluator {
         self
     }
 
+    /// Override the maximum number of axis/predicate node visits permitted
+    /// during one evaluation.
+    pub fn with_max_node_visits(mut self, max_node_visits: usize) -> Self {
+        self.max_node_visits = max_node_visits;
+        self
+    }
+
     /// Evaluate an XPath expression from the given context node.
     pub fn evaluate(
         &self,
@@ -167,12 +178,14 @@ impl XPathEvaluator {
         let tokens = tokenize(expr)?;
         let mut parser = XPathParser::new(&tokens, self.max_depth);
         let ast = parser.parse_expr()?;
+        let budget = EvalBudget::new(self.max_node_visits);
         let ctx = EvalContext {
             node: context,
             position: 1,
             size: 1,
             doc,
             namespaces: &self.namespaces,
+            budget: &budget,
         };
         evaluate_expr(&ast, &ctx)
     }
@@ -533,6 +546,12 @@ enum NodeTest {
 /// exceeds 5-10 nesting levels). Override via
 /// [`XPathEvaluator::with_max_depth`].
 pub const DEFAULT_MAX_XPATH_DEPTH: u32 = 32;
+
+/// Default maximum axis/predicate node visits in one XPath evaluation.
+///
+/// The cap bounds hostile expressions such as repeated descendant/following
+/// axes over large DOMs while leaving ordinary document queries unaffected.
+pub const DEFAULT_MAX_XPATH_NODE_VISITS: usize = 100_000;
 
 struct XPathParser<'a> {
     tokens: &'a [Token],
@@ -987,6 +1006,31 @@ struct EvalContext<'a, 'b> {
     size: usize,
     doc: &'a Document<'b>,
     namespaces: &'a HashMap<String, String>,
+    budget: &'a EvalBudget,
+}
+
+struct EvalBudget {
+    remaining: Cell<usize>,
+}
+
+impl EvalBudget {
+    fn new(max_visits: usize) -> Self {
+        Self {
+            remaining: Cell::new(max_visits),
+        }
+    }
+
+    fn charge(&self, amount: usize) -> XmlResult<()> {
+        let remaining = self.remaining.get();
+        if amount > remaining {
+            return Err(XmlError::xpath(format!(
+                "XPath evaluation exceeded maximum node visit budget of {}",
+                remaining + amount
+            )));
+        }
+        self.remaining.set(remaining - amount);
+        Ok(())
+    }
 }
 
 fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
@@ -995,6 +1039,7 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let mut nodes = vec![ctx.node];
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
+                nodes = dedup_document_order(nodes);
             }
             Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
         }
@@ -1007,6 +1052,7 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let mut nodes = vec![root];
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
+                nodes = dedup_document_order(nodes);
             }
             Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
         }
@@ -1015,6 +1061,7 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let right_val = evaluate_expr(right, ctx)?;
             let mut nodes = left_val.as_node_set().to_vec();
             nodes.extend_from_slice(right_val.as_node_set());
+            ctx.budget.charge(nodes.len())?;
             Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
         }
         Expr::Or(left, right) => {
@@ -1157,18 +1204,20 @@ fn xpath_equal(left: &XPathValue, right: &XPathValue, doc: &Document<'_>) -> boo
 fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
     let mut result = Vec::new();
     for &node in context_nodes {
-        let axis_nodes = select_axis(&step.axis, node, ctx.doc);
+        let axis_nodes = select_axis(&step.axis, node, ctx)?;
         for &candidate in &axis_nodes {
             if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
                 result.push(candidate);
             }
         }
     }
+    ctx.budget.charge(result.len())?;
     // Apply predicates
     for pred in &step.predicates {
         result = apply_predicate(pred, &result, ctx)?;
+        result = dedup_document_order(result);
     }
-    Ok(result)
+    Ok(dedup_document_order(result))
 }
 
 fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
@@ -1181,6 +1230,7 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
             size,
             doc: ctx.doc,
             namespaces: ctx.namespaces,
+            budget: ctx.budget,
         };
         let val = evaluate_expr(pred, &pred_ctx)?;
         let keep = match &val {
@@ -1191,58 +1241,107 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
             result.push(node);
         }
     }
+    ctx.budget.charge(nodes.len() + result.len())?;
     Ok(result)
 }
 
-fn select_axis(axis: &Axis, node: NodeId, doc: &Document<'_>) -> Vec<NodeId> {
+fn select_axis(axis: &Axis, node: NodeId, ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
+    let doc = ctx.doc;
     match axis {
-        Axis::Child => doc.children(node),
-        Axis::Descendant => doc.descendants(node),
-        Axis::Parent => doc.parent(node).into_iter().collect(),
-        Axis::Ancestor => doc.ancestors(node),
-        Axis::Self_ => vec![node],
+        Axis::Child => {
+            let nodes = doc.children(node);
+            ctx.budget.charge(nodes.len())?;
+            Ok(nodes)
+        }
+        Axis::Descendant => collect_descendants(doc, node, false, ctx.budget),
+        Axis::Parent => {
+            let nodes: Vec<_> = doc.parent(node).into_iter().collect();
+            ctx.budget.charge(nodes.len())?;
+            Ok(nodes)
+        }
+        Axis::Ancestor => {
+            let nodes = doc.ancestors(node);
+            ctx.budget.charge(nodes.len())?;
+            Ok(nodes)
+        }
+        Axis::Self_ => {
+            ctx.budget.charge(1)?;
+            Ok(vec![node])
+        }
         Axis::DescendantOrSelf => {
             let mut result = vec![node];
-            result.extend(doc.descendants(node));
-            result
+            ctx.budget.charge(1)?;
+            result.extend(collect_descendants(doc, node, false, ctx.budget)?);
+            Ok(result)
         }
         Axis::AncestorOrSelf => {
             let mut result = vec![node];
             result.extend(doc.ancestors(node));
-            result
+            ctx.budget.charge(result.len())?;
+            Ok(result)
         }
         Axis::FollowingSibling => {
             let mut result = Vec::new();
             let mut current = doc.next_sibling(node);
             while let Some(sib) = current {
+                ctx.budget.charge(1)?;
                 result.push(sib);
                 current = doc.next_sibling(sib);
             }
-            result
+            Ok(result)
         }
         Axis::PrecedingSibling => {
             let mut result = Vec::new();
             let mut current = doc.previous_sibling(node);
             while let Some(sib) = current {
+                ctx.budget.charge(1)?;
                 result.push(sib);
                 current = doc.previous_sibling(sib);
             }
-            result
+            Ok(result)
         }
-        Axis::Following => collect_following(doc, node),
-        Axis::Preceding => collect_preceding(doc, node),
-        Axis::Attribute => doc.get_attribute_nodes(node).to_vec(),
-        Axis::Namespace => Vec::new(),
+        Axis::Following => collect_following(doc, node, ctx.budget),
+        Axis::Preceding => collect_preceding(doc, node, ctx.budget),
+        Axis::Attribute => {
+            let nodes = doc.get_attribute_nodes(node).to_vec();
+            ctx.budget.charge(nodes.len())?;
+            Ok(nodes)
+        }
+        Axis::Namespace => Ok(Vec::new()),
     }
 }
 
-fn collect_following(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
+fn collect_descendants(
+    doc: &Document<'_>,
+    node: NodeId,
+    include_self: bool,
+    budget: &EvalBudget,
+) -> XmlResult<Vec<NodeId>> {
+    let mut result = Vec::new();
+    if include_self {
+        budget.charge(1)?;
+        result.push(node);
+    }
+    for child in doc.children(node) {
+        budget.charge(1)?;
+        result.push(child);
+        result.extend(collect_descendants(doc, child, false, budget)?);
+    }
+    Ok(result)
+}
+
+fn collect_following(
+    doc: &Document<'_>,
+    node: NodeId,
+    budget: &EvalBudget,
+) -> XmlResult<Vec<NodeId>> {
     let mut result = Vec::new();
     let mut current = node;
     loop {
         if let Some(next) = doc.next_sibling(current) {
+            budget.charge(1)?;
             result.push(next);
-            result.extend(doc.descendants(next));
+            result.extend(collect_descendants(doc, next, false, budget)?);
             current = next;
             continue;
         }
@@ -1252,18 +1351,23 @@ fn collect_following(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
             break;
         }
     }
-    result
+    Ok(result)
 }
 
-fn collect_preceding(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
+fn collect_preceding(
+    doc: &Document<'_>,
+    node: NodeId,
+    budget: &EvalBudget,
+) -> XmlResult<Vec<NodeId>> {
     let mut result = Vec::new();
     let mut current = node;
     loop {
         if let Some(prev) = doc.previous_sibling(current) {
-            let descs = doc.descendants(prev);
+            let descs = collect_descendants(doc, prev, false, budget)?;
             for d in descs.into_iter().rev() {
                 result.push(d);
             }
+            budget.charge(1)?;
             result.push(prev);
             current = prev;
             continue;
@@ -1278,7 +1382,7 @@ fn collect_preceding(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
             break;
         }
     }
-    result
+    Ok(result)
 }
 
 fn matches_node_test(
@@ -1293,8 +1397,12 @@ fn matches_node_test(
             Some(NodeKind::Element(_)) | Some(NodeKind::Attribute(_, _))
         ),
         NodeTest::Name(name) => match doc.node_kind(node) {
-            Some(NodeKind::Element(e)) => *e.name.local_name == *name,
-            Some(NodeKind::Attribute(qn, _)) => *qn.local_name == *name,
+            Some(NodeKind::Element(e)) => {
+                *e.name.local_name == *name && e.name.namespace_uri.is_none()
+            }
+            Some(NodeKind::Attribute(qn, _)) => {
+                *qn.local_name == *name && qn.namespace_uri.is_none()
+            }
             _ => false,
         },
         NodeTest::PrefixedName(prefix, local) => match doc.node_kind(node) {
@@ -1303,8 +1411,7 @@ fn matches_node_test(
                     *e.name.local_name == *local
                         && e.name.namespace_uri.as_deref() == Some(expected_ns.as_str())
                 } else {
-                    e.name.prefix.as_deref() == Some(prefix.as_str())
-                        && *e.name.local_name == *local
+                    false
                 }
             }
             Some(NodeKind::Attribute(qn, _)) => {
@@ -1312,7 +1419,7 @@ fn matches_node_test(
                     *qn.local_name == *local
                         && qn.namespace_uri.as_deref() == Some(expected_ns.as_str())
                 } else {
-                    qn.prefix.as_deref() == Some(prefix.as_str()) && *qn.local_name == *local
+                    false
                 }
             }
             _ => false,
@@ -1322,14 +1429,14 @@ fn matches_node_test(
                 if let Some(expected_ns) = namespaces.get(prefix) {
                     e.name.namespace_uri.as_deref() == Some(expected_ns.as_str())
                 } else {
-                    e.name.prefix.as_deref() == Some(prefix.as_str())
+                    false
                 }
             }
             Some(NodeKind::Attribute(qn, _)) => {
                 if let Some(expected_ns) = namespaces.get(prefix) {
                     qn.namespace_uri.as_deref() == Some(expected_ns.as_str())
                 } else {
-                    qn.prefix.as_deref() == Some(prefix.as_str())
+                    false
                 }
             }
             _ => false,

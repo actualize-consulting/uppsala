@@ -411,13 +411,22 @@ pub(crate) fn is_valid_date(s: &str) -> bool {
 /// are allowed. MS tests: time016/017/018 — reject invalid ranges.
 pub(crate) fn is_valid_time(s: &str) -> bool {
     // hh:mm:ss[.sss][Z|(+|-)hh:mm]
-    let s = strip_time_timezone(s);
+    let Some(s) = strip_time_timezone(s) else {
+        return false;
+    };
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() < 3 {
+    if parts.len() != 3 {
         return false;
     }
     // Allow seconds with fractional part
     let seconds_parts: Vec<&str> = parts[2].split('.').collect();
+    if seconds_parts.len() > 2
+        || (seconds_parts.len() == 2
+            && (seconds_parts[1].is_empty()
+                || !seconds_parts[1].chars().all(|c| c.is_ascii_digit())))
+    {
+        return false;
+    }
     if parts[0].len() != 2
         || parts[1].len() != 2
         || seconds_parts[0].len() != 2
@@ -441,28 +450,36 @@ pub(crate) fn is_valid_time(s: &str) -> bool {
     };
     // 24:00:00 is allowed as midnight end-of-day, but nothing else with hour=24
     if hours == 24 {
-        return minutes == 0 && seconds == 0;
+        let fractional_zero = seconds_parts
+            .get(1)
+            .is_none_or(|fraction| fraction.chars().all(|c| c == '0'));
+        return minutes == 0 && seconds == 0 && fractional_zero;
     }
     hours <= 23 && minutes <= 59 && seconds <= 59
 }
 
 /// Strip timezone from a time-only string (hh:mm:ss[.sss][Z|(+|-)hh:mm]).
 ///
-/// Returns the time string without any timezone suffix.
-fn strip_time_timezone(s: &str) -> &str {
+/// Returns the time string without any timezone suffix, or `None` if a suffix
+/// is present but malformed.
+fn strip_time_timezone(s: &str) -> Option<&str> {
     if let Some(stripped) = s.strip_suffix('Z') {
-        return stripped;
+        return Some(stripped);
     }
     // Look for timezone offset: +hh:mm or -hh:mm at the end
     // A timezone offset has the form [+-]dd:dd at the end (6 chars)
     if s.len() >= 6 {
         let tz_start = s.len() - 6;
-        let c = s.as_bytes()[tz_start];
-        if (c == b'+' || c == b'-') && s.as_bytes()[tz_start + 3] == b':' {
-            return &s[..tz_start];
+        let tz = &s[tz_start..];
+        let b = tz.as_bytes();
+        if b[0] == b'+' || b[0] == b'-' {
+            if !valid_timezone_offset(tz) {
+                return None;
+            }
+            return Some(&s[..tz_start]);
         }
     }
-    s
+    Some(s)
 }
 
 /// Strip timezone suffix from date strings.
@@ -489,4 +506,29 @@ pub(crate) fn strip_timezone(s: &str) -> &str {
         }
     }
     s
+}
+
+fn valid_timezone_offset(tz: &str) -> bool {
+    let b = tz.as_bytes();
+    if b.len() != 6
+        || !(b[0] == b'+' || b[0] == b'-')
+        || !b[1].is_ascii_digit()
+        || !b[2].is_ascii_digit()
+        || b[3] != b':'
+        || !b[4].is_ascii_digit()
+        || !b[5].is_ascii_digit()
+    {
+        return false;
+    }
+
+    let hour = match tz[1..3].parse::<u32>() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let minute = match tz[4..6].parse::<u32>() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    hour < 14 && minute <= 59 || hour == 14 && minute == 0
 }

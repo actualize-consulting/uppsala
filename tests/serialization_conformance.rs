@@ -136,34 +136,40 @@ fn roundtrip_attr_with_lt() {
     assert_eq!(doc.to_xml(), xml);
 }
 
-// ─── DOCTYPE preservation ───────────────────────────────────────────────────
+// ─── DOCTYPE handling ───────────────────────────────────────────────────────
 
 #[test]
-fn doctype_preserved_system() {
+fn doctype_omitted_by_default_system() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE root SYSTEM "root.dtd"><root/>"#;
     let doc = uppsala::parse(xml).unwrap();
     assert_eq!(
         doc.doctype.as_deref(),
         Some(r#"<!DOCTYPE root SYSTEM "root.dtd">"#)
     );
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), r#"<?xml version="1.0"?><root/>"#);
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]
-fn doctype_preserved_public() {
+fn doctype_omitted_by_default_public() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html/>"#;
     let doc = uppsala::parse(xml).unwrap();
     assert!(doc.doctype.is_some());
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), r#"<?xml version="1.0"?><html/>"#);
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]
-fn doctype_preserved_internal_subset() {
+fn doctype_omitted_by_default_internal_subset() {
     let xml =
         "<?xml version=\"1.0\"?><!DOCTYPE root [\n<!ELEMENT root (#PCDATA)>\n]><root>hello</root>";
     let doc = uppsala::parse(xml).unwrap();
     assert!(doc.doctype.is_some());
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), "<?xml version=\"1.0\"?><root>hello</root>");
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]

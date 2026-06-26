@@ -1,0 +1,261 @@
+//! Focused integration tests for the initial XPath 2.0 implementation.
+
+use std::borrow::Cow;
+
+use uppsala::xpath2::lexer::{tokenize, TokenKind};
+use uppsala::{parse, XPath2AtomicValue, XPath2Evaluator, XPath2Resolver, XPath2Value, XmlResult};
+
+fn eval(expression: &str) -> XPath2Value {
+    let doc = parse("<root/>").unwrap();
+    XPath2Evaluator::new()
+        .evaluate(&doc, doc.root(), expression)
+        .unwrap()
+}
+
+fn atom_strings(value: &XPath2Value) -> Vec<String> {
+    value
+        .items()
+        .iter()
+        .map(|item| match item {
+            uppsala::XPath2Item::Atomic(value) => value.to_xpath_string(),
+            uppsala::XPath2Item::Node(node) => format!("node:{}", node.index()),
+        })
+        .collect()
+}
+
+#[test]
+fn lexer_borrows_unescaped_string_literals() {
+    let tokens = tokenize("\"alpha\"").unwrap();
+    match &tokens[0].kind {
+        TokenKind::StringLiteral(Cow::Borrowed(value)) => assert_eq!(*value, "alpha"),
+        other => panic!("expected borrowed string literal, got {other:?}"),
+    }
+}
+
+#[test]
+fn lexer_unescapes_doubled_quotes() {
+    let tokens = tokenize("\"a \"\"quote\"\"\"").unwrap();
+    match &tokens[0].kind {
+        TokenKind::StringLiteral(Cow::Owned(value)) => assert_eq!(value, "a \"quote\""),
+        other => panic!("expected owned string literal, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluates_empty_sequence_and_sequence_constructor() {
+    assert!(eval("()").is_empty());
+    assert_eq!(atom_strings(&eval("(1, 2, 3)")), ["1", "2", "3"]);
+}
+
+#[test]
+fn evaluates_range_and_arithmetic() {
+    assert_eq!(atom_strings(&eval("1 to 4")), ["1", "2", "3", "4"]);
+    assert_eq!(atom_strings(&eval("1 + 2 * 3")), ["7"]);
+    assert_eq!(atom_strings(&eval("7 idiv 2")), ["3"]);
+}
+
+#[test]
+fn evaluates_for_if_and_quantified_expressions() {
+    assert_eq!(
+        atom_strings(&eval("for $x in 1 to 3 return $x * 2")),
+        ["2", "4", "6"]
+    );
+    assert_eq!(atom_strings(&eval("if (false()) then 1 else 2")), ["2"]);
+    assert_eq!(
+        atom_strings(&eval("some $x in 1 to 3 satisfies $x eq 2")),
+        ["true"]
+    );
+    assert_eq!(
+        atom_strings(&eval("every $x in 1 to 3 satisfies $x lt 4")),
+        ["true"]
+    );
+}
+
+#[test]
+fn evaluates_path_navigation_and_predicates() {
+    let xml = r#"
+        <library>
+            <book category="fiction"><title>Dune</title></book>
+            <book category="science"><title>Cosmos</title></book>
+        </library>
+    "#;
+    let mut doc = parse(xml).unwrap();
+    doc.prepare_xpath();
+    let eval = XPath2Evaluator::new();
+    let nodes = eval
+        .select_nodes(&doc, doc.root(), "//book[@category = 'fiction']/title")
+        .unwrap();
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.text_content_deep(nodes[0]), "Dune");
+}
+
+#[test]
+fn evaluates_predicates_per_path_context_node() {
+    let xml = r#"
+        <root>
+            <section><item>A1</item><item>A2</item></section>
+            <section><item>B1</item><item>B2</item></section>
+        </root>
+    "#;
+    let doc = parse(xml).unwrap();
+    let eval = XPath2Evaluator::new();
+    let nodes = eval
+        .select_nodes(&doc, doc.root(), "//section/item[1]")
+        .unwrap();
+    let text: Vec<String> = nodes
+        .iter()
+        .map(|node| doc.text_content_deep(*node))
+        .collect();
+
+    assert_eq!(text, ["A1", "B1"]);
+}
+
+#[test]
+fn evaluates_node_set_intersect_and_except() {
+    let xml = r#"
+        <root>
+            <item id="a"/>
+            <item id="b" skip="yes"/>
+            <item id="c"/>
+        </root>
+    "#;
+    let mut doc = parse(xml).unwrap();
+    doc.prepare_xpath();
+    let eval = XPath2Evaluator::new();
+
+    let intersect = eval
+        .select_nodes(&doc, doc.root(), "//item intersect //*[@id = 'b']")
+        .unwrap();
+    assert_eq!(intersect.len(), 1);
+    assert_eq!(doc.get_attribute(intersect[0], "id"), Some("b"));
+
+    let except = eval
+        .select_nodes(&doc, doc.root(), "//item except //item[@skip = 'yes']")
+        .unwrap();
+    let ids: Vec<&str> = except
+        .iter()
+        .map(|node| doc.get_attribute(*node, "id").unwrap())
+        .collect();
+    assert_eq!(ids, ["a", "c"]);
+}
+
+#[test]
+fn allows_operator_words_as_path_step_names_after_separators() {
+    let doc = parse("<root><intersect/><except/><union/></root>").unwrap();
+    let eval = XPath2Evaluator::new();
+
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "/root/intersect")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "/root/except")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "/root/union")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn evaluates_additional_axes() {
+    let xml = r#"
+        <root>
+            <a/>
+            <b><c/><d/></b>
+            <e/>
+        </root>
+    "#;
+    let doc = parse(xml).unwrap();
+    let eval = XPath2Evaluator::new();
+    let d = eval.select_nodes(&doc, doc.root(), "//d").unwrap()[0];
+    let c = eval.select_nodes(&doc, doc.root(), "//c").unwrap()[0];
+
+    assert_eq!(
+        eval.select_nodes(&doc, d, "preceding-sibling::*")
+            .unwrap()
+            .len(),
+        1
+    );
+    let following_sibling = eval.select_nodes(&doc, c, "following-sibling::*").unwrap()[0];
+    assert_eq!(
+        doc.element(following_sibling)
+            .unwrap()
+            .name
+            .local_name
+            .as_ref(),
+        "d"
+    );
+    assert_eq!(
+        eval.select_nodes(&doc, d, "ancestor::root").unwrap().len(),
+        1
+    );
+    assert_eq!(eval.select_nodes(&doc, c, "following::e").unwrap().len(), 1);
+    assert_eq!(eval.select_nodes(&doc, d, "preceding::a").unwrap().len(), 1);
+}
+
+#[test]
+fn evaluates_prefix_and_local_wildcards() {
+    let xml = r#"
+        <root xmlns:ns="urn:a" xmlns:other="urn:b">
+            <ns:target/>
+            <other:target/>
+            <ns:other/>
+        </root>
+    "#;
+    let doc = parse(xml).unwrap();
+    let eval = XPath2Evaluator::new();
+
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "//ns:*").unwrap().len(),
+        2
+    );
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "//*:target")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn evaluates_ebv_and_core_sequence_functions() {
+    assert_eq!(atom_strings(&eval("exists(1 to 2)")), ["true"]);
+    assert_eq!(atom_strings(&eval("empty(())")), ["true"]);
+    assert_eq!(atom_strings(&eval("count(1 to 3)")), ["3"]);
+    assert_eq!(atom_strings(&eval("not(())")), ["true"]);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryResolver;
+
+impl XPath2Resolver for MemoryResolver {
+    fn resolve_doc(&self, uri: &str) -> XmlResult<Option<XPath2Value>> {
+        if uri == "urn:test" {
+            Ok(Some(XPath2Value::atomic(XPath2AtomicValue::String(
+                "resolved".to_string(),
+            ))))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[test]
+fn resolver_backed_doc_function_has_no_default_access() {
+    let doc = parse("<root/>").unwrap();
+    let eval = XPath2Evaluator::new();
+    assert!(eval.evaluate(&doc, doc.root(), "doc('urn:test')").is_err());
+
+    let eval = eval.with_resolver(MemoryResolver);
+    let value = eval.evaluate(&doc, doc.root(), "doc('urn:test')").unwrap();
+    assert_eq!(atom_strings(&value), ["resolved"]);
+}

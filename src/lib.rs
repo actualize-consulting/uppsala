@@ -7,6 +7,7 @@
 //! - **Namespaces in XML 1.0 (Third Edition)** with prefix resolution and scoping
 //! - **Arena-based DOM** with tree mutation (insert, remove, replace nodes)
 //! - **XPath 1.0** evaluation (all axes, core functions, predicates)
+//! - **XPath 2.0** evaluation (initial XDM, expression, and path support)
 //! - **XML Schema (XSD) 1.1** validation (structures + datatypes)
 //! - **XSD regex engine** for pattern facets (custom NFA matcher)
 //! - **Serialization** with round-trip fidelity, pretty-printing, and streaming output
@@ -90,6 +91,8 @@ mod simd;
 pub mod writer;
 /// XPath 1.0 evaluation engine.
 pub mod xpath;
+/// XPath 2.0 evaluation engine.
+pub mod xpath2;
 /// XML Schema (XSD) validation.
 pub mod xsd;
 /// XSD regular expression engine for pattern facets.
@@ -107,6 +110,10 @@ pub use namespace::NamespaceResolver;
 pub use parser::Parser;
 pub use writer::XmlWriter;
 pub use xpath::{XPathEvaluator, XPathValue};
+pub use xpath2::{
+    NoopXPath2Resolver, XPath2AtomicValue, XPath2Evaluator, XPath2Item, XPath2Options,
+    XPath2Resolver, XPath2Value,
+};
 pub use xsd::{XsdValidator, XSI_NAMESPACE, XS_NAMESPACE};
 pub use xsd_regex::XsdRegex;
 

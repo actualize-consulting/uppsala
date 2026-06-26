@@ -2391,6 +2391,16 @@ fn parse_element<'a>(
         } else {
             QName::local(attr_name)
         };
+        if resolved_attrs.iter().any(|existing: &Attribute<'a>| {
+            existing.name.local_name == a_qname.local_name
+                && existing.name.namespace_uri.as_deref() == a_qname.namespace_uri.as_deref()
+        }) {
+            return Err(XmlError::well_formedness(
+                format!("Duplicate attribute: {}", a_qname),
+                cursor.line(),
+                cursor.column(),
+            ));
+        }
         resolved_attrs.push(Attribute {
             name: a_qname,
             value: attr_value,

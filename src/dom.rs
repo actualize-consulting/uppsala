@@ -665,9 +665,14 @@ impl<'a> Document<'a> {
     pub fn children(&self, id: NodeId) -> Vec<NodeId> {
         let mut result = Vec::new();
         let mut current = self.nodes.get(id.0).and_then(|n| n.first_child);
+        let mut steps = 0usize;
         while let Some(child_id) = current {
+            if child_id.0 >= self.nodes.len() || steps >= self.nodes.len() {
+                break;
+            }
             result.push(child_id);
             current = self.nodes.get(child_id.0).and_then(|n| n.next_sibling);
+            steps += 1;
         }
         result
     }
@@ -925,6 +930,9 @@ impl<'a> Document<'a> {
 
     /// Append a child node to a parent. Detaches the child from any previous parent.
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        if !self.can_reparent(parent, child) {
+            return;
+        }
         // Detach from old parent first
         self.detach(child);
         self.append_child_unchecked(parent, child);
@@ -934,6 +942,9 @@ impl<'a> Document<'a> {
     /// The child must have no parent, no siblings. Used during parsing for speed.
     #[inline]
     pub(crate) fn append_child_unchecked(&mut self, parent: NodeId, child: NodeId) {
+        debug_assert!(self.valid_node_id(parent));
+        debug_assert!(self.valid_node_id(child));
+        debug_assert!(!self.is_ancestor_of(child, parent));
         // Set new parent
         self.nodes[child.0].parent = Some(parent);
         // Link into parent's child list
@@ -952,6 +963,12 @@ impl<'a> Document<'a> {
 
     /// Insert a child before a reference node. Both must share the same parent.
     pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, reference: NodeId) {
+        if new_child == reference
+            || !self.can_reparent(parent, new_child)
+            || self.parent(reference) != Some(parent)
+        {
+            return;
+        }
         self.detach(new_child);
         if let Some(node) = self.nodes.get_mut(new_child.0) {
             node.parent = Some(parent);
@@ -979,6 +996,12 @@ impl<'a> Document<'a> {
 
     /// Insert a child after a reference node.
     pub fn insert_after(&mut self, parent: NodeId, new_child: NodeId, reference: NodeId) {
+        if new_child == reference
+            || !self.can_reparent(parent, new_child)
+            || self.parent(reference) != Some(parent)
+        {
+            return;
+        }
         self.detach(new_child);
         if let Some(node) = self.nodes.get_mut(new_child.0) {
             node.parent = Some(parent);
@@ -1004,12 +1027,21 @@ impl<'a> Document<'a> {
     }
 
     /// Remove a child from its parent. The node remains in the arena but is detached.
-    pub fn remove_child(&mut self, _parent: NodeId, child: NodeId) {
+    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        if self.parent(child) != Some(parent) {
+            return;
+        }
         self.detach(child);
     }
 
     /// Replace an old child with a new child under the given parent.
     pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
+        if new_child == old_child
+            || !self.can_reparent(parent, new_child)
+            || self.parent(old_child) != Some(parent)
+        {
+            return;
+        }
         self.detach(new_child);
         let prev = self.nodes.get(old_child.0).and_then(|n| n.prev_sibling);
         let next = self.nodes.get(old_child.0).and_then(|n| n.next_sibling);
@@ -1076,6 +1108,33 @@ impl<'a> Document<'a> {
                 node.next_sibling = None;
             }
         }
+    }
+
+    fn valid_node_id(&self, id: NodeId) -> bool {
+        id.0 < self.nodes.len()
+    }
+
+    fn can_reparent(&self, parent: NodeId, child: NodeId) -> bool {
+        self.valid_node_id(parent)
+            && self.valid_node_id(child)
+            && parent != child
+            && !self.is_ancestor_of(child, parent)
+    }
+
+    fn is_ancestor_of(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
+        let mut current = Some(node);
+        let mut steps = 0usize;
+        while let Some(id) = current {
+            if id == maybe_ancestor {
+                return true;
+            }
+            if steps >= self.nodes.len() {
+                return true;
+            }
+            current = self.nodes.get(id.0).and_then(|n| n.parent);
+            steps += 1;
+        }
+        false
     }
 
     // ─── Navigation helpers ───
@@ -1196,8 +1255,10 @@ impl<'a> Document<'a> {
             }
             out.write_str("?>")?;
         }
-        if let Some(dt) = &self.doctype {
-            out.write_str(dt)?;
+        if opts.include_doctype {
+            if let Some(dt) = &self.doctype {
+                out.write_str(dt)?;
+            }
         }
         for child in self.children(self.root) {
             self.write_node_to(child, out, opts, 0, opts.indent.is_some())?;
@@ -1223,15 +1284,17 @@ impl<'a> Document<'a> {
                     write_indent(out, opts, depth)?;
                 }
                 out.write_char('<')?;
-                let pname = elem.name.prefixed_name();
+                let raw_pname = elem.name.prefixed_name();
+                let pname = crate::writer::safe_xml_qname(&raw_pname);
                 out.write_str(&pname)?;
                 // Namespace declarations
                 for (prefix, uri) in &elem.namespace_declarations {
                     if prefix.is_empty() {
                         out.write_str(" xmlns=\"")?;
                     } else {
+                        let prefix = crate::writer::safe_xml_ncname(prefix);
                         out.write_str(" xmlns:")?;
-                        out.write_str(prefix)?;
+                        out.write_str(&prefix)?;
                         out.write_str("=\"")?;
                     }
                     write_escaped_attr(out, uri)?;
@@ -1240,7 +1303,8 @@ impl<'a> Document<'a> {
                 // Attributes
                 for attr in &elem.attributes {
                     out.write_char(' ')?;
-                    let aname = attr.name.prefixed_name();
+                    let raw_aname = attr.name.prefixed_name();
+                    let aname = crate::writer::safe_xml_qname(&raw_aname);
                     out.write_str(&aname)?;
                     out.write_str("=\"")?;
                     write_escaped_attr(out, &attr.value)?;
@@ -1366,6 +1430,12 @@ pub struct XmlWriteOptions {
     /// Use `<foo></foo>` instead of `<foo/>` for empty elements.
     /// Required for W3C Canonical XML (C14N).
     pub expand_empty_elements: bool,
+    /// Include the raw DOCTYPE declaration when serializing.
+    ///
+    /// Disabled by default so parsed DTDs are not handed to downstream XML
+    /// processors unless the caller deliberately opts into trusted DTD
+    /// round-tripping.
+    pub include_doctype: bool,
 }
 
 impl XmlWriteOptions {
@@ -1374,6 +1444,7 @@ impl XmlWriteOptions {
         XmlWriteOptions {
             indent: None,
             expand_empty_elements: false,
+            include_doctype: false,
         }
     }
 
@@ -1382,12 +1453,19 @@ impl XmlWriteOptions {
         XmlWriteOptions {
             indent: Some(indent.into()),
             expand_empty_elements: false,
+            include_doctype: false,
         }
     }
 
     /// Set whether empty elements use expanded form (`<foo></foo>`).
     pub fn with_expand_empty_elements(mut self, expand: bool) -> Self {
         self.expand_empty_elements = expand;
+        self
+    }
+
+    /// Set whether the parsed raw DOCTYPE declaration is serialized.
+    pub fn with_doctype(mut self, include: bool) -> Self {
+        self.include_doctype = include;
         self
     }
 }
