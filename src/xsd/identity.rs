@@ -5,7 +5,7 @@
 //! `.//` descendant selectors, composite (multi-field) keys, QName
 //! namespace-aware value comparison, and decimal normalization.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
@@ -271,6 +271,11 @@ fn idc_select_nodes(
     namespaces: &HashMap<String, String>,
 ) -> Vec<NodeId> {
     let mut results = Vec::new();
+    // Track membership in O(1) instead of an O(n) `results.contains()` scan per
+    // candidate; for broad selectors (e.g. `.//*` or wide unions) the linear
+    // scan made selection O(n^2), a schema-driven DoS during validation. The
+    // set only gates pushes, so `results` keeps its deterministic order.
+    let mut seen: HashSet<NodeId> = HashSet::new();
 
     // Split on '|' for union
     for path_str in selector.split('|') {
@@ -286,9 +291,7 @@ fn idc_select_nodes(
             let mut descendants = Vec::new();
             idc_collect_descendants(doc, context, &mut descendants);
             for desc in descendants {
-                if idc_match_steps(doc, context, desc, &steps, namespaces)
-                    && !results.contains(&desc)
-                {
+                if idc_match_steps(doc, context, desc, &steps, namespaces) && seen.insert(desc) {
                     results.push(desc);
                 }
             }
@@ -302,7 +305,7 @@ fn idc_select_nodes(
                         if let Some(NodeKind::Element(_)) = doc.node_kind(child) {
                             if idc_step_matches(doc, child, step, namespaces) {
                                 if i == steps.len() - 1 {
-                                    if !results.contains(&child) {
+                                    if seen.insert(child) {
                                         results.push(child);
                                     }
                                 } else {

@@ -44,6 +44,12 @@ jobs:
       - name: Unit and hand-crafted tests
         run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance
 
+      # Security regression coverage. The fail-closed assertions run by
+      # default; `#[ignore]`-marked process-fatal reproducers in
+      # security_audit are skipped here and run manually with `-- --ignored`.
+      - name: Security regression tests
+        run: cargo test --test security_regressions --test hardening_regressions --test security_audit
+
       # W3C conformance suites — the full XML test suite (~1 208 tests) and
       # the three XSD test suites (NIST ~19 217, MS ~1 213, Sun ~199). All
       # fully deterministic; split into named steps so the CI log shows
