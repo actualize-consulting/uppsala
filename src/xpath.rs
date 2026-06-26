@@ -1160,18 +1160,25 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
 /// Without this, `(/r/a) = (/r/b)` over disjoint-valued sets built via cheap
 /// child-axis paths runs for minutes while staying under the node-visit cap.
 ///
-/// Only node-set work is charged: a pure scalar-vs-scalar comparison (e.g.
-/// `1 = 1`) performs no node visits, so it must not consume budget — otherwise
-/// it would fail under a zero budget despite touching no nodes. Scalar-vs-node-set
-/// is charged as `1 * N`.
+/// Only node-set work is charged, matching the actual number of string-value
+/// scans the comparison performs:
+/// - node-set vs node-set: `n * m`
+/// - node-set vs scalar: `n` (the scalar is converted once, then scanned against
+///   each node)
+/// - scalar vs scalar: `0` (no node visits — e.g. `1 = 1` must not consume budget,
+///   otherwise it would fail under a zero budget despite touching no nodes)
+///
+/// The operands are matched on their enum variants rather than via
+/// `as_node_set().len()`, because that helper returns an empty slice for *both* a
+/// scalar and an empty node-set. An empty node-set short-circuits the comparison
+/// with zero scans, so it must charge `0`, not be billed as a 1-wide scalar.
 fn charge_comparison(left: &XPathValue, right: &XPathValue, ctx: &EvalContext) -> XmlResult<()> {
-    let l = left.as_node_set().len();
-    let r = right.as_node_set().len();
-    if l == 0 && r == 0 {
-        // Neither operand is a (non-empty) node-set: no cartesian scan happens.
-        return Ok(());
-    }
-    ctx.budget.charge(l.max(1).saturating_mul(r.max(1)))
+    let cost = match (left, right) {
+        (XPathValue::NodeSet(a), XPathValue::NodeSet(b)) => a.len().saturating_mul(b.len()),
+        (XPathValue::NodeSet(ns), _) | (_, XPathValue::NodeSet(ns)) => ns.len(),
+        _ => 0,
+    };
+    ctx.budget.charge(cost)
 }
 
 /// XPath equality comparison (handles node-set vs string/number/boolean).

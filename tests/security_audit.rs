@@ -489,7 +489,7 @@ fn xpath_variable_reference_unsupported() {
 // ─── Finding F-15 — Namespace resolver lets `xml:` be rebound ───────────
 
 #[test]
-fn namespace_resolver_accepts_xml_rebinding() {
+fn namespace_resolver_refuses_xml_rebinding() {
     use std::borrow::Cow;
     use uppsala::NamespaceResolver;
     let mut r = NamespaceResolver::new();
