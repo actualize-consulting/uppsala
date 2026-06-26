@@ -1287,15 +1287,20 @@ impl<'a> Document<'a> {
                 let raw_pname = elem.name.prefixed_name();
                 let pname = crate::writer::safe_xml_qname(&raw_pname);
                 out.write_str(&pname)?;
+                // Track names already emitted for this start tag so sanitized
+                // programmatic attributes cannot collide into duplicate XML.
+                let mut seen_attrs = Vec::new();
                 // Namespace declarations
                 for (prefix, uri) in &elem.namespace_declarations {
                     if prefix.is_empty() {
                         out.write_str(" xmlns=\"")?;
+                        seen_attrs.push("xmlns".to_string());
                     } else {
                         let prefix = crate::writer::safe_xml_ncname(prefix);
                         out.write_str(" xmlns:")?;
                         out.write_str(&prefix)?;
                         out.write_str("=\"")?;
+                        seen_attrs.push(format!("xmlns:{}", prefix));
                     }
                     write_escaped_attr(out, uri)?;
                     out.write_char('"')?;
@@ -1304,7 +1309,7 @@ impl<'a> Document<'a> {
                 for attr in &elem.attributes {
                     out.write_char(' ')?;
                     let raw_aname = attr.name.prefixed_name();
-                    let aname = crate::writer::safe_xml_qname(&raw_aname);
+                    let aname = crate::writer::unique_safe_xml_qname(&raw_aname, &mut seen_attrs);
                     out.write_str(&aname)?;
                     out.write_str("=\"")?;
                     write_escaped_attr(out, &attr.value)?;

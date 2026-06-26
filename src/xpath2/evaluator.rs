@@ -101,11 +101,18 @@ where
     }
 
     /// Register a namespace prefix for use in XPath 2.0 expressions.
+    ///
+    /// Prefixed name tests fail closed when their prefix is not registered.
+    /// Registered prefixes are matched against node namespace URIs, not the
+    /// lexical prefixes used in the source document.
     pub fn add_namespace(&mut self, prefix: impl Into<String>, uri: impl Into<String>) {
         self.namespaces.insert(prefix.into(), uri.into());
     }
 
     /// Register a namespace prefix and return `self` for builder-style setup.
+    ///
+    /// This is equivalent to calling [`Self::add_namespace`] before
+    /// evaluation.
     pub fn with_namespace(mut self, prefix: impl Into<String>, uri: impl Into<String>) -> Self {
         self.add_namespace(prefix, uri);
         self
@@ -747,6 +754,9 @@ fn expanded_name_matches(
     actual_namespace: Option<&str>,
     namespaces: &HashMap<String, String>,
 ) -> bool {
+    // XPath expressions bind prefixes in the static context. Comparing URI
+    // values prevents a document from rebinding the same lexical prefix to a
+    // different namespace and still matching a prefixed name test.
     if actual_local != name.local {
         return false;
     }
@@ -762,6 +772,8 @@ fn namespace_matches(
     actual_namespace: Option<&str>,
     namespaces: &HashMap<String, String>,
 ) -> bool {
+    // Unregistered prefixes fail closed. Callers must opt into every
+    // namespace URI an expression is allowed to match.
     namespaces
         .get(prefix)
         .is_some_and(|expected| actual_namespace == Some(expected.as_str()))

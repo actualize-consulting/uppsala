@@ -1,3 +1,9 @@
+//! Security regression coverage for hardening shipped in the 0.5.0 cycle.
+//!
+//! These tests intentionally favor small, hand-written inputs over large
+//! conformance fixtures. Each case captures a previously risky behavior and
+//! documents the fail-closed outcome expected from the public API.
+
 use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
@@ -7,6 +13,8 @@ use uppsala::{
 };
 
 fn validate(schema: &str, instance: &str) -> Vec<String> {
+    // Keep XSD assertions compact by returning display strings rather than
+    // leaking validator internals into each test.
     let schema_doc = parse(schema).expect("parse schema");
     let validator = XsdValidator::from_schema(&schema_doc).expect("build validator");
     let doc = parse(instance).expect("parse instance");
@@ -18,6 +26,8 @@ fn validate(schema: &str, instance: &str) -> Vec<String> {
 }
 
 fn mkdir_unique(label: &str) -> PathBuf {
+    // XSD import/include tests need a real base path; use a process-unique
+    // directory so parallel test runs do not collide.
     let dir = std::env::temp_dir().join(format!(
         "uppsala-security-{}-{}-{}",
         label,
@@ -33,6 +43,9 @@ fn mkdir_unique(label: &str) -> PathBuf {
 
 #[test]
 fn parser_rejects_duplicate_expanded_attributes() {
+    // Namespace-aware XML forbids duplicate attributes after expansion, even
+    // when the lexical prefixes differ. Accepting both would let the same
+    // logical attribute carry conflicting values.
     let err = parse(r#"<r xmlns:a="urn:x" xmlns:b="urn:x" a:id="first" b:id="second"/>"#)
         .expect_err("duplicate expanded attributes must be rejected");
     assert!(err.to_string().contains("Duplicate attribute"));
@@ -40,6 +53,9 @@ fn parser_rejects_duplicate_expanded_attributes() {
 
 #[test]
 fn writer_sanitizes_structural_names() {
+    // Programmatic writer callers can pass arbitrary strings as element and
+    // attribute names. Invalid structural names are collapsed to a safe QName
+    // instead of being emitted verbatim into markup position.
     let mut writer = XmlWriter::new();
     writer.start_element("bad name", &[("bad attr", "value")]);
     writer.end_element("bad name");
@@ -50,7 +66,25 @@ fn writer_sanitizes_structural_names() {
 }
 
 #[test]
+fn writer_disambiguates_sanitized_attribute_collisions() {
+    // Distinct invalid names can sanitize to the same fallback `_`. The writer
+    // must make later names unique so the output remains well-formed XML.
+    let mut writer = XmlWriter::new();
+    writer.start_element(
+        "r",
+        &[("bad attr", "one"), ("bad\tattr", "two"), ("_", "three")],
+    );
+    writer.end_element("r");
+    let output = writer.into_string();
+
+    assert_eq!(output, r#"<r _="one" __1="two" __2="three"></r>"#);
+    parse(&output).expect("collision-disambiguated writer output must reparse");
+}
+
+#[test]
 fn dom_serializer_sanitizes_programmatic_names() {
+    // The DOM path has the same structural-name threat model as XmlWriter:
+    // names constructed in memory must not be able to break serialized XML.
     let mut doc = Document::new();
     let root = doc.root();
     let elem = doc.create_element(QName::local("bad name"));
@@ -65,7 +99,48 @@ fn dom_serializer_sanitizes_programmatic_names() {
 }
 
 #[test]
+fn dom_serializer_disambiguates_sanitized_attribute_collisions() {
+    // DOM serialization also needs collision handling after sanitization,
+    // because programmatic attributes can contain arbitrary invalid QNames.
+    let mut doc = Document::new();
+    let root = doc.root();
+    let elem = doc.create_element(QName::local("r"));
+    doc.append_child(root, elem);
+    let elem = doc.element_mut(elem).unwrap();
+    elem.set_attribute(QName::local("bad attr"), Cow::Borrowed("one"));
+    elem.set_attribute(QName::local("bad\tattr"), Cow::Borrowed("two"));
+    elem.set_attribute(QName::local("_"), Cow::Borrowed("three"));
+
+    let output = doc.to_xml();
+    assert_eq!(output, r#"<r _="one" __1="two" __2="three"/>"#);
+    parse(&output).expect("collision-disambiguated DOM output must reparse");
+}
+
+#[test]
+fn parse_bytes_rejects_odd_utf16_tail() {
+    // A UTF-16 byte stream is a sequence of 16-bit code units. A trailing
+    // orphan byte means the input is truncated and must not be silently
+    // discarded by the decoder.
+    let mut le = vec![0xFF, 0xFE];
+    for code_unit in "<r/>".encode_utf16() {
+        le.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    le.push(0x41);
+    assert!(uppsala::parse_bytes(&le).is_err());
+
+    let mut be = vec![0xFE, 0xFF];
+    for code_unit in "<r/>".encode_utf16() {
+        be.extend_from_slice(&code_unit.to_be_bytes());
+    }
+    be.push(0x41);
+    assert!(uppsala::parse_bytes(&be).is_err());
+}
+
+#[test]
 fn doctype_is_omitted_unless_explicitly_requested() {
+    // Parsed DOCTYPE declarations are preserved for callers that need them,
+    // but serialization omits them by default to avoid handing DTDs to
+    // downstream processors unintentionally.
     let xml = r#"<?xml version="1.0"?><!DOCTYPE root SYSTEM "root.dtd"><root/>"#;
     let doc = parse(xml).unwrap();
 
@@ -76,6 +151,8 @@ fn doctype_is_omitted_unless_explicitly_requested() {
 
 #[test]
 fn dom_mutation_rejects_invalid_and_cyclic_node_ids() {
+    // Public mutation APIs accept NodeId values, so they must ignore invalid
+    // IDs and ancestry cycles instead of corrupting the arena links.
     let mut doc = Document::new();
     let root = doc.root();
     let a = doc.create_element(QName::local("a"));
@@ -97,6 +174,9 @@ fn dom_mutation_rejects_invalid_and_cyclic_node_ids() {
 
 #[test]
 fn xpath_name_tests_are_namespace_aware() {
+    // XPath prefixes are expression bindings, not document prefix text. This
+    // verifies unprefixed tests match only no-namespace nodes and unbound
+    // prefixes fail closed.
     let doc = parse(r#"<r xmlns:a="urn:a"><a:item/><item/></r>"#).unwrap();
     let root = doc.document_element().unwrap();
 
@@ -129,6 +209,9 @@ fn xpath_name_tests_are_namespace_aware() {
 
 #[test]
 fn xpath_axis_expansion_is_budgeted() {
+    // Descendant-style axes can expand over the entire DOM. A low visit budget
+    // must stop expansion with a stable diagnostic, while a normal budget still
+    // returns the expected nodes.
     let xml = "<r><a><b/><b/><b/><b/></a></r>";
     let doc = parse(xml).unwrap();
     let root = doc.root();
@@ -148,6 +231,8 @@ fn xpath_axis_expansion_is_budgeted() {
 
 #[test]
 fn xpath2_range_allocation_is_bounded() {
+    // XPath 2.0 `to` eagerly constructs integer sequences in this evaluator.
+    // The allocation cap prevents hostile ranges from creating huge vectors.
     let doc = parse("<r/>").unwrap();
     let root = doc.root();
 
@@ -166,6 +251,8 @@ fn xpath2_range_allocation_is_bounded() {
 
 #[test]
 fn xsd_rejects_malformed_time_and_datetime_values() {
+    // Timezone parsing must reject invalid offsets and malformed Unicode input
+    // as validation errors. The non-ASCII cases exercise byte-boundary safety.
     let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:element name="t" type="xs:time"/>
   <xs:element name="dt" type="xs:dateTime"/>
@@ -182,6 +269,9 @@ fn xsd_rejects_malformed_time_and_datetime_values() {
 
 #[test]
 fn namespaced_root_does_not_fall_back_to_no_namespace_declaration() {
+    // A no-namespace declaration must not validate a namespaced document root.
+    // Falling back by local name would accept documents outside the schema's
+    // declared namespace.
     let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:element name="root" type="xs:string"/>
 </xs:schema>"#;
@@ -195,6 +285,9 @@ fn namespaced_root_does_not_fall_back_to_no_namespace_declaration() {
 
 #[test]
 fn prefixed_xsd_type_qnames_resolve_to_imported_namespace() {
+    // Prefixed `type` QNames in schemas are resolved through in-scope namespace
+    // declarations. This keeps imported types precise and prevents local-name
+    // fallback from masking invalid values.
     let dir = mkdir_unique("prefixed-type");
 
     let inner = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
@@ -235,6 +328,8 @@ fn prefixed_xsd_type_qnames_resolve_to_imported_namespace() {
 
 #[test]
 fn unknown_named_xsd_type_fails_closed() {
+    // An unresolved schema type reference must be a validation error. Treating
+    // it as string-like content would silently bypass the intended constraint.
     let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            xmlns:i="urn:inner"
            xmlns:o="urn:outer"
@@ -254,6 +349,9 @@ fn unknown_named_xsd_type_fails_closed() {
 
 #[test]
 fn xsd_identity_constraints_use_namespace_uris() {
+    // Identity-constraint selectors and fields must compare expanded names.
+    // The valid document reuses a local name in another namespace; only the
+    // target namespace should participate in the key.
     let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            xmlns:r="urn:root"
            xmlns:v="urn:vehicle"
@@ -291,6 +389,9 @@ fn xsd_identity_constraints_use_namespace_uris() {
 
 #[test]
 fn xsd_attribute_wildcard_union_stays_namespace_precise() {
+    // Attribute wildcard extension combines namespace constraints. The union
+    // should allow only the local and target namespaces configured by the
+    // schema, not arbitrary foreign attributes.
     let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            xmlns:t="urn:t"
            targetNamespace="urn:t"
@@ -321,6 +422,9 @@ fn xsd_attribute_wildcard_union_stays_namespace_precise() {
 
 #[test]
 fn xsd_complex_type_derivation_cycles_are_rejected() {
+    // Recursive complex-type derivation can otherwise loop while resolving the
+    // effective content model. The validator should detect the cycle and report
+    // it instead of recursing indefinitely.
     let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            xmlns:t="urn:t"
            targetNamespace="urn:t"

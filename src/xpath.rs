@@ -1010,7 +1010,9 @@ struct EvalContext<'a, 'b> {
 }
 
 struct EvalBudget {
+    /// Visits still available during this evaluation.
     remaining: Cell<usize>,
+    /// The caller-configured cap, retained for stable diagnostics.
     max_visits: usize,
 }
 

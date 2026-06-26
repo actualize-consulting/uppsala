@@ -97,13 +97,9 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            let key = safe_xml_qname(key);
-            self.buf.push(' ');
-            self.buf.push_str(&key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push('>');
     }
@@ -123,13 +119,9 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            let key = safe_xml_qname(key);
-            self.buf.push(' ');
-            self.buf.push_str(&key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push_str("/>");
     }
@@ -160,13 +152,14 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for (key, val) in attrs {
-            let key = safe_xml_qname(key.as_ref());
-            self.buf.push(' ');
-            self.buf.push_str(&key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val.as_ref());
-            self.buf.push('"');
+            write_sanitized_attr_to_string(
+                &mut self.buf,
+                key.as_ref(),
+                val.as_ref(),
+                &mut seen_attrs,
+            );
         }
         self.buf.push('>');
     }
@@ -195,13 +188,14 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for (key, val) in attrs {
-            let key = safe_xml_qname(key.as_ref());
-            self.buf.push(' ');
-            self.buf.push_str(&key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val.as_ref());
-            self.buf.push('"');
+            write_sanitized_attr_to_string(
+                &mut self.buf,
+                key.as_ref(),
+                val.as_ref(),
+                &mut seen_attrs,
+            );
         }
         self.buf.push_str("/>");
     }
@@ -213,13 +207,9 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            let key = safe_xml_qname(key);
-            self.buf.push(' ');
-            self.buf.push_str(&key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push_str("></");
         self.buf.push_str(&name);
@@ -472,6 +462,31 @@ pub(crate) fn safe_xml_ncname(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// Return a safe XML QName that is unique among names already emitted for
+/// the same element.
+///
+/// Sanitization can collapse distinct invalid inputs such as `"bad attr"` and
+/// `"bad\tattr"` to the same fallback name (`"_"`). XML forbids duplicate
+/// attribute names, so callers pass a per-element `seen` set and this helper
+/// appends deterministic suffixes (`_1`, `_2`, ...) when needed.
+pub(crate) fn unique_safe_xml_qname(s: &str, seen: &mut Vec<String>) -> String {
+    let base = safe_xml_qname(s).into_owned();
+    if !seen.contains(&base) {
+        seen.push(base.clone());
+        return base;
+    }
+
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{}_{}", base, suffix);
+        if !seen.contains(&candidate) {
+            seen.push(candidate.clone());
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
     let mut parts = s.split(':');
     let Some(first) = parts.next() else {
@@ -529,6 +544,22 @@ fn write_escaped_attr_to_string(buf: &mut String, s: &str) {
             _ => buf.push(c),
         }
     }
+}
+
+/// Write one attribute after structural-name sanitization and per-element
+/// collision disambiguation.
+fn write_sanitized_attr_to_string(
+    buf: &mut String,
+    key: &str,
+    value: &str,
+    seen_attrs: &mut Vec<String>,
+) {
+    let key = unique_safe_xml_qname(key, seen_attrs);
+    buf.push(' ');
+    buf.push_str(&key);
+    buf.push_str("=\"");
+    write_escaped_attr_to_string(buf, value);
+    buf.push('"');
 }
 
 #[cfg(test)]

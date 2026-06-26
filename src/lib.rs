@@ -178,10 +178,19 @@ fn decode_xml_bytes(input: &[u8]) -> XmlResult<String> {
 
 /// Decode UTF-16 little-endian bytes to a String.
 fn decode_utf16_le(bytes: &[u8]) -> XmlResult<String> {
+    // A UTF-16 stream must be an exact sequence of 16-bit code units.
+    // Dropping an orphan trailing byte would silently accept truncated input.
+    if !bytes.len().is_multiple_of(2) {
+        return Err(XmlError::well_formedness(
+            "Invalid UTF-16 LE: odd number of bytes",
+            1,
+            1,
+        ));
+    }
+
     // Pair up bytes as u16 code units (little-endian)
     let code_units: Vec<u16> = bytes
         .chunks(2)
-        .filter(|chunk| chunk.len() == 2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
 
@@ -191,10 +200,19 @@ fn decode_utf16_le(bytes: &[u8]) -> XmlResult<String> {
 
 /// Decode UTF-16 big-endian bytes to a String.
 fn decode_utf16_be(bytes: &[u8]) -> XmlResult<String> {
+    // A UTF-16 stream must be an exact sequence of 16-bit code units.
+    // Dropping an orphan trailing byte would silently accept truncated input.
+    if !bytes.len().is_multiple_of(2) {
+        return Err(XmlError::well_formedness(
+            "Invalid UTF-16 BE: odd number of bytes",
+            1,
+            1,
+        ));
+    }
+
     // Pair up bytes as u16 code units (big-endian)
     let code_units: Vec<u16> = bytes
         .chunks(2)
-        .filter(|chunk| chunk.len() == 2)
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
         .collect();
 
