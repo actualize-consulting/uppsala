@@ -254,6 +254,34 @@ fn xpath_id_function_scan_is_budgeted() {
 }
 
 #[test]
+fn xpath_descendant_collection_handles_deep_programmatic_dom() {
+    // Programmatic DOM construction can exceed parser depth caps. Descendant
+    // axes must use heap-backed traversal so a deep chain is still budgeted.
+    let mut doc = Document::new();
+    let mut parent = doc.root();
+    for _ in 0..4096 {
+        let child = doc.create_element(QName::local("n"));
+        doc.append_child(parent, child);
+        parent = child;
+    }
+    let leaf = doc.create_element(QName::local("leaf"));
+    doc.append_child(parent, leaf);
+
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(20_000)
+        .select_nodes(&doc, doc.root(), "//leaf")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0], leaf);
+
+    let err = XPathEvaluator::new()
+        .with_max_node_visits(32)
+        .select_nodes(&doc, doc.root(), "//leaf")
+        .expect_err("deep descendant traversal must remain budgeted");
+    assert!(err.to_string().contains("maximum node visit budget of 32"));
+}
+
+#[test]
 fn serializers_replace_invalid_xml_characters() {
     let mut writer = XmlWriter::new();
     writer.start_element("r", &[("a", "x\u{0001}y")]);

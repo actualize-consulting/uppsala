@@ -1286,12 +1286,7 @@ fn select_axis(axis: &Axis, node: NodeId, ctx: &EvalContext) -> XmlResult<Vec<No
             ctx.budget.charge(1)?;
             Ok(vec![node])
         }
-        Axis::DescendantOrSelf => {
-            let mut result = vec![node];
-            ctx.budget.charge(1)?;
-            result.extend(collect_descendants(doc, node, false, ctx.budget)?);
-            Ok(result)
-        }
+        Axis::DescendantOrSelf => collect_descendants(doc, node, true, ctx.budget),
         Axis::AncestorOrSelf => {
             let mut result = vec![node];
             result.extend(doc.ancestors(node));
@@ -1336,15 +1331,23 @@ fn collect_descendants(
     budget: &EvalBudget,
 ) -> XmlResult<Vec<NodeId>> {
     let mut result = Vec::new();
-    if include_self {
+    let mut stack = if include_self {
+        vec![node]
+    } else {
+        let mut children = doc.children(node);
+        children.reverse();
+        children
+    };
+
+    while let Some(current) = stack.pop() {
         budget.charge(1)?;
-        result.push(node);
+        result.push(current);
+
+        let mut children = doc.children(current);
+        children.reverse();
+        stack.extend(children);
     }
-    for child in doc.children(node) {
-        budget.charge(1)?;
-        result.push(child);
-        result.extend(collect_descendants(doc, child, false, budget)?);
-    }
+
     Ok(result)
 }
 

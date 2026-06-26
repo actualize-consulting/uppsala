@@ -63,6 +63,7 @@ fn billion_laughs_full() {
 /// silently" rather than OOM. Asserts the parser accepted the blow-up
 /// — which itself is the bug.
 #[test]
+#[ignore = "audit-only reproducer; default CI must not encode insecure behavior as expected"]
 fn billion_laughs_small_expands_unchecked() {
     let xml = r#"<?xml version="1.0"?>
 <!DOCTYPE lolz [
@@ -91,6 +92,7 @@ fn billion_laughs_small_expands_unchecked() {
 // ─── Finding F-02 — Quadratic entity expansion ──────────────────────────
 
 #[test]
+#[ignore = "audit-only reproducer; default CI must not encode insecure behavior as expected"]
 fn quadratic_entity_expansion_unchecked() {
     let xml = include_str!("../audit/pocs/quadratic_blowup.xml");
     let doc = parse(xml).expect("quadratic blow-up still parses today");
