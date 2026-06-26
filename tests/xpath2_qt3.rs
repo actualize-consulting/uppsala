@@ -32,6 +32,42 @@ struct Stats {
     failed: usize,
     skipped: usize,
     first_failures: Vec<String>,
+    // TEMP instrumentation fields:
+    fail_categories: std::collections::BTreeMap<String, usize>,
+    fail_by_spec: std::collections::BTreeMap<String, usize>,
+    fail_by_func: std::collections::BTreeMap<String, usize>,
+    examples: std::collections::BTreeMap<String, Vec<String>>,
+    regex_xtab: std::collections::BTreeMap<String, usize>,
+    regex_examples: Vec<String>,
+}
+
+// TEMP: best-effort leading function name in an expression, e.g. "fn:avg(" -> "avg".
+fn leading_func(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'(' {
+            // walk back over an identifier (letters, digits, '-', ':')
+            let mut start = i;
+            while start > 0 {
+                let c = bytes[start - 1];
+                if c.is_ascii_alphanumeric() || c == b'-' || c == b':' || c == b'_' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            if start < i {
+                let mut name = &expr[start..i];
+                if let Some(idx) = name.rfind(':') {
+                    name = &name[idx + 1..];
+                }
+                if !name.is_empty() && name.chars().next().unwrap().is_ascii_alphabetic() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    "(non-call)".to_string()
 }
 
 #[test]
@@ -80,7 +116,46 @@ fn qt3_xpath2_conformance() {
             denom
         );
     }
-    for failure in stats.first_failures.iter().take(25) {
+    // --- TEMP: failure breakdown ---
+    println!("\n=== FAIL CATEGORIES ===");
+    let mut cats: Vec<_> = stats.fail_categories.iter().collect();
+    cats.sort_by(|a, b| b.1.cmp(a.1));
+    for (cat, n) in &cats {
+        println!("  {n:>6}  {cat}");
+    }
+    println!("\n=== FAIL BY SPEC DEPENDENCY ===");
+    let mut specs: Vec<_> = stats.fail_by_spec.iter().collect();
+    specs.sort_by(|a, b| b.1.cmp(a.1));
+    for (spec, n) in specs.iter().take(15) {
+        println!("  {n:>6}  {spec}");
+    }
+    println!("\n=== TOP 30 FAILING FUNCTIONS (by leading call) ===");
+    let mut funcs: Vec<_> = stats.fail_by_func.iter().collect();
+    funcs.sort_by(|a, b| b.1.cmp(a.1));
+    for (f, n) in funcs.iter().take(30) {
+        println!("  {n:>5}  {f}");
+    }
+    println!("\n=== REGEX FN x CATEGORY ===");
+    for (k, n) in &stats.regex_xtab {
+        println!("  {n:>5}  {k}");
+    }
+    println!("\n=== REGEX FAILURE EXAMPLES ===");
+    for e in &stats.regex_examples {
+        let e: String = e.chars().take(150).collect();
+        println!("    {e}");
+    }
+    println!("\n=== EXAMPLES PER CATEGORY ===");
+    for (cat, n) in &cats {
+        println!("-- {cat} ({n}) --");
+        if let Some(ex) = stats.examples.get(*cat) {
+            for e in ex {
+                let e: String = e.chars().take(160).collect();
+                println!("    {e}");
+            }
+        }
+    }
+    // --- end TEMP ---
+    for failure in stats.first_failures.iter().take(0) {
         println!("  FAIL: {failure}");
     }
     // The runner reports statistics; it intentionally does not hard-fail on
@@ -114,12 +189,64 @@ fn run_test_set(doc: &Document<'_>, stats: &mut Stats) {
             CaseOutcome::Pass => stats.passed += 1,
             CaseOutcome::Fail(reason) => {
                 stats.failed += 1;
+                // --- TEMP instrumentation: bucket failures ---
+                let cat = categorize(&reason);
+                *stats.fail_categories.entry(cat.to_string()).or_default() += 1;
+                let spec = case_spec(doc, tc);
+                *stats.fail_by_spec.entry(spec).or_default() += 1;
+                let ex = stats.examples.entry(cat.to_string()).or_default();
+                if ex.len() < 6 {
+                    ex.push(format!("{name}: [{expr}] -> {reason}"));
+                }
+                let lf = leading_func(&expr);
+                *stats.fail_by_func.entry(lf.clone()).or_default() += 1;
+                if matches!(lf.as_str(), "tokenize" | "matches" | "replace") {
+                    *stats
+                        .regex_xtab
+                        .entry(format!("{lf} / {cat}"))
+                        .or_default() += 1;
+                    if stats.regex_examples.len() < 18 {
+                        stats
+                            .regex_examples
+                            .push(format!("{name}: [{expr}] -> {reason}"));
+                    }
+                }
+                // --- end instrumentation ---
                 if stats.first_failures.len() < 25 {
                     stats.first_failures.push(format!("{name}: {reason}"));
                 }
             }
         }
     }
+}
+
+// TEMP: coarse failure category from a reason string.
+fn categorize(reason: &str) -> &'static str {
+    if reason.starts_with("expected an error") {
+        "expected_error_but_got_value"
+    } else if reason.starts_with("unexpected evaluation error") {
+        "eval_error_but_value_expected"
+    } else if reason.starts_with("expected ") {
+        "assert_eq_value_mismatch"
+    } else if reason.starts_with("assertion not satisfied") {
+        "assertion_predicate_false"
+    } else if reason.starts_with("no alternative") {
+        "any_of_none_matched"
+    } else {
+        "other"
+    }
+}
+
+// TEMP: the spec dependency value of a test case (e.g. "XP20 XP30").
+fn case_spec(doc: &Document<'_>, tc: NodeId) -> String {
+    for dep in child_elements(doc, tc) {
+        if local_name(doc, dep) == "dependency"
+            && element_attr(doc, dep, "type").as_deref() == Some("spec")
+        {
+            return element_attr(doc, dep, "value").unwrap_or_default();
+        }
+    }
+    "(none)".to_string()
 }
 
 enum CaseOutcome {
