@@ -392,7 +392,7 @@ pub(crate) fn sanitize_pi_target(s: &str) -> Cow<'_, str> {
     if s.eq_ignore_ascii_case("xml") {
         return Cow::Owned(format!("_{}", s));
     }
-    // A PI target must be a valid XML Name. Without this check a target
+    // A PI target must be a valid XML NCName (no ':'). Without this check a target
     // containing `?>` plus markup (e.g. `foo?><evil>`) is written verbatim
     // between `<?` and the data, breaking out of PI position and smuggling
     // sibling elements into the output. Any invalid target collapses to `_`.
