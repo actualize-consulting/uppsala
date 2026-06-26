@@ -35,7 +35,7 @@ impl XsdValidator {
                 doc,
                 context_node,
                 &constraint.selector,
-                &constraint.namespaces,
+                &constraint.selector_namespaces,
             );
             debug_log!(
                 "identity constraint '{}' ({:?}): selector='{}' selected {} nodes",
@@ -53,9 +53,13 @@ impl XsdValidator {
                 let mut all_present = true;
                 let mut multiplicity_error = false;
 
-                for field_xpath in &constraint.fields {
+                for (field_index, field_xpath) in constraint.fields.iter().enumerate() {
+                    let field_namespaces = constraint
+                        .field_namespaces
+                        .get(field_index)
+                        .unwrap_or(&constraint.namespaces);
                     let (value, match_count, source_node) =
-                        idc_evaluate_field(doc, sel_node, field_xpath, &constraint.namespaces);
+                        idc_evaluate_field(doc, sel_node, field_xpath, field_namespaces);
                     // For xs:key (and xs:unique), if a field selects more than one node,
                     // that's an error per XSD spec §3.11.4
                     if match_count > 1 && constraint.kind == IdentityConstraintKind::Key {
@@ -181,7 +185,7 @@ impl XsdValidator {
                 doc,
                 context_node,
                 &constraint.selector,
-                &constraint.namespaces,
+                &constraint.selector_namespaces,
             );
             debug_log!(
                 "keyref '{}': selector='{}' selected {} nodes, referred key '{}' has {} tuples",
@@ -197,9 +201,13 @@ impl XsdValidator {
                 let mut field_source_nodes: Vec<Option<NodeId>> = Vec::new();
                 let mut all_present = true;
 
-                for field_xpath in &constraint.fields {
+                for (field_index, field_xpath) in constraint.fields.iter().enumerate() {
+                    let field_namespaces = constraint
+                        .field_namespaces
+                        .get(field_index)
+                        .unwrap_or(&constraint.namespaces);
                     let (value, _match_count, source_node) =
-                        idc_evaluate_field(doc, sel_node, field_xpath, &constraint.namespaces);
+                        idc_evaluate_field(doc, sel_node, field_xpath, field_namespaces);
                     if value.is_none() {
                         all_present = false;
                     }

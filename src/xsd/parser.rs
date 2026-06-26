@@ -181,7 +181,9 @@ fn parse_identity_constraints(doc: &Document, elem_node: NodeId) -> Vec<Identity
                 });
 
                 let mut selector = String::new();
+                let mut selector_namespaces = None;
                 let mut fields = Vec::new();
+                let mut field_namespaces = Vec::new();
 
                 for gc in doc.children(child) {
                     if let Some(NodeKind::Element(gc_elem)) = doc.node_kind(gc) {
@@ -195,10 +197,13 @@ fn parse_identity_constraints(doc: &Document, elem_node: NodeId) -> Vec<Identity
                             match gc_elem.name.local_name.as_ref() {
                                 "selector" => {
                                     selector = gce.get_attribute("xpath").unwrap_or("").to_string();
+                                    selector_namespaces =
+                                        Some(identity_constraint_namespaces(doc, gc));
                                 }
                                 "field" => {
                                     fields
                                         .push(gce.get_attribute("xpath").unwrap_or("").to_string());
+                                    field_namespaces.push(identity_constraint_namespaces(doc, gc));
                                 }
                                 _ => {}
                             }
@@ -212,6 +217,7 @@ fn parse_identity_constraints(doc: &Document, elem_node: NodeId) -> Vec<Identity
                 );
 
                 let namespaces = identity_constraint_namespaces(doc, child);
+                let selector_namespaces = selector_namespaces.unwrap_or_else(|| namespaces.clone());
 
                 constraints.push(IdentityConstraint {
                     name,
@@ -220,6 +226,8 @@ fn parse_identity_constraints(doc: &Document, elem_node: NodeId) -> Vec<Identity
                     fields,
                     refer,
                     namespaces,
+                    selector_namespaces,
+                    field_namespaces,
                 });
             }
         }

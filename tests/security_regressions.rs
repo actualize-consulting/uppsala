@@ -228,6 +228,32 @@ fn xpath_axis_expansion_is_budgeted() {
 }
 
 #[test]
+fn xpath_id_function_scan_is_budgeted() {
+    // id() performs a document-wide lookup. It must consume the same visit
+    // budget as axis expansion so callers can bound adversarial lookups.
+    let mut xml = String::from("<r>");
+    for i in 0..64 {
+        xml.push_str(&format!(r#"<item id="item-{i}"/>"#));
+    }
+    xml.push_str(r#"<item id="target"/></r>"#);
+
+    let doc = parse(&xml).unwrap();
+    let root = doc.root();
+
+    let err = XPathEvaluator::new()
+        .with_max_node_visits(0)
+        .select_nodes(&doc, root, "id('target')")
+        .expect_err("low node visit budget must stop id() expansion");
+    assert!(err.to_string().contains("maximum node visit budget of 0"));
+
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(100)
+        .select_nodes(&doc, root, "id('target')")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+}
+
+#[test]
 fn serializers_replace_invalid_xml_characters() {
     let mut writer = XmlWriter::new();
     writer.start_element("r", &[("a", "x\u{0001}y")]);
@@ -279,6 +305,53 @@ fn xsd_rejects_malformed_time_and_datetime_values() {
     assert!(!validate(schema, "<t>12:00:0é0+000</t>").is_empty());
     assert!(!validate(schema, "<dt>2024-01-01T12:00:00+99:00</dt>").is_empty());
     assert!(!validate(schema, "<dt>2024-01-01T12:00:0é0+000</dt>").is_empty());
+}
+
+#[test]
+fn xsd_date_like_types_reject_out_of_range_timezone_offsets() {
+    // Date-like XSD types use the same timezone range as xs:time/dateTime:
+    // offsets are limited to +/-14:00 and minutes must be 00-59.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="date" type="xs:date"/>
+  <xs:element name="gy" type="xs:gYear"/>
+  <xs:element name="gym" type="xs:gYearMonth"/>
+  <xs:element name="gm" type="xs:gMonth"/>
+  <xs:element name="gmd" type="xs:gMonthDay"/>
+  <xs:element name="gd" type="xs:gDay"/>
+</xs:schema>"#;
+
+    for invalid in [
+        "<date>2024-01-01+99:99</date>",
+        "<gy>2024+99:99</gy>",
+        "<gym>2024-01+99:99</gym>",
+        "<gm>--01+99:99</gm>",
+        "<gmd>--01-01+99:99</gmd>",
+        "<gd>---01+99:99</gd>",
+        "<date>2024-01-01+14:01</date>",
+        "<gy>2024+14:01</gy>",
+        "<gym>2024-01+14:01</gym>",
+        "<gm>--01+14:01</gm>",
+        "<gmd>--01-01+14:01</gmd>",
+        "<gd>---01+14:01</gd>",
+    ] {
+        let errors = validate(schema, invalid);
+        assert!(!errors.is_empty(), "expected {invalid} to be invalid");
+    }
+
+    for valid in [
+        "<date>2024-01-01+14:00</date>",
+        "<gy>2024+14:00</gy>",
+        "<gym>2024-01+14:00</gym>",
+        "<gm>--01+14:00</gm>",
+        "<gmd>--01-01+14:00</gmd>",
+        "<gd>---01+14:00</gd>",
+    ] {
+        let errors = validate(schema, valid);
+        assert!(
+            errors.is_empty(),
+            "expected {valid} to be valid, got {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -398,6 +471,122 @@ fn xsd_identity_constraints_use_namespace_uris() {
     assert!(
         errors.iter().any(|e| e.contains("duplicate value")),
         "expected duplicate key error, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_identity_constraint_selector_uses_local_namespace_scope() {
+    // Namespace declarations on xs:selector are in scope for that XPath. If
+    // ignored, the selector matches nothing and duplicate key values bypass.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:v"
+           elementFormDefault="qualified">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="vehicle" type="xs:string" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key name="vehicle_texts">
+      <xs:selector xmlns:v="urn:v" xpath="v:vehicle"/>
+      <xs:field xpath="."/>
+    </xs:key>
+  </xs:element>
+</xs:schema>"#;
+
+    let invalid = r#"<v:root xmlns:v="urn:v">
+  <v:vehicle>same</v:vehicle>
+  <v:vehicle>same</v:vehicle>
+</v:root>"#;
+    let errors = validate(schema, invalid);
+    assert!(
+        errors.iter().any(|e| e.contains("duplicate value")),
+        "expected selector-local namespace to expose duplicate key, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_identity_constraint_field_uses_local_namespace_scope() {
+    // Namespace declarations on xs:field are in scope for that XPath. xs:unique
+    // skips absent fields, so ignoring the local binding would accept duplicates.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:v"
+           elementFormDefault="qualified">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="vehicle" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="id" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:unique xmlns:s="urn:v" name="vehicle_ids">
+      <xs:selector xpath="s:vehicle"/>
+      <xs:field xmlns:f="urn:v" xpath="f:id"/>
+    </xs:unique>
+  </xs:element>
+</xs:schema>"#;
+
+    let invalid = r#"<v:root xmlns:v="urn:v">
+  <v:vehicle><v:id>same</v:id></v:vehicle>
+  <v:vehicle><v:id>same</v:id></v:vehicle>
+</v:root>"#;
+    let errors = validate(schema, invalid);
+    assert!(
+        errors.iter().any(|e| e.contains("duplicate value")),
+        "expected field-local namespace to expose duplicate unique value, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_keyref_field_uses_local_namespace_scope() {
+    // Keyref fields with locally declared prefixes must resolve before the
+    // tuple lookup. Otherwise missing field values are skipped and bad refs pass.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:v"
+           elementFormDefault="qualified">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="vehicle" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="id" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ref" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="id" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key xmlns:s="urn:v" name="vehicle_ids">
+      <xs:selector xpath="s:vehicle"/>
+      <xs:field xpath="s:id"/>
+    </xs:key>
+    <xs:keyref xmlns:s="urn:v" name="vehicle_refs" refer="vehicle_ids">
+      <xs:selector xpath="s:ref"/>
+      <xs:field xmlns:f="urn:v" xpath="f:id"/>
+    </xs:keyref>
+  </xs:element>
+</xs:schema>"#;
+
+    let invalid = r#"<v:root xmlns:v="urn:v">
+  <v:vehicle><v:id>known</v:id></v:vehicle>
+  <v:ref><v:id>missing</v:id></v:ref>
+</v:root>"#;
+    let errors = validate(schema, invalid);
+    assert!(
+        errors.iter().any(|e| e.contains("no matching key value")),
+        "expected field-local namespace to expose bad keyref, got {errors:?}"
     );
 }
 

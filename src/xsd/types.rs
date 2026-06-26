@@ -104,8 +104,12 @@ pub(crate) struct IdentityConstraint {
     pub(super) fields: Vec<String>,
     /// For keyref: the name of the referred key/unique constraint.
     pub(super) refer: Option<String>,
-    /// Prefix bindings used by selector and field XPath expressions.
+    /// Prefix bindings declared on the constraint element.
     pub(super) namespaces: HashMap<String, String>,
+    /// Prefix bindings visible from the selector XPath expression.
+    pub(super) selector_namespaces: HashMap<String, String>,
+    /// Prefix bindings visible from each field XPath expression.
+    pub(super) field_namespaces: Vec<HashMap<String, String>>,
 }
 
 /// The kind of identity constraint.

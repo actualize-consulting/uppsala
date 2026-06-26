@@ -107,7 +107,9 @@ pub(crate) fn is_valid_duration(s: &str) -> bool {
 /// The year must be at least 4 digits (CCYY). Leading '-' for negative years
 /// (BCE dates) is permitted. Timezone suffix is optional.
 pub(crate) fn is_valid_gyear(s: &str) -> bool {
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     let s = if let Some(stripped) = s.strip_prefix('-') {
         stripped
     } else {
@@ -120,7 +122,9 @@ pub(crate) fn is_valid_gyear(s: &str) -> bool {
 ///
 /// Year must be at least 4 digits, month must be 01-12.
 pub(crate) fn is_valid_gyearmonth(s: &str) -> bool {
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     let (s, _neg) = if let Some(stripped) = s.strip_prefix('-') {
         (stripped, true)
     } else {
@@ -154,7 +158,9 @@ pub(crate) fn is_valid_gyearmonth(s: &str) -> bool {
 /// Note: XSD 1.0 also allowed --MM-- (with trailing --), so we accept both
 /// for backwards compatibility.
 pub(crate) fn is_valid_gmonth(s: &str) -> bool {
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     // gMonth is an all-ASCII lexical form. Reject any non-ASCII byte up front so
     // the fixed byte-index slices below cannot land inside a multibyte UTF-8
     // sequence and panic on a non-char-boundary.
@@ -217,7 +223,9 @@ fn is_leap_year(year: u32) -> bool {
 /// Month must be 01-12, day must be valid for that month (Feb allows up to 29
 /// since no year is specified).
 pub(crate) fn is_valid_gmonthday(s: &str) -> bool {
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     // All-ASCII lexical form; reject non-ASCII so the byte slices below stay on
     // char boundaries.
     if !s.is_ascii() || !s.starts_with("--") || s.len() < 7 {
@@ -252,7 +260,9 @@ pub(crate) fn is_valid_gmonthday(s: &str) -> bool {
 ///
 /// Day must be 01-31.
 pub(crate) fn is_valid_gday(s: &str) -> bool {
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     // All-ASCII lexical form; reject non-ASCII so the byte slices below stay on
     // char boundaries.
     if !s.is_ascii() || !s.starts_with("---") || s.len() < 5 {
@@ -336,7 +346,9 @@ pub(crate) fn is_valid_datetime(s: &str) -> bool {
 /// MS tests: date003/004/009, dateTime011 — reject invalid ranges.
 pub(crate) fn is_valid_date(s: &str) -> bool {
     // YYYY-MM-DD[Z|(+|-)hh:mm]
-    let s = strip_timezone(s);
+    let Some(s) = strip_timezone(s) else {
+        return false;
+    };
     let parts: Vec<&str> = s.split('-').collect();
     // Handle negative years
     if s.starts_with('-') {
@@ -478,7 +490,13 @@ fn strip_time_timezone(s: &str) -> Option<&str> {
     if s.len() >= 6 {
         let tz_start = s.len() - 6;
         let tz = &s.as_bytes()[tz_start..];
-        if tz[0] == b'+' || tz[0] == b'-' {
+        if (tz[0] == b'+' || tz[0] == b'-')
+            && tz[1].is_ascii_digit()
+            && tz[2].is_ascii_digit()
+            && tz[3] == b':'
+            && tz[4].is_ascii_digit()
+            && tz[5].is_ascii_digit()
+        {
             if !s.is_char_boundary(tz_start) || !valid_timezone_offset_bytes(tz) {
                 return None;
             }
@@ -493,25 +511,28 @@ fn strip_time_timezone(s: &str) -> Option<&str> {
 /// Timezone is Z, +hh:mm, or -hh:mm at the end.
 /// MS tests: gYearMonth003, gYear006, gMonthDay003, gDay003, gMonth004 —
 /// the old `pos > 8` heuristic failed for short types like gYear, gDay.
-pub(crate) fn strip_timezone(s: &str) -> &str {
+pub(crate) fn strip_timezone(s: &str) -> Option<&str> {
     if let Some(stripped) = s.strip_suffix('Z') {
-        return stripped;
+        return Some(stripped);
     }
     // Check for +hh:mm or -hh:mm at the end (exactly 6 chars: [+-]dd:dd)
     if s.len() >= 6 {
         let tz_start = s.len() - 6;
-        let b = s.as_bytes();
-        if (b[tz_start] == b'+' || b[tz_start] == b'-')
-            && b[tz_start + 1].is_ascii_digit()
-            && b[tz_start + 2].is_ascii_digit()
-            && b[tz_start + 3] == b':'
-            && b[tz_start + 4].is_ascii_digit()
-            && b[tz_start + 5].is_ascii_digit()
+        let tz = &s.as_bytes()[tz_start..];
+        if (tz[0] == b'+' || tz[0] == b'-')
+            && tz[1].is_ascii_digit()
+            && tz[2].is_ascii_digit()
+            && tz[3] == b':'
+            && tz[4].is_ascii_digit()
+            && tz[5].is_ascii_digit()
         {
-            return &s[..tz_start];
+            if !s.is_char_boundary(tz_start) || !valid_timezone_offset_bytes(tz) {
+                return None;
+            }
+            return Some(&s[..tz_start]);
         }
     }
-    s
+    Some(s)
 }
 
 fn valid_timezone_offset_bytes(tz: &[u8]) -> bool {

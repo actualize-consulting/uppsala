@@ -1736,8 +1736,11 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
             }
             let val = evaluate_expr(&args[0], ctx)?.to_string_value(ctx.doc);
             let ids: Vec<&str> = val.split_whitespace().collect();
+            if ids.is_empty() {
+                return Ok(XPathValue::NodeSet(Vec::new()));
+            }
             let mut result = Vec::new();
-            collect_elements_with_id(ctx.doc, ctx.doc.root(), &ids, &mut result);
+            collect_elements_with_id(ctx.doc, ctx.doc.root(), &ids, &mut result, ctx.budget)?;
             Ok(XPathValue::NodeSet(result))
         }
         _ => Err(XmlError::xpath(format!("Unknown function: {}()", name))),
@@ -1749,7 +1752,9 @@ fn collect_elements_with_id(
     node: NodeId,
     ids: &[&str],
     result: &mut Vec<NodeId>,
-) {
+    budget: &EvalBudget,
+) -> XmlResult<()> {
+    budget.charge(1)?;
     if let Some(NodeKind::Element(e)) = doc.node_kind(node) {
         for attr in &e.attributes {
             if (&*attr.name.local_name == "id" || &*attr.name.local_name == "ID")
@@ -1761,8 +1766,9 @@ fn collect_elements_with_id(
         }
     }
     for child in doc.children(node) {
-        collect_elements_with_id(doc, child, ids, result);
+        collect_elements_with_id(doc, child, ids, result, budget)?;
     }
+    Ok(())
 }
 
 /// Remove duplicate NodeIds and maintain document order.
