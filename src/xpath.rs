@@ -1227,7 +1227,6 @@ fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlRe
             }
         }
     }
-    ctx.budget.charge(result.len())?;
     // Apply predicates
     for pred in &step.predicates {
         result = apply_predicate(pred, &result, ctx)?;

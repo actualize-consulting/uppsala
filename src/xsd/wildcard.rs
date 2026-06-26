@@ -136,18 +136,12 @@ pub(super) fn union_namespace_constraints(
             (None, None) => NamespaceConstraint::Other(None),
             _ => NamespaceConstraint::NotLocal,
         },
-        (NamespaceConstraint::NotLocal, NamespaceConstraint::Local)
-        | (NamespaceConstraint::Local, NamespaceConstraint::NotLocal) => NamespaceConstraint::Any,
-        // `TargetNamespace(None)` is the no-namespace case (≡ `Local`). Its
-        // union with `NotLocal` (every non-empty namespace) covers all names,
-        // so the result is `Any` — not `NotLocal`, which would wrongly exclude
-        // no-namespace names.
-        (NamespaceConstraint::NotLocal, NamespaceConstraint::TargetNamespace(None))
-        | (NamespaceConstraint::TargetNamespace(None), NamespaceConstraint::NotLocal) => {
-            NamespaceConstraint::Any
-        }
-        (NamespaceConstraint::NotLocal, _) | (_, NamespaceConstraint::NotLocal) => {
-            NamespaceConstraint::NotLocal
+        (NamespaceConstraint::NotLocal, other) | (other, NamespaceConstraint::NotLocal) => {
+            if finite_includes_local(other) {
+                NamespaceConstraint::Any
+            } else {
+                NamespaceConstraint::NotLocal
+            }
         }
         (NamespaceConstraint::Other(excluded), NamespaceConstraint::TargetNamespace(Some(ns)))
         | (NamespaceConstraint::TargetNamespace(Some(ns)), NamespaceConstraint::Other(excluded)) => {
@@ -194,6 +188,10 @@ fn finite_namespaces(constraint: &NamespaceConstraint) -> Option<Vec<Option<Stri
         }
         _ => None,
     }
+}
+
+fn finite_includes_local(constraint: &NamespaceConstraint) -> bool {
+    finite_namespaces(constraint).is_some_and(|namespaces| namespaces.contains(&None))
 }
 
 fn intersection_from_finite(
@@ -272,6 +270,22 @@ mod tests {
         ));
         // The resulting constraint must admit both no-namespace and any URI.
         let result = union_namespace_constraints(&a, &b);
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:x")));
+    }
+
+    #[test]
+    fn union_notlocal_with_local_list_is_any() {
+        let a = NamespaceConstraint::NotLocal;
+        let b = NamespaceConstraint::List(vec!["##local".into(), "urn:extra".into()]);
+
+        let result = union_namespace_constraints(&a, &b);
+        assert!(matches!(result, NamespaceConstraint::Any));
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:x")));
+
+        let result = union_namespace_constraints(&b, &a);
+        assert!(matches!(result, NamespaceConstraint::Any));
         assert!(wildcard_allows_namespace(&result, None));
         assert!(wildcard_allows_namespace(&result, Some("urn:x")));
     }

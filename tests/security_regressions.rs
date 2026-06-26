@@ -228,6 +228,27 @@ fn xpath_axis_expansion_is_budgeted() {
 }
 
 #[test]
+fn xpath_axis_budget_is_not_double_charged_after_name_test() {
+    // Axis traversal already charges returned nodes. A matching name test must
+    // not charge the same node again or a one-node child lookup with budget 1
+    // would fail.
+    let doc = parse("<r><a/></r>").unwrap();
+    let root = doc.document_element().unwrap();
+
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(1)
+        .select_nodes(&doc, root, "a")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+
+    let err = XPathEvaluator::new()
+        .with_max_node_visits(0)
+        .select_nodes(&doc, root, "a")
+        .expect_err("child axis must still charge returned nodes");
+    assert!(err.to_string().contains("maximum node visit budget of 0"));
+}
+
+#[test]
 fn xpath_id_function_scan_is_budgeted() {
     // id() performs a document-wide lookup. It must consume the same visit
     // budget as axis expansion so callers can bound adversarial lookups.
