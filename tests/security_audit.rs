@@ -1,9 +1,13 @@
 //! Security-audit test harness.
 //!
-//! Each test reproduces a finding in SECURITY_AUDIT.md. Tests that exercise
-//! reliably-crashing bugs (stack overflow, billion-laughs OOM) are marked
-//! `#[ignore]` so the default `cargo test` run remains safe; invoke them
-//! explicitly with `cargo test --test security_audit -- --ignored`.
+//! Each test reproduces a finding in SECURITY_AUDIT.md, using the finding's
+//! canonical `F-NN` identifier. Findings that are now fixed assert the
+//! hardened behavior (fail-closed error, bounded time, or a still-working
+//! legitimate baseline). A few reproducers that can only manifest as a
+//! process-fatal crash on the *unhardened* code path (e.g. a true stack
+//! overflow) remain `#[ignore]` so the default `cargo test` run stays safe;
+//! invoke them explicitly with
+//! `cargo test --test security_audit -- --ignored`.
 //!
 use std::time::{Duration, Instant};
 
@@ -30,13 +34,14 @@ fn billion_laughs_full() {
     );
 }
 
-/// CI-safe variant: 6-level nesting (~10^6 chars). Parser still fully
-/// expands but it fits in memory, so the failure mode is "completes
-/// silently" rather than OOM. Asserts the parser accepted the blow-up
-/// — which itself is the bug.
+/// Bounded-expansion baseline: 5-level nesting expands to ~3×10^5 chars,
+/// which is *below* the default entity-expansion byte budget
+/// (`DEFAULT_MAX_ENTITY_EXPANSION`, 1 MiB). Such a document is legitimate
+/// and must still parse — the cap fails closed only on the unbounded
+/// blow-up (`billion_laughs_full`), not on bounded expansion. This pins
+/// that the cap does not over-reject below its threshold.
 #[test]
-#[ignore = "audit-only reproducer; default CI must not encode insecure behavior as expected"]
-fn billion_laughs_small_expands_unchecked() {
+fn bounded_entity_expansion_within_cap_accepted() {
     let xml = r#"<?xml version="1.0"?>
 <!DOCTYPE lolz [
   <!ENTITY lol "lol">
@@ -47,45 +52,39 @@ fn billion_laughs_small_expands_unchecked() {
   <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">
 ]>
 <lolz>&lol5;</lolz>"#;
-    let doc = parse(xml).expect("small billion-laughs still parses today");
+    let doc = parse(xml).expect("bounded expansion below the cap must still parse");
     let root = doc.document_element().unwrap();
     let text = doc.text_content_deep(root);
-    // 3 * 10^5 chars — no entity-expansion cap was applied.
-    assert_eq!(
-        text.len(),
-        3 * 100_000,
-        "parser should have capped expansion; instead produced {} chars",
-        text.len()
-    );
-    // This test currently PASSES, which means the vulnerability is real.
-    // A fix should make this test FAIL (parser should reject / truncate).
+    // 3 × 10^5 chars — well under the 1 MiB expansion budget.
+    assert_eq!(text.len(), 3 * 100_000);
 }
 
-// ─── Finding F-02 — Quadratic entity expansion ──────────────────────────
+// ─── Finding F-02 — Quadratic entity expansion (bounded baseline) ───────
 
+/// The quadratic POC expands to ~2000 chars, far below the expansion byte
+/// budget, so it parses. This is the "legitimate bounded input still
+/// works" control for F-02; the unbounded blow-up is bounded by
+/// `DEFAULT_MAX_ENTITY_EXPANSION` and `DEFAULT_MAX_ENTITY_DEPTH`.
 #[test]
-#[ignore = "audit-only reproducer; default CI must not encode insecure behavior as expected"]
-fn quadratic_entity_expansion_unchecked() {
+fn quadratic_entity_expansion_bounded_accepted() {
     let xml = include_str!("../audit/pocs/quadratic_blowup.xml");
-    let doc = parse(xml).expect("quadratic blow-up still parses today");
+    let doc = parse(xml).expect("bounded quadratic expansion still parses");
     let root = doc.document_element().unwrap();
     let text_len = doc.text_content_deep(root).len();
-    // 20 chars × 10 (inner) × 10 (outer) = 2000 — small enough to run,
-    // but enforcement would reject or cap before expansion.
+    // 20 chars × 10 (inner) × 10 (outer) = 2000 — below the expansion cap.
     assert!(text_len >= 2000);
 }
 
-// ─── Finding F-03 — Parser stack overflow on deep nesting ───────────────
+// ─── Finding F-03 — Parser deep-nesting depth cap — FIXED ───────────────
 
-/// Building a 1,000,000-deep element chain and feeding it to the parser
-/// aborts the process on Linux with an 8 MiB stack. We run it in a
-/// spawned thread with a small stack so the failure manifests as a
-/// thread-panic rather than crashing the test binary — but Rust still
-/// `abort()`s on stack overflow regardless of thread, so the whole
-/// binary will die. Marked `#[ignore]`.
+/// Regression for F-03. A deeply nested element chain previously recursed
+/// once per level in `parse_element` and could overflow the stack. The
+/// parser now enforces `DEFAULT_MAX_DEPTH` (128) and fails closed with a
+/// bounded error long before the stack is at risk — even for pathological
+/// million-deep input, which is rejected cheaply without ever recursing
+/// past the cap.
 #[test]
-#[ignore = "stack overflow aborts the test binary; run explicitly"]
-fn deep_nesting_parser_stack_overflow() {
+fn deep_nesting_rejected_by_depth_cap() {
     let depth = 1_000_000;
     let mut xml = String::with_capacity(depth * 8);
     for _ in 0..depth {
@@ -95,16 +94,25 @@ fn deep_nesting_parser_stack_overflow() {
     for _ in 0..depth {
         xml.push_str("</a>");
     }
-    let _ = parse(&xml);
+    let res = parse(&xml);
+    assert!(
+        res.is_err(),
+        "deep nesting must be rejected by the depth cap, not stack-overflow"
+    );
+    let msg = format!("{:?}", res.err());
+    assert!(
+        msg.contains("nesting exceeds maximum depth"),
+        "expected depth-cap error, got: {}",
+        msg
+    );
 }
 
-/// Smaller, survivable variant — demonstrates that the parser accepts
-/// very deep nesting *without* any configured cap. The author can make
-/// this test fail by introducing a depth limit.
+/// Control: nesting that stays within the default cap still parses. This
+/// pins the boundary so a future cap change that breaks legitimate
+/// moderately-nested documents is caught.
 #[test]
-#[ignore = "5k-deep nesting aborts the test binary on the default stack"]
-fn deep_nesting_accepted_without_cap() {
-    let depth = 5_000; // confirmed to stack-overflow on default 8 MiB stack
+fn moderate_nesting_within_cap_accepted() {
+    let depth = 100; // < DEFAULT_MAX_DEPTH (128)
     let mut xml = String::with_capacity(depth * 8);
     for _ in 0..depth {
         xml.push_str("<a>");
@@ -116,7 +124,8 @@ fn deep_nesting_accepted_without_cap() {
     let res = parse(&xml);
     assert!(
         res.is_ok(),
-        "expected current build to accept 5k-deep nesting (no cap enforced)"
+        "nesting within the default depth cap must still parse: {:?}",
+        res.err()
     );
 }
 
@@ -240,11 +249,11 @@ fn xpath_parser_deep_paren_stack_overflow() {
     let _ = eval.evaluate(&doc, root, &expr);
 }
 
-// ─── Finding F-09/F11 — XPath substring() overflow — FIXED ──────────────
+// ─── Finding F-09 — XPath substring() overflow — FIXED ──────────────────
 
 #[test]
 fn xpath_substring_overflow_handled() {
-    // Regression for F11. `substring(s, start, +inf)` coerced the length to
+    // Regression for F-09. `substring(s, start, +inf)` coerced the length to
     // `usize::MAX`; `start + len` then overflowed (debug panic / release wrap
     // into an out-of-order slice). `substring` now uses `saturating_add` and
     // clamps, so a huge/`inf` length yields a normal (clamped) result with no
@@ -317,9 +326,15 @@ fn xsd_include_reads_absolute_paths() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+// ─── Finding F-11 — Circular xs:include cycle cap — FIXED ───────────────
+
+/// Regression for F-11. `a.xsd` includes `b.xsd`, which includes `a.xsd`.
+/// Pre-fix the loader recursed through the cycle until the stack
+/// overflowed. The composition pass now carries a visited-paths set and a
+/// depth cap, so the cycle is short-circuited and the build completes in
+/// bounded time without overflowing.
 #[test]
-#[ignore = "stack overflow aborts the test binary; run explicitly"]
-fn xsd_include_circular_stack_overflow() {
+fn xsd_include_circular_handled() {
     let tmp = std::env::temp_dir().join("uppsala-audit-circular");
     std::fs::create_dir_all(&tmp).unwrap();
     let a = tmp.join("a.xsd");
@@ -336,6 +351,9 @@ fn xsd_include_circular_stack_overflow() {
     .unwrap();
     let schema_src = std::fs::read_to_string(&a).unwrap();
     let schema_doc = parse(&schema_src).unwrap();
+    // Must return (cycle detected / short-circuited), not recurse forever
+    // or overflow the stack. Either Ok or a bounded Err is acceptable;
+    // the point is that it terminates.
     let _ = XsdValidator::from_schema_with_base_path(&schema_doc, Some(&a));
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -432,7 +450,7 @@ fn roundtrip_cdata_smuggle() {
     );
 }
 
-// ─── Finding F-12 — UTF-16 decoder silently drops odd trailing byte — FIXED ─
+// ─── Finding F-20 — UTF-16 decoder silently drops odd trailing byte — FIXED ─
 
 #[test]
 fn utf16_odd_byte_rejected() {
@@ -454,7 +472,7 @@ fn utf16_odd_byte_rejected() {
     );
 }
 
-// ─── Finding F-13 — Pattern compile accepts arbitrary recursion in class subtraction ─
+// ─── Finding F-04 — XSD regex compiler stack overflow (class-subtraction recursion) ─
 
 #[test]
 #[ignore = "stack overflow on class-subtraction recursion"]
@@ -471,7 +489,7 @@ fn xsd_regex_class_subtraction_stack() {
     let _ = XsdRegex::compile(&pat);
 }
 
-// ─── Finding F-14 — XPath `$var` unsupported (low; documented as XPath 1.0) ──
+// ─── Finding F-24 — XPath `$var` unsupported (low; documented as XPath 1.0) ──
 
 #[test]
 fn xpath_variable_reference_unsupported() {
@@ -486,7 +504,7 @@ fn xpath_variable_reference_unsupported() {
     );
 }
 
-// ─── Finding F-15 — Namespace resolver lets `xml:` be rebound ───────────
+// ─── Finding F-19 — Namespace resolver lets `xml:` be rebound ───────────
 
 #[test]
 fn namespace_resolver_refuses_xml_rebinding() {
@@ -503,7 +521,7 @@ fn namespace_resolver_refuses_xml_rebinding() {
     );
 }
 
-// ─── Finding F-16 — Control characters silently emitted on serialize — FIXED ─
+// ─── Finding F-18 — Control characters silently emitted on serialize — FIXED ─
 
 #[test]
 fn control_char_sanitized_on_attribute_write() {
@@ -519,7 +537,7 @@ fn control_char_sanitized_on_attribute_write() {
     parse(&out).expect("sanitized output must reparse");
 }
 
-// ─── Finding F-17 — XPath //a//b//c cross-product blow-up ──────────────
+// ─── Finding F-21 — XPath //a//b//c cross-product blow-up ──────────────
 
 #[test]
 fn xpath_double_slash_blowup() {

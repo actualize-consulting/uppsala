@@ -17,7 +17,7 @@
 //!   `div`, `mod`, `|`
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
@@ -1257,6 +1257,11 @@ fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlRe
 
 fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
     let size = nodes.len();
+    // Charge the candidate scan up front so a query that is already over budget
+    // fails before doing the (potentially expensive) per-candidate predicate
+    // evaluation, rather than after. This tightens the DoS bound the budget
+    // is meant to provide.
+    ctx.budget.charge(size)?;
     let mut result = Vec::new();
     for (i, &node) in nodes.iter().enumerate() {
         let pred_ctx = EvalContext {
@@ -1276,7 +1281,6 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
             result.push(node);
         }
     }
-    ctx.budget.charge(nodes.len())?;
     Ok(result)
 }
 
@@ -1799,12 +1803,53 @@ fn collect_elements_with_id(
 
 /// Remove duplicate NodeIds and return them in the document's current tree order.
 fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeId> {
-    nodes.sort_by_cached_key(|&node| document_order_key(doc, node));
+    // A sibling-index memo turns each `position()` lookup from an O(siblings)
+    // scan into an amortized O(1) hash lookup. Without it, sorting a wide
+    // node-set is O(n^2) (each of n nodes re-scans its parent's child list),
+    // which is *uncharged* work that defeats the node-visit budget — a
+    // disjoint `(/r/a) = (/r/b)` comparison would spend minutes inside dedup
+    // before the comparison charge ever fires.
+    let mut order = SiblingOrderIndex::default();
+    nodes.sort_by_cached_key(|&node| document_order_key(doc, node, &mut order));
     nodes.dedup();
     nodes
 }
 
-fn document_order_key(doc: &Document<'_>, node: NodeId) -> (u8, Vec<(u8, usize)>, usize) {
+/// Memoizes the position of each node within its parent's child / attribute
+/// list. The first lookup for a given parent indexes that parent's whole list
+/// once; subsequent sibling lookups are O(1).
+#[derive(Default)]
+struct SiblingOrderIndex {
+    pos: HashMap<NodeId, usize>,
+    children_indexed: HashSet<NodeId>,
+    attrs_indexed: HashSet<NodeId>,
+}
+
+impl SiblingOrderIndex {
+    fn child_pos(&mut self, doc: &Document<'_>, parent: NodeId, child: NodeId) -> Option<usize> {
+        if self.children_indexed.insert(parent) {
+            for (i, c) in doc.children(parent).into_iter().enumerate() {
+                self.pos.insert(c, i);
+            }
+        }
+        self.pos.get(&child).copied()
+    }
+
+    fn attr_pos(&mut self, doc: &Document<'_>, parent: NodeId, attr: NodeId) -> Option<usize> {
+        if self.attrs_indexed.insert(parent) {
+            for (i, a) in doc.get_attribute_nodes(parent).iter().enumerate() {
+                self.pos.insert(*a, i);
+            }
+        }
+        self.pos.get(&attr).copied()
+    }
+}
+
+fn document_order_key(
+    doc: &Document<'_>,
+    node: NodeId,
+    order: &mut SiblingOrderIndex,
+) -> (u8, Vec<(u8, usize)>, usize) {
     let mut path = Vec::new();
     let mut current = node;
 
@@ -1819,20 +1864,12 @@ fn document_order_key(doc: &Document<'_>, node: NodeId) -> (u8, Vec<(u8, usize)>
         };
 
         if matches!(doc.node_kind(current), Some(NodeKind::Attribute(_, _))) {
-            let Some(index) = doc
-                .get_attribute_nodes(parent)
-                .iter()
-                .position(|&attr| attr == current)
-            else {
+            let Some(index) = order.attr_pos(doc, parent, current) else {
                 return (1, Vec::new(), node.index());
             };
             path.push((0, index));
         } else {
-            let Some(index) = doc
-                .children(parent)
-                .iter()
-                .position(|&child| child == current)
-            else {
+            let Some(index) = order.child_pos(doc, parent, current) else {
                 return (1, Vec::new(), node.index());
             };
             path.push((1, index));

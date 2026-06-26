@@ -75,6 +75,29 @@
 //!
 //! assert!(w.into_string().contains("<root"));
 //! ```
+//!
+//! # Resource limits
+//!
+//! To fail closed on hostile input, the parser enforces fixed resource caps
+//! by default (see [`parser`] for the associated constants and the
+//! `Parser::with_*` overrides):
+//!
+//! - **Element nesting depth** — capped at
+//!   [`DEFAULT_MAX_DEPTH`](parser::DEFAULT_MAX_DEPTH) (128). Documents nested
+//!   deeper are rejected with an error rather than risking a stack overflow.
+//! - **Entity expansion byte budget** — capped at
+//!   [`DEFAULT_MAX_ENTITY_EXPANSION`](parser::DEFAULT_MAX_ENTITY_EXPANSION)
+//!   (1 MiB). Total bytes produced by entity expansion per parse cannot
+//!   exceed this, defeating billion-laughs / quadratic-blowup amplification.
+//! - **Entity expansion nesting depth** — capped at
+//!   [`DEFAULT_MAX_ENTITY_DEPTH`](parser::DEFAULT_MAX_ENTITY_DEPTH) (256), so
+//!   a deep linear entity chain fails closed instead of overflowing the stack
+//!   even before the byte budget is reached.
+//!
+//! The depth and expansion-byte limits are configurable via builder methods
+//! on [`Parser`] ([`Parser::with_max_depth`] and
+//! [`Parser::with_max_entity_expansion`]) when a workload legitimately needs
+//! a different bound.
 
 /// Arena-based DOM representation of XML documents.
 pub mod dom;
