@@ -5,7 +5,6 @@
 //! XML declarations, and edge cases from the W3C XML 1.0 specification.
 
 use uppsala::dom::{NodeKind, QName};
-use uppsala::error::XmlError;
 
 // ─── Well-formed documents ───────────────────────────────
 

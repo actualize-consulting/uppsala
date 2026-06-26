@@ -3,8 +3,8 @@
 use crate::error::{XmlError, XmlResult};
 
 use super::ast::{
-    Axis, BinaryOp, Expr, ForBinding, Literal, NodeTest, PathExpr, PathStep, QName, Quantifier,
-    UnaryOp,
+    Axis, BinaryOp, Expr, ForBinding, ItemType, Literal, NodeTest, Occurrence, PathExpr, PathStep,
+    QName, Quantifier, SequenceType, SingleType, UnaryOp,
 };
 use super::lexer::{tokenize, Token, TokenKind};
 
@@ -278,7 +278,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
     }
 
     fn parse_intersect_except_expr(&mut self) -> XmlResult<Expr<'expr>> {
-        let mut expr = self.parse_unary_expr()?;
+        let mut expr = self.parse_instanceof_expr()?;
         loop {
             let op = if self.consume_name("intersect") {
                 Some(BinaryOp::Intersect)
@@ -294,10 +294,127 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
-                right: Box::new(self.parse_unary_expr()?),
+                right: Box::new(self.parse_instanceof_expr()?),
             };
         }
         Ok(expr)
+    }
+
+    fn parse_instanceof_expr(&mut self) -> XmlResult<Expr<'expr>> {
+        let expr = self.parse_treat_expr()?;
+        if self.peek_name("instance") && self.peek_n_name(1, "of") {
+            self.advance();
+            self.advance();
+            self.charge_node()?;
+            let seq_type = self.parse_sequence_type()?;
+            return Ok(Expr::InstanceOf {
+                expr: Box::new(expr),
+                seq_type,
+            });
+        }
+        Ok(expr)
+    }
+
+    fn parse_treat_expr(&mut self) -> XmlResult<Expr<'expr>> {
+        let expr = self.parse_castable_expr()?;
+        if self.peek_name("treat") && self.peek_n_name(1, "as") {
+            self.advance();
+            self.advance();
+            self.charge_node()?;
+            let seq_type = self.parse_sequence_type()?;
+            return Ok(Expr::TreatAs {
+                expr: Box::new(expr),
+                seq_type,
+            });
+        }
+        Ok(expr)
+    }
+
+    fn parse_castable_expr(&mut self) -> XmlResult<Expr<'expr>> {
+        let expr = self.parse_cast_expr()?;
+        if self.peek_name("castable") && self.peek_n_name(1, "as") {
+            self.advance();
+            self.advance();
+            self.charge_node()?;
+            let single_type = self.parse_single_type()?;
+            return Ok(Expr::Castable {
+                expr: Box::new(expr),
+                single_type,
+            });
+        }
+        Ok(expr)
+    }
+
+    fn parse_cast_expr(&mut self) -> XmlResult<Expr<'expr>> {
+        let expr = self.parse_unary_expr()?;
+        if self.peek_name("cast") && self.peek_n_name(1, "as") {
+            self.advance();
+            self.advance();
+            self.charge_node()?;
+            let single_type = self.parse_single_type()?;
+            return Ok(Expr::Cast {
+                expr: Box::new(expr),
+                single_type,
+            });
+        }
+        Ok(expr)
+    }
+
+    /// Parse `SingleType ::= AtomicType "?"?`.
+    fn parse_single_type(&mut self) -> XmlResult<SingleType<'expr>> {
+        let type_name = self.parse_qname()?;
+        let optional = self.consume_token(TokenDiscriminant::Question);
+        Ok(SingleType {
+            type_name,
+            optional,
+        })
+    }
+
+    /// Parse `SequenceType ::= ("empty-sequence" "(" ")") | (ItemType OccurrenceIndicator?)`.
+    fn parse_sequence_type(&mut self) -> XmlResult<SequenceType<'expr>> {
+        if self.peek_name("empty-sequence")
+            && matches!(self.peek_n(1).map(|t| &t.kind), Some(TokenKind::LeftParen))
+        {
+            self.advance();
+            self.expect_token(TokenDiscriminant::LeftParen)?;
+            self.expect_token(TokenDiscriminant::RightParen)?;
+            return Ok(SequenceType {
+                item: None,
+                occurrence: Occurrence::One,
+            });
+        }
+
+        let item = self.parse_item_type()?;
+        let occurrence = if self.consume_token(TokenDiscriminant::Question) {
+            Occurrence::ZeroOrOne
+        } else if self.consume_token(TokenDiscriminant::Star) {
+            Occurrence::ZeroOrMore
+        } else if self.consume_token(TokenDiscriminant::Plus) {
+            Occurrence::OneOrMore
+        } else {
+            Occurrence::One
+        };
+        Ok(SequenceType {
+            item: Some(item),
+            occurrence,
+        })
+    }
+
+    /// Parse `ItemType ::= KindTest | ("item" "(" ")") | AtomicType`.
+    fn parse_item_type(&mut self) -> XmlResult<ItemType<'expr>> {
+        if let Some(name) = self.peek_any_name() {
+            let is_paren = matches!(self.peek_n(1).map(|t| &t.kind), Some(TokenKind::LeftParen));
+            if name == "item" && is_paren {
+                self.advance();
+                self.expect_token(TokenDiscriminant::LeftParen)?;
+                self.expect_token(TokenDiscriminant::RightParen)?;
+                return Ok(ItemType::Item);
+            }
+            if is_paren && is_extended_kind_test_name(name) {
+                return Ok(ItemType::Kind(self.parse_kind_test()?));
+            }
+        }
+        Ok(ItemType::Atomic(self.parse_qname()?))
     }
 
     fn parse_unary_expr(&mut self) -> XmlResult<Expr<'expr>> {
@@ -448,32 +565,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
 
         if let Some(name) = self.peek_any_name() {
             if self.is_kind_test_name(name) {
-                let name = self.expect_any_name()?;
-                self.expect_token(TokenDiscriminant::LeftParen)?;
-                let test = match name {
-                    "text" => NodeTest::Text,
-                    "node" => NodeTest::Node,
-                    "comment" => NodeTest::Comment,
-                    "processing-instruction" => {
-                        let target = match self.peek().map(|token| &token.kind) {
-                            Some(TokenKind::StringLiteral(value)) => {
-                                let value = value.clone();
-                                self.advance();
-                                Some(value)
-                            }
-                            Some(TokenKind::Name(value)) => {
-                                let value = *value;
-                                self.advance();
-                                Some(std::borrow::Cow::Borrowed(value))
-                            }
-                            _ => None,
-                        };
-                        NodeTest::ProcessingInstruction(target)
-                    }
-                    _ => unreachable!("kind test checked by is_kind_test_name"),
-                };
-                self.expect_token(TokenDiscriminant::RightParen)?;
-                return Ok(test);
+                return self.parse_kind_test();
             }
 
             if matches!(
@@ -491,6 +583,96 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
         }
 
         Ok(NodeTest::Name(self.parse_qname()?))
+    }
+
+    /// Parse a full XPath 2.0 `KindTest`. The caller has verified the upcoming
+    /// token is a kind-test name immediately followed by `(`.
+    fn parse_kind_test(&mut self) -> XmlResult<NodeTest<'expr>> {
+        let name = self.expect_any_name()?;
+        self.expect_token(TokenDiscriminant::LeftParen)?;
+        let test = match name {
+            "text" => NodeTest::Text,
+            "node" => NodeTest::Node,
+            "comment" => NodeTest::Comment,
+            "processing-instruction" => {
+                let target = match self.peek().map(|token| &token.kind) {
+                    Some(TokenKind::StringLiteral(value)) => {
+                        let value = value.clone();
+                        self.advance();
+                        Some(value)
+                    }
+                    Some(TokenKind::Name(value)) => {
+                        let value = *value;
+                        self.advance();
+                        Some(std::borrow::Cow::Borrowed(value))
+                    }
+                    _ => None,
+                };
+                NodeTest::ProcessingInstruction(target)
+            }
+            "document-node" => {
+                let inner = if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::RightParen)) {
+                    None
+                } else {
+                    // `document-node(document-node(...))` nests recursively; route
+                    // through the depth guard so a deeply nested kind test fails
+                    // closed instead of overflowing the stack (see security audit).
+                    Some(Box::new(self.with_depth(|p| p.parse_kind_test())?))
+                };
+                NodeTest::Document(inner)
+            }
+            "element" => {
+                let (name, ty) = self.parse_element_attribute_args()?;
+                NodeTest::Element(name, ty)
+            }
+            "attribute" => {
+                let (name, ty) = self.parse_element_attribute_args()?;
+                NodeTest::Attribute(name, ty)
+            }
+            "schema-element" => {
+                let name = self.parse_qname()?;
+                NodeTest::SchemaElement(name)
+            }
+            "schema-attribute" => {
+                let name = self.parse_qname()?;
+                NodeTest::SchemaAttribute(name)
+            }
+            // Reachable via a recursive inner test such as
+            // `document-node(unknown())`: the recursion at the `document-node`
+            // arm above does not pre-check `is_kind_test_name`, so an invalid
+            // inner test name lands here. A parser must never panic on input, so
+            // fail closed with an error instead of `unreachable!` (see security
+            // audit / QT3 conformance).
+            other => {
+                return Err(XmlError::xpath(format!("unsupported kind test '{other}'")));
+            }
+        };
+        self.expect_token(TokenDiscriminant::RightParen)?;
+        Ok(test)
+    }
+
+    /// Parse the optional `(NameOrWildcard (, TypeName "?"?)?)` arguments of an
+    /// `element(...)` or `attribute(...)` test.
+    fn parse_element_attribute_args(
+        &mut self,
+    ) -> XmlResult<(Option<QName<'expr>>, Option<QName<'expr>>)> {
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::RightParen)) {
+            return Ok((None, None));
+        }
+        let name = if self.consume_token(TokenDiscriminant::Star) {
+            None
+        } else {
+            Some(self.parse_qname()?)
+        };
+        let ty = if self.consume_comma() {
+            let ty = self.parse_qname()?;
+            // Tolerate the nillable `?` marker that follows a type name.
+            self.consume_token(TokenDiscriminant::Question);
+            Some(ty)
+        } else {
+            None
+        };
+        Ok((name, ty))
     }
 
     fn parse_predicates(&mut self) -> XmlResult<Vec<Expr<'expr>>> {
@@ -675,6 +857,13 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
         )
     }
 
+    fn peek_n_name(&self, n: usize, expected: &str) -> bool {
+        matches!(
+            self.peek_n(n).map(|token| &token.kind),
+            Some(TokenKind::Name(name)) if *name == expected
+        )
+    }
+
     fn peek_any_name(&self) -> Option<&'expr str> {
         match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Name(name)) => Some(*name),
@@ -764,6 +953,14 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
                 ) {
                     return is_kind_test_name(name);
                 }
+                // A prefixed function call (`prefix:local(`) is a primary
+                // expression, not an axis step. `prefix:*` and `prefix:local`
+                // remain name tests.
+                if matches!(self.peek_n(1).map(|t| &t.kind), Some(TokenKind::Colon))
+                    && matches!(self.peek_n(3).map(|t| &t.kind), Some(TokenKind::LeftParen))
+                {
+                    return false;
+                }
                 !is_reserved_operator_name(name)
             }
             _ => false,
@@ -822,7 +1019,24 @@ fn parse_axis(name: &str) -> XmlResult<Axis> {
 }
 
 fn is_kind_test_name(name: &str) -> bool {
-    matches!(name, "text" | "node" | "comment" | "processing-instruction")
+    matches!(
+        name,
+        "text"
+            | "node"
+            | "comment"
+            | "processing-instruction"
+            | "document-node"
+            | "element"
+            | "attribute"
+            | "schema-element"
+            | "schema-attribute"
+    )
+}
+
+/// Kind-test names usable as an `ItemType` in a sequence type. Identical to the
+/// path-step kind tests today, named separately for grammar clarity.
+fn is_extended_kind_test_name(name: &str) -> bool {
+    is_kind_test_name(name)
 }
 
 fn is_reserved_operator_name(name: &str) -> bool {
@@ -849,6 +1063,12 @@ fn is_reserved_operator_name(name: &str) -> bool {
             | "else"
             | "satisfies"
             | "in"
+            | "instance"
+            | "of"
+            | "treat"
+            | "as"
+            | "castable"
+            | "cast"
     )
 }
 
@@ -870,6 +1090,7 @@ enum TokenDiscriminant {
     Dollar,
     Colon,
     ColonColon,
+    Question,
 }
 
 impl TokenDiscriminant {
@@ -891,6 +1112,7 @@ impl TokenDiscriminant {
             TokenKind::Dollar => TokenDiscriminant::Dollar,
             TokenKind::Colon => TokenDiscriminant::Colon,
             TokenKind::ColonColon => TokenDiscriminant::ColonColon,
+            TokenKind::Question => TokenDiscriminant::Question,
             _ => return None,
         })
     }
@@ -913,6 +1135,7 @@ impl TokenDiscriminant {
             TokenDiscriminant::Dollar => "'$'",
             TokenDiscriminant::Colon => "':'",
             TokenDiscriminant::ColonColon => "'::'",
+            TokenDiscriminant::Question => "'?'",
         }
     }
 }

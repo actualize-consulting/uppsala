@@ -329,3 +329,235 @@ fn resolver_backed_doc_function_has_no_default_access() {
     let value = eval.evaluate(&doc, doc.root(), "doc('urn:test')").unwrap();
     assert_eq!(atom_strings(&value), ["resolved"]);
 }
+
+#[test]
+fn smoke_fo_library() {
+    assert_eq!(atom_strings(&eval("upper-case('abc')")), ["ABC"]);
+    assert_eq!(atom_strings(&eval("substring('hello',2,3)")), ["ell"]);
+    assert_eq!(atom_strings(&eval("string-length('hello')")), ["5"]);
+    assert_eq!(atom_strings(&eval("substring-before('a/b/c','/')")), ["a"]);
+    assert_eq!(atom_strings(&eval("substring-after('a/b/c','/')")), ["b/c"]);
+    assert_eq!(
+        atom_strings(&eval("string-join(('a','b','c'), '-')")),
+        ["a-b-c"]
+    );
+    assert_eq!(
+        atom_strings(&eval("tokenize('a,b,c', ',')")),
+        ["a", "b", "c"]
+    );
+    assert_eq!(atom_strings(&eval("replace('a1b2','[0-9]','#')")), ["a#b#"]);
+    assert_eq!(atom_strings(&eval("matches('abc','b')")), ["true"]);
+    assert_eq!(atom_strings(&eval("translate('bar','abc','ABC')")), ["BAr"]);
+    assert_eq!(atom_strings(&eval("abs(-5)")), ["5"]);
+    assert_eq!(atom_strings(&eval("ceiling(1.2)")), ["2"]);
+    assert_eq!(atom_strings(&eval("floor(1.8)")), ["1"]);
+    assert_eq!(atom_strings(&eval("round(2.5)")), ["3"]);
+    assert_eq!(atom_strings(&eval("sum((1,2,3))")), ["6"]);
+    assert_eq!(atom_strings(&eval("avg((1,2,3))")), ["2"]);
+    assert_eq!(atom_strings(&eval("max((3,1,2))")), ["3"]);
+    assert_eq!(atom_strings(&eval("min((3,1,2))")), ["1"]);
+    assert_eq!(
+        atom_strings(&eval("distinct-values((1,2,2,3,1))")),
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        atom_strings(&eval("index-of((10,20,30,20),20)")),
+        ["2", "4"]
+    );
+    assert_eq!(atom_strings(&eval("reverse((1,2,3))")), ["3", "2", "1"]);
+    assert_eq!(
+        atom_strings(&eval("subsequence((1,2,3,4,5),2,2)")),
+        ["2", "3"]
+    );
+    assert_eq!(
+        atom_strings(&eval("string-to-codepoints('AB')")),
+        ["65", "66"]
+    );
+    assert_eq!(
+        atom_strings(&eval("codepoints-to-string((72,105))")),
+        ["Hi"]
+    );
+    assert_eq!(atom_strings(&eval("compare('a','b')")), ["-1"]);
+    assert_eq!(atom_strings(&eval("concat('a',1,'b')")), ["a1b"]);
+    assert_eq!(atom_strings(&eval("deep-equal((1,2),(1,2))")), ["true"]);
+    assert_eq!(atom_strings(&eval("encode-for-uri('a b')")), ["a%20b"]);
+    assert_eq!(atom_strings(&eval("xs:integer('42') + 1")), ["43"]);
+}
+
+#[test]
+fn smoke_casts_and_instanceof() {
+    assert_eq!(atom_strings(&eval("5 instance of xs:integer")), ["true"]);
+    assert_eq!(atom_strings(&eval("5 instance of xs:string")), ["false"]);
+    assert_eq!(atom_strings(&eval("'5' cast as xs:integer")), ["5"]);
+    assert_eq!(
+        atom_strings(&eval("(1,2) instance of xs:integer+")),
+        ["true"]
+    );
+    assert_eq!(
+        atom_strings(&eval("() instance of empty-sequence()")),
+        ["true"]
+    );
+    assert_eq!(atom_strings(&eval("'12' castable as xs:integer")), ["true"]);
+    assert_eq!(atom_strings(&eval("'x' castable as xs:integer")), ["false"]);
+    assert_eq!(atom_strings(&eval("'3.14' cast as xs:double")), ["3.14"]);
+    assert_eq!(atom_strings(&eval("5 treat as xs:integer")), ["5"]);
+    assert_eq!(
+        atom_strings(&eval("'P1Y2M' cast as xs:yearMonthDuration")),
+        ["P1Y2M"]
+    );
+    assert_eq!(
+        atom_strings(&eval("'2004-04-12' cast as xs:date")),
+        ["2004-04-12"]
+    );
+}
+
+#[test]
+fn smoke_compat_and_context() {
+    // XPath 1.0 compatibility: a multi-item operand reduces to its first item.
+    let doc = parse("<root/>").unwrap();
+    let compat = XPath2Evaluator::new().with_xpath1_compatibility(true);
+    let v = compat.evaluate(&doc, doc.root(), "(1,2,3) + 10").unwrap();
+    assert_eq!(atom_strings(&v), ["11"]);
+    // Without compat, the same expression is a type error.
+    assert!(XPath2Evaluator::new()
+        .evaluate(&doc, doc.root(), "(1,2,3) + 10")
+        .is_err());
+
+    // External variable binding.
+    let eval = XPath2Evaluator::new().with_variable(
+        "x",
+        XPath2Value::atomic(XPath2AtomicValue::Integer("41".to_string())),
+    );
+    let v = eval.evaluate(&doc, doc.root(), "$x + 1").unwrap();
+    assert_eq!(atom_strings(&v), ["42"]);
+}
+
+#[test]
+fn smoke_default_element_namespace() {
+    let xml = r#"<root xmlns="urn:d"><item/><item/></root>"#;
+    let doc = parse(xml).unwrap();
+    // Without a default element namespace, unprefixed names match no-ns nodes.
+    let plain = XPath2Evaluator::new();
+    assert_eq!(
+        plain
+            .select_nodes(&doc, doc.root(), "//item")
+            .unwrap()
+            .len(),
+        0
+    );
+    // With the default element namespace set, unprefixed names match it.
+    let eval = XPath2Evaluator::new().with_default_element_namespace("urn:d");
+    assert_eq!(
+        eval.select_nodes(&doc, doc.root(), "//item").unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn smoke_reverse_axis_predicate() {
+    let xml = r#"<a><b/><c><d/></c></a>"#;
+    let doc = parse(xml).unwrap();
+    let eval = XPath2Evaluator::new();
+    let d = eval.select_nodes(&doc, doc.root(), "//d").unwrap()[0];
+    // ancestor::*[1] must be the *nearest* ancestor (c), not the document root.
+    let nearest = eval.select_nodes(&doc, d, "ancestor::*[1]").unwrap();
+    assert_eq!(nearest.len(), 1);
+    assert_eq!(
+        doc.element(nearest[0]).unwrap().name.local_name.as_ref(),
+        "c"
+    );
+}
+
+#[test]
+fn smoke_kind_tests() {
+    let xml = r#"<r><a/>text<!--c--><?pi x?></r>"#;
+    let doc = parse(xml).unwrap();
+    let eval = XPath2Evaluator::new();
+    let r = doc.document_element().unwrap();
+    assert_eq!(
+        eval.select_nodes(&doc, r, "child::element()")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        eval.select_nodes(&doc, r, "child::element(a)")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        atom_strings(
+            &eval
+                .evaluate(&doc, r, "child::element() instance of element()")
+                .unwrap()
+        ),
+        ["true"]
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FnResolver;
+
+impl XPath2Resolver for FnResolver {
+    fn resolve_function(
+        &self,
+        _ns: Option<&str>,
+        local: &str,
+        args: &[XPath2Value],
+    ) -> XmlResult<Option<XPath2Value>> {
+        if local == "double-it" {
+            let n: i128 = args[0].items()[0]
+                .string_value(&parse("<x/>").unwrap())
+                .parse()
+                .unwrap_or(0);
+            return Ok(Some(XPath2Value::atomic(XPath2AtomicValue::Integer(
+                (n * 2).to_string(),
+            ))));
+        }
+        Ok(None)
+    }
+}
+
+#[test]
+fn smoke_external_function_resolver() {
+    let doc = parse("<root/>").unwrap();
+    // Unknown function fails without a resolver.
+    assert!(XPath2Evaluator::new()
+        .evaluate(&doc, doc.root(), "double-it(21)")
+        .is_err());
+    // The resolver supplies it.
+    let eval = XPath2Evaluator::new().with_resolver(FnResolver);
+    let v = eval.evaluate(&doc, doc.root(), "double-it(21)").unwrap();
+    assert_eq!(atom_strings(&v), ["42"]);
+}
+
+#[test]
+fn smoke_datetime_and_node_functions() {
+    // Deterministic current-dateTime via a pinned clock (2021-01-01T00:00:00Z).
+    let doc = parse("<root xml:lang='en'><child/></root>").unwrap();
+    let eval = XPath2Evaluator::new().with_current_datetime_unix(1_609_459_200);
+    let v = eval.evaluate(&doc, doc.root(), "current-date()").unwrap();
+    assert_eq!(atom_strings(&v), ["2021-01-01Z"]);
+
+    let root = doc.document_element().unwrap();
+    let eval = XPath2Evaluator::new();
+    assert_eq!(
+        atom_strings(&eval.evaluate(&doc, root, "local-name()").unwrap()),
+        ["root"]
+    );
+    assert_eq!(
+        atom_strings(&eval.evaluate(&doc, root, "lang('en')").unwrap()),
+        ["true"]
+    );
+
+    // Duration casts and dateTime comparisons.
+    assert_eq!(
+        atom_strings(
+            &eval
+                .evaluate(&doc, root, "xs:date('2004-01-01') eq xs:date('2004-01-01')")
+                .unwrap()
+        ),
+        ["true"]
+    );
+}

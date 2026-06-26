@@ -23,3 +23,8 @@ debug-logging = []
 [dependencies]
 
 [dev-dependencies]
+
+# Zero-dependency XPath 2.0 micro-benchmark harness (uses std::time only).
+[[bench]]
+name = "xpath2_bench"
+harness = false

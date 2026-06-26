@@ -13,7 +13,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uppsala::{parse, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
+use uppsala::{
+    parse, XPath2Evaluator, XPath2Value, XPathEvaluator, XmlResult, XmlWriter, XsdRegex,
+    XsdValidator,
+};
 
 // Wall-clock cap for DoS tests. Well under a typical cargo-test default.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -567,4 +570,208 @@ fn xpath_double_slash_blowup() {
         let root = doc.root();
         let _ = eval.evaluate(&doc, root, "//*[//leaf]");
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// XPath 2.0 differential-review findings (DIFFERENTIAL_REVIEW_REPORT.md)
+//
+// All inputs are exercised through the public API (`XPath2Evaluator::evaluate`),
+// the real untrusted-input boundary for XPath 2.0 expressions. A failure here
+// means a fixed crash / DoS has regressed.
+//
+//   XP2-F1 — multibyte `split_at` panic in xs:dateTime/date/time casts
+//   XP2-F2 — multibyte `split_at` panic in gregorian (xs:gYear/...) casts
+//   XP2-F3 — unbounded parser recursion via `document-node(...)` kind test
+//   XP2-F4 — regex DoS (ReDoS / O(n^3) scan) in matches/replace/tokenize
+//   XP2-F5 — uncharged O(n^2) work in fn:distinct-values
+//   XP2-F6 — integer overflow in date/duration arithmetic
+//   XP2-F7 — silent saturating cast in `idiv` instead of FOAR0002
+//   XP2-F8 — `i`-flag case folding corrupted replace/tokenize output
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Evaluate an XPath 2.0 expression, returning the raw result (no unwrap) so a
+/// test can assert a graceful `Err` rather than a crash.
+fn xp2_try_eval(expression: &str) -> XmlResult<XPath2Value> {
+    let doc = parse("<root/>").unwrap();
+    XPath2Evaluator::new().evaluate(&doc, doc.root(), expression)
+}
+
+/// Evaluate and flatten the result to its string values.
+fn xp2_eval_strings(expression: &str) -> Vec<String> {
+    let doc = parse("<root/>").unwrap();
+    let value = XPath2Evaluator::new()
+        .evaluate(&doc, doc.root(), expression)
+        .expect("expression should evaluate");
+    value
+        .items()
+        .iter()
+        .map(|item| match item {
+            uppsala::XPath2Item::Atomic(v) => v.to_xpath_string(),
+            uppsala::XPath2Item::Node(n) => format!("node:{}", n.index()),
+        })
+        .collect()
+}
+
+/// Assert that evaluating `expression` neither panics nor aborts, and returns a
+/// graceful `Err`. Used for the "must not crash on hostile input" findings. The
+/// `catch_unwind` proves no panic; reaching `Ok(Err(_))` proves fail-closed.
+fn xp2_assert_graceful_error(expression: &str) {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(|| xp2_try_eval(expression))) {
+        Err(_) => panic!("expression panicked instead of returning an error: {expression:?}"),
+        Ok(Ok(_)) => panic!("expression unexpectedly succeeded (expected error): {expression:?}"),
+        Ok(Err(_)) => {}
+    }
+}
+
+// ─── XP2-F1 — multibyte split_at panic in temporal casts ────────────────────
+
+#[test]
+fn xp2_f1_multibyte_timezone_in_temporal_casts_does_not_panic() {
+    // `split_at(len - 6)` used to slice inside a multibyte char at the tail.
+    // The emoji is 4 bytes, so `len - 6` lands inside it -> historical panic.
+    xp2_assert_graceful_error("xs:time('\u{1F600}12345')");
+    xp2_assert_graceful_error("xs:dateTime('2004-01-01T\u{1F600}12345')");
+    xp2_assert_graceful_error("xs:date('2004-01-0\u{1F600}12')");
+    // A valid value with a real timezone must still parse correctly.
+    assert_eq!(
+        xp2_eval_strings("xs:dateTime('2004-04-12T13:20:00+05:30')"),
+        ["2004-04-12T13:20:00+05:30"]
+    );
+}
+
+// ─── XP2-F2 — multibyte split_at panic in gregorian casts ───────────────────
+
+#[test]
+fn xp2_f2_multibyte_timezone_in_gregorian_casts_does_not_panic() {
+    xp2_assert_graceful_error("xs:gYear('\u{1F600}12345')");
+    xp2_assert_graceful_error("xs:gMonthDay('--01-0\u{1F600}12')");
+    xp2_assert_graceful_error("xs:gDay('---0\u{1F600}12')");
+}
+
+// ─── XP2-F3 — unbounded parser recursion via document-node(...) ──────────────
+
+#[test]
+fn xp2_f3_deeply_nested_document_node_fails_closed_without_stack_overflow() {
+    // Historically this recursed once per `document-node(` with no depth guard,
+    // aborting the process (SIGABRT) on a long input. It must now fail closed
+    // with a depth error. Run on a small stack so a regression would overflow
+    // here rather than relying on a large default stack.
+    let mut expr = String::from("1 instance of ");
+    for _ in 0..50_000 {
+        expr.push_str("document-node(");
+    }
+    let handle = thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || xp2_try_eval(&expr).is_err())
+        .unwrap();
+    let is_err = handle
+        .join()
+        .expect("parsing overflowed the stack (XP2-F3 regression)");
+    assert!(is_err, "deeply nested document-node must fail closed");
+}
+
+#[test]
+fn xp2_f3_invalid_inner_document_node_test_does_not_panic() {
+    // Surfaced by the QT3 suite (prod/NodeTest.xml): `document-node(unknown())`
+    // recursed into the kind-test parser, whose final match arm was
+    // `unreachable!` — a panic on hostile input. It must now fail closed.
+    xp2_assert_graceful_error("1 instance of document-node(unknown())");
+    xp2_assert_graceful_error("/document-node(bogus())");
+}
+
+// ─── XP2-F4 — regex DoS in matches / replace / tokenize ─────────────────────
+
+#[test]
+fn xp2_f4_large_nonmatching_regex_input_is_bounded() {
+    // A large input with no match used to drive an O(n^3) substring scan that
+    // hung the thread. It must now terminate quickly with a work-budget error.
+    let big = "a".repeat(8_000);
+    run_with_timeout("xp2_f4_matches", {
+        let expr = format!("matches('{big}', 'zzzz')");
+        move || xp2_assert_graceful_error(&expr)
+    });
+    run_with_timeout("xp2_f4_replace", {
+        let expr = format!("replace('{big}', 'z', 'q')");
+        move || xp2_assert_graceful_error(&expr)
+    });
+    run_with_timeout("xp2_f4_tokenize", {
+        let expr = format!("tokenize('{big}', 'z')");
+        move || xp2_assert_graceful_error(&expr)
+    });
+}
+
+#[test]
+fn xp2_f4_normal_regex_still_works() {
+    // The bound must not break ordinary regex use.
+    assert_eq!(xp2_eval_strings("matches('hello world', 'wor')"), ["true"]);
+    assert_eq!(xp2_eval_strings("matches('hello', 'zzz')"), ["false"]);
+    assert_eq!(xp2_eval_strings("replace('a1b2', '[0-9]', '#')"), ["a#b#"]);
+    assert_eq!(xp2_eval_strings("tokenize('a,b,c', ',')"), ["a", "b", "c"]);
+}
+
+// ─── XP2-F5 — uncharged O(n^2) work in fn:distinct-values ────────────────────
+
+#[test]
+fn xp2_f5_large_distinct_values_is_charged_and_bounded() {
+    // `1 to 100000` builds cheaply (within max_sequence_items) but the O(n^2)
+    // dedup used to run uncharged. It must now hit the work budget and error.
+    run_with_timeout("xp2_f5_distinct", || {
+        xp2_assert_graceful_error("distinct-values(1 to 100000)")
+    });
+}
+
+#[test]
+fn xp2_f5_small_distinct_values_still_works() {
+    assert_eq!(
+        xp2_eval_strings("distinct-values((1, 1, 2, 3, 2))"),
+        ["1", "2", "3"]
+    );
+}
+
+// ─── XP2-F6 — integer overflow in date / duration arithmetic ────────────────
+
+#[test]
+fn xp2_f6_overflowing_duration_component_fails_closed() {
+    // `* 12` on a valid-i64 year component used to overflow (debug panic).
+    xp2_assert_graceful_error("xs:duration('P800000000000000000Y')");
+}
+
+#[test]
+fn xp2_f6_extreme_year_comparison_does_not_panic() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    // Comparison drives days_from_civil, where `era * 146097` used to overflow
+    // i64 (debug panic). With i128 intermediates it must compute gracefully.
+    let expr = "xs:dateTime('5000000000000000000-01-01T00:00:00Z') \
+                eq xs:dateTime('2004-01-01T00:00:00Z')";
+    let result = catch_unwind(AssertUnwindSafe(|| xp2_try_eval(expr)));
+    assert!(
+        result.is_ok(),
+        "extreme-year comparison panicked (XP2-F6 regression)"
+    );
+}
+
+// ─── XP2-F7 — idiv saturating cast instead of FOAR0002 overflow error ───────
+
+#[test]
+fn xp2_f7_idiv_overflow_raises_error_not_saturated_value() {
+    // `1e308 idiv 1` used to saturate to i128::MAX silently; it must now error.
+    xp2_assert_graceful_error("xs:double('1e308') idiv 1");
+    // Ordinary idiv still works.
+    assert_eq!(xp2_eval_strings("10 idiv 3"), ["3"]);
+}
+
+// ─── XP2-F8 — case-insensitive replace/tokenize corrupting output ───────────
+
+#[test]
+fn xp2_f8_case_insensitive_replace_preserves_non_ascii_output() {
+    // With the old length-changing `to_lowercase` fold, a non-ASCII char whose
+    // lowercase form differs in length (here U+0130, the dotted capital I)
+    // forced the output to be the lower-cased copy. ASCII-only folding leaves
+    // the original char untouched while still matching the ASCII 'X'
+    // case-insensitively, so the output preserves U+0130.
+    assert_eq!(
+        xp2_eval_strings("replace('\u{0130}X', 'x', 'z', 'i')"),
+        ["\u{0130}z"]
+    );
 }

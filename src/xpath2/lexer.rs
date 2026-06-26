@@ -47,6 +47,7 @@ pub enum TokenKind<'expr> {
     Dollar,
     Colon,
     ColonColon,
+    Question,
 }
 
 /// Tokenize an XPath 2.0 expression.
@@ -166,6 +167,10 @@ pub fn tokenize(input: &str) -> XmlResult<Vec<Token<'_>>> {
             b'$' => {
                 offset += 1;
                 push(&mut tokens, TokenKind::Dollar, start, offset);
+            }
+            b'?' => {
+                offset += 1;
+                push(&mut tokens, TokenKind::Question, start, offset);
             }
             b':' => {
                 if bytes.get(offset + 1) == Some(&b':') {

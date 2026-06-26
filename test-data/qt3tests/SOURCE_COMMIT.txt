@@ -1,0 +1,41 @@
+W3C QT3 test suite — vendored snapshot
+======================================
+
+Upstream:  https://github.com/w3c/qt3tests
+Commit:    201a6e466940cdfc727f4babfedcde5332b9f578
+Subject:   Relax expected results for JSON numeric output
+Date:      2026-05-14
+Vendored:  2026-06-26
+
+What this is
+------------
+The official W3C XQuery/XPath 3.* Functions and Operators (QT3 / FOTS) test
+suite — ~30,000 tests with metadata describing dependencies, environments, and
+expected results. The upstream README.md is retained alongside this file.
+
+How it is used
+--------------
+Consumed by `tests/xpath2_qt3.rs`, a metadata-aware runner that executes only
+the self-contained, XPath-applicable cases and skips cases requiring unsupported
+host features (external source documents, schema awareness, collations,
+higher-order functions, XQuery-only syntax). The runner reports statistics and
+intentionally does not hard-fail on individual mismatches (XPath 2.0 support is
+documented as partial); a green run means the harness executed end-to-end over
+this data without crashing.
+
+What was omitted
+----------------
+The upstream `.git` directory was not copied. Everything else is a verbatim copy
+of the pinned commit above.
+
+Packaging
+---------
+This directory lives under `test-data/`, which is listed in the `exclude` key of
+the crate's `Cargo.toml`. It is therefore NOT included in the published crate
+(`cargo package` / `cargo publish`) — it exists only for local/CI testing.
+
+License
+-------
+The QT3 test suite is published by the W3C under the W3C Test Suite licensing
+terms (W3C Software and Document License). See the upstream repository for the
+authoritative license text.

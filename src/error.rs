@@ -60,6 +60,9 @@ pub struct NamespaceError {
 pub struct XPathError {
     /// Human-readable description of the XPath error.
     pub message: String,
+    /// Structured XPath/XQuery error code (e.g. `FORG0001`, `XPTY0004`), when
+    /// the failure maps to a spec-defined error. `None` for generic failures.
+    pub code: Option<&'static str>,
 }
 
 /// An XSD validation error.
@@ -90,7 +93,10 @@ impl fmt::Display for XmlError {
                     e.line, e.column, e.message
                 )
             }
-            XmlError::XPath(e) => write!(f, "XPath error: {}", e.message),
+            XmlError::XPath(e) => match e.code {
+                Some(code) => write!(f, "XPath error [{}]: {}", code, e.message),
+                None => write!(f, "XPath error: {}", e.message),
+            },
             XmlError::Validation(e) => match (e.line, e.column) {
                 (Some(l), Some(c)) => {
                     write!(f, "Validation error at {}:{}: {}", l, c, e.message)
@@ -148,7 +154,25 @@ impl XmlError {
     pub fn xpath(message: impl Into<String>) -> Self {
         XmlError::XPath(XPathError {
             message: message.into(),
+            code: None,
         })
+    }
+
+    /// Create an [`XPathError`] carrying a structured XPath/XQuery error code.
+    pub fn xpath_code(code: &'static str, message: impl Into<String>) -> Self {
+        XmlError::XPath(XPathError {
+            message: message.into(),
+            code: Some(code),
+        })
+    }
+
+    /// Return the structured XPath error code, if this is an XPath error with
+    /// one assigned.
+    pub fn xpath_error_code(&self) -> Option<&'static str> {
+        match self {
+            XmlError::XPath(e) => e.code,
+            _ => None,
+        }
     }
 
     /// Create a [`ValidationError`] with the given message (no source location).

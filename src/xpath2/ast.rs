@@ -64,8 +64,80 @@ pub enum Expr<'expr> {
         /// Test expression.
         satisfies: Box<Expr<'expr>>,
     },
+    /// `expr instance of SequenceType`
+    InstanceOf {
+        /// Operand expression.
+        expr: Box<Expr<'expr>>,
+        /// Tested sequence type.
+        seq_type: SequenceType<'expr>,
+    },
+    /// `expr treat as SequenceType`
+    TreatAs {
+        /// Operand expression.
+        expr: Box<Expr<'expr>>,
+        /// Asserted sequence type.
+        seq_type: SequenceType<'expr>,
+    },
+    /// `expr castable as SingleType`
+    Castable {
+        /// Operand expression.
+        expr: Box<Expr<'expr>>,
+        /// Target single type.
+        single_type: SingleType<'expr>,
+    },
+    /// `expr cast as SingleType`
+    Cast {
+        /// Operand expression.
+        expr: Box<Expr<'expr>>,
+        /// Target single type.
+        single_type: SingleType<'expr>,
+    },
     /// XPath path expression.
     Path(PathExpr<'expr>),
+}
+
+/// Occurrence indicator on a sequence type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occurrence {
+    /// Exactly one (no indicator).
+    One,
+    /// `?` — zero or one.
+    ZeroOrOne,
+    /// `*` — zero or more.
+    ZeroOrMore,
+    /// `+` — one or more.
+    OneOrMore,
+}
+
+/// A `SequenceType`: an item type plus an occurrence indicator, or the special
+/// `empty-sequence()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceType<'expr> {
+    /// `None` represents `empty-sequence()`.
+    pub item: Option<ItemType<'expr>>,
+    /// Occurrence indicator.
+    pub occurrence: Occurrence,
+}
+
+/// An `ItemType` used by sequence types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemType<'expr> {
+    /// `item()` — any single item.
+    Item,
+    /// A named atomic type, e.g. `xs:integer`.
+    Atomic(QName<'expr>),
+    /// A node kind test, e.g. `element()` or `text()`.
+    Kind(NodeTest<'expr>),
+}
+
+/// A `SingleType` used by `cast as` / `castable as`: an atomic type name with
+/// an optional `?` permitting the empty sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleType<'expr> {
+    /// Atomic type name.
+    pub type_name: QName<'expr>,
+    /// Whether a trailing `?` allows the empty sequence.
+    pub optional: bool,
 }
 
 /// XPath literal forms.
@@ -226,7 +298,8 @@ pub enum Axis {
     Preceding,
 }
 
-/// XPath node tests.
+/// XPath node tests, covering both the name-test forms and the full XPath 2.0
+/// `KindTest` grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeTest<'expr> {
     Name(QName<'expr>),
@@ -237,4 +310,14 @@ pub enum NodeTest<'expr> {
     Node,
     Comment,
     ProcessingInstruction(Option<Cow<'expr, str>>),
+    /// `document-node()` or `document-node(element(...))`.
+    Document(Option<Box<NodeTest<'expr>>>),
+    /// `element()`, `element(name)`, `element(name, type)`, `element(*, type)`.
+    Element(Option<QName<'expr>>, Option<QName<'expr>>),
+    /// `attribute()`, `attribute(name)`, `attribute(name, type)`.
+    Attribute(Option<QName<'expr>>, Option<QName<'expr>>),
+    /// `schema-element(name)`.
+    SchemaElement(QName<'expr>),
+    /// `schema-attribute(name)`.
+    SchemaAttribute(QName<'expr>),
 }

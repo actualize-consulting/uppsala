@@ -26,6 +26,14 @@ test-xpath:
 test-xpath2:
     cargo test --test xpath2_conformance
 
+# Run the W3C QT3 XPath 2.0 conformance runner (skips if snapshot absent)
+test-qt3-xpath2:
+    cargo test --test xpath2_qt3 -- --nocapture
+
+# Run the zero-dependency XPath 2.0 benchmark harness
+bench-xpath2:
+    cargo bench --bench xpath2_bench
+
 # Run XSD conformance tests (38 tests)
 test-xsd:
     cargo test --test xsd_conformance
