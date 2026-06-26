@@ -1,15 +1,15 @@
 //! Date/time validation helpers for XSD built-in date and time types.
 //!
 //! Implements format validation for all XSD date/time types:
-//! - `xs:dateTime` (YYYY-MM-DDThh:mm:ss[.sss][timezone])
-//! - `xs:date` (YYYY-MM-DD[timezone])
-//! - `xs:time` (hh:mm:ss[.sss][timezone])
-//! - `xs:duration` (PnYnMnDTnHnMnS)
-//! - `xs:gYear` ([-]CCYY[timezone])
-//! - `xs:gYearMonth` ([-]CCYY-MM[timezone])
-//! - `xs:gMonth` (--MM[timezone])
-//! - `xs:gMonthDay` (--MM-DD[timezone])
-//! - `xs:gDay` (---DD[timezone])
+//! - `xs:dateTime` (`YYYY-MM-DDThh:mm:ss[.sss][timezone]`)
+//! - `xs:date` (`YYYY-MM-DD[timezone]`)
+//! - `xs:time` (`hh:mm:ss[.sss][timezone]`)
+//! - `xs:duration` (`PnYnMnDTnHnMnS`)
+//! - `xs:gYear` (`[-]CCYY[timezone]`)
+//! - `xs:gYearMonth` (`[-]CCYY-MM[timezone]`)
+//! - `xs:gMonth` (`--MM[timezone]`)
+//! - `xs:gMonthDay` (`--MM-DD[timezone]`)
+//! - `xs:gDay` (`---DD[timezone]`)
 //!
 //! Timezone is always optional and can be `Z`, `+hh:mm`, or `-hh:mm`.
 //! Also provides a `normalize_datetime_tz` function for normalizing timezone
@@ -155,7 +155,10 @@ pub(crate) fn is_valid_gyearmonth(s: &str) -> bool {
 /// for backwards compatibility.
 pub(crate) fn is_valid_gmonth(s: &str) -> bool {
     let s = strip_timezone(s);
-    if !s.starts_with("--") || s.len() < 4 {
+    // gMonth is an all-ASCII lexical form. Reject any non-ASCII byte up front so
+    // the fixed byte-index slices below cannot land inside a multibyte UTF-8
+    // sequence and panic on a non-char-boundary.
+    if !s.is_ascii() || !s.starts_with("--") || s.len() < 4 {
         return false;
     }
     let month_str = &s[2..4];
@@ -215,7 +218,9 @@ fn is_leap_year(year: u32) -> bool {
 /// since no year is specified).
 pub(crate) fn is_valid_gmonthday(s: &str) -> bool {
     let s = strip_timezone(s);
-    if !s.starts_with("--") || s.len() < 7 {
+    // All-ASCII lexical form; reject non-ASCII so the byte slices below stay on
+    // char boundaries.
+    if !s.is_ascii() || !s.starts_with("--") || s.len() < 7 {
         return false;
     }
     let month_str = &s[2..4];
@@ -248,7 +253,9 @@ pub(crate) fn is_valid_gmonthday(s: &str) -> bool {
 /// Day must be 01-31.
 pub(crate) fn is_valid_gday(s: &str) -> bool {
     let s = strip_timezone(s);
-    if !s.starts_with("---") || s.len() < 5 {
+    // All-ASCII lexical form; reject non-ASCII so the byte slices below stay on
+    // char boundaries.
+    if !s.is_ascii() || !s.starts_with("---") || s.len() < 5 {
         return false;
     }
     let day_str = &s[3..5];
@@ -308,7 +315,7 @@ pub(crate) fn normalize_datetime_tz(s: &str) -> String {
     val
 }
 
-/// Validate dateTime format: YYYY-MM-DDThh:mm:ss[.sss][Z|(+|-)hh:mm]
+/// Validate dateTime format: `YYYY-MM-DDThh:mm:ss[.sss][Z|(+|-)hh:mm]`
 ///
 /// Splits on 'T' and validates the date part and time part independently.
 pub(crate) fn is_valid_datetime(s: &str) -> bool {
@@ -404,7 +411,7 @@ pub(crate) fn is_valid_date(s: &str) -> bool {
     true
 }
 
-/// Validate time format: hh:mm:ss[.sss][Z|(+|-)hh:mm]
+/// Validate time format: `hh:mm:ss[.sss][Z|(+|-)hh:mm]`
 ///
 /// Hours must be 00-24 (24:00:00 is valid as end-of-day midnight).
 /// Minutes must be 00-59, seconds must be 00-59. Fractional seconds
@@ -458,7 +465,7 @@ pub(crate) fn is_valid_time(s: &str) -> bool {
     hours <= 23 && minutes <= 59 && seconds <= 59
 }
 
-/// Strip timezone from a time-only string (hh:mm:ss[.sss][Z|(+|-)hh:mm]).
+/// Strip timezone from a time-only string (`hh:mm:ss[.sss][Z|(+|-)hh:mm]`).
 ///
 /// Returns the time string without any timezone suffix, or `None` if a suffix
 /// is present but malformed.

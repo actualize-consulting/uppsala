@@ -1,6 +1,8 @@
 //! XPath 2.0 evaluator.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
@@ -40,10 +42,19 @@ impl XPath2Resolver for NoopXPath2Resolver {}
 pub struct XPath2Options {
     /// Whether XPath 1.0 compatibility mode is enabled.
     pub xpath1_compatibility: bool,
-    /// Maximum nested expression depth.
+    /// Maximum nested expression depth (parser).
     pub max_depth: u32,
     /// Maximum items an eager sequence constructor such as `to` may allocate.
     pub max_sequence_items: usize,
+    /// Maximum total units of evaluation work (nodes selected, comparisons,
+    /// sequence items produced). Bounds CPU/memory for a single evaluation so
+    /// a small expression cannot explode (e.g. nested `for`, cartesian
+    /// comparisons, repeated `//` predicates).
+    pub max_work: usize,
+    /// Maximum evaluator recursion depth. Bounds AST recursion independently of
+    /// the parser's nesting cap so flat operator chains (`1 or 1 or …`) — which
+    /// the parser builds iteratively — cannot overflow the stack.
+    pub max_eval_depth: usize,
 }
 
 impl Default for XPath2Options {
@@ -52,12 +63,87 @@ impl Default for XPath2Options {
             xpath1_compatibility: false,
             max_depth: DEFAULT_MAX_XPATH2_DEPTH,
             max_sequence_items: DEFAULT_MAX_XPATH2_SEQUENCE_ITEMS,
+            max_work: DEFAULT_MAX_XPATH2_WORK,
+            max_eval_depth: DEFAULT_MAX_XPATH2_EVAL_DEPTH,
         }
     }
 }
 
 /// Default maximum items for eager XPath 2.0 sequence construction.
 pub const DEFAULT_MAX_XPATH2_SEQUENCE_ITEMS: usize = 100_000;
+
+/// Default evaluation-work budget for a single XPath 2.0 evaluation.
+pub const DEFAULT_MAX_XPATH2_WORK: usize = 10_000_000;
+
+/// Default evaluator recursion-depth cap. Comfortably above any realistic
+/// expression nesting yet far below the stack-overflow threshold.
+pub const DEFAULT_MAX_XPATH2_EVAL_DEPTH: usize = 1_000;
+
+/// Shared per-evaluation resource budget: a work counter and a recursion-depth
+/// counter, both with interior mutability so they survive context forks.
+struct EvalBudget {
+    remaining: Cell<usize>,
+    max_work: usize,
+    depth: Cell<usize>,
+    max_eval_depth: usize,
+}
+
+impl EvalBudget {
+    fn new(max_work: usize, max_eval_depth: usize) -> Self {
+        Self {
+            remaining: Cell::new(max_work),
+            max_work,
+            depth: Cell::new(0),
+            max_eval_depth,
+        }
+    }
+
+    /// Charge `amount` units of work, failing closed when the budget is spent.
+    fn charge(&self, amount: usize) -> XmlResult<()> {
+        let remaining = self.remaining.get();
+        if amount > remaining {
+            return Err(XmlError::xpath(format!(
+                "XPath 2.0 evaluation exceeded work budget of {}",
+                self.max_work
+            )));
+        }
+        self.remaining.set(remaining - amount);
+        Ok(())
+    }
+
+    /// Enter one recursion level, returning a guard that releases it on drop.
+    ///
+    /// Takes the shared `Rc` so the returned guard owns an independent handle to
+    /// the counter and does not borrow the surrounding `DynamicContext` (which
+    /// the evaluator still needs mutably).
+    fn enter(budget: &Rc<EvalBudget>) -> XmlResult<DepthGuard> {
+        let depth = budget.depth.get() + 1;
+        if depth > budget.max_eval_depth {
+            return Err(XmlError::xpath(format!(
+                "XPath 2.0 expression nesting exceeded maximum evaluation depth of {}",
+                budget.max_eval_depth
+            )));
+        }
+        budget.depth.set(depth);
+        Ok(DepthGuard {
+            budget: Rc::clone(budget),
+        })
+    }
+}
+
+/// RAII guard decrementing the evaluator depth counter when a recursion level
+/// returns (on every path, including `?` early-exit).
+struct DepthGuard {
+    budget: Rc<EvalBudget>,
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.budget
+            .depth
+            .set(self.budget.depth.get().saturating_sub(1));
+    }
+}
 
 /// XPath 2.0 evaluator.
 #[derive(Debug, Clone)]
@@ -136,6 +222,18 @@ where
         self
     }
 
+    /// Set the total evaluation-work budget (DoS bound for a single evaluation).
+    pub fn with_max_work(mut self, max_work: usize) -> Self {
+        self.options.max_work = max_work;
+        self
+    }
+
+    /// Set the evaluator recursion-depth cap.
+    pub fn with_max_eval_depth(mut self, max_eval_depth: usize) -> Self {
+        self.options.max_eval_depth = max_eval_depth;
+        self
+    }
+
     /// Return evaluator options.
     pub fn options(&self) -> &XPath2Options {
         &self.options
@@ -192,6 +290,7 @@ where
     position: usize,
     size: usize,
     variables: Vec<(String, XPath2Value)>,
+    budget: Rc<EvalBudget>,
 }
 
 impl<'doc, 'input, R> DynamicContext<'doc, 'input, R>
@@ -214,6 +313,7 @@ where
             position: 1,
             size: 1,
             variables: Vec::new(),
+            budget: Rc::new(EvalBudget::new(options.max_work, options.max_eval_depth)),
         }
     }
 
@@ -227,6 +327,7 @@ where
             position,
             size,
             variables: self.variables.clone(),
+            budget: Rc::clone(&self.budget),
         }
     }
 
@@ -251,12 +352,17 @@ fn evaluate_expr<R>(expr: &Expr<'_>, ctx: &mut DynamicContext<'_, '_, R>) -> Xml
 where
     R: XPath2Resolver,
 {
+    // Bound recursion depth so flat operator chains (parsed iteratively, hence
+    // not covered by the parser's nesting cap) cannot overflow the stack.
+    let _depth_guard = EvalBudget::enter(&ctx.budget)?;
     match expr {
         Expr::EmptySequence => Ok(XPath2Value::empty()),
         Expr::Sequence(items) => {
             let mut value = XPath2Value::empty();
             for item in items {
-                value.extend(evaluate_expr(item, ctx)?);
+                let part = evaluate_expr(item, ctx)?;
+                ctx.budget.charge(part.len().max(1))?;
+                value.extend(part);
             }
             Ok(value)
         }
@@ -327,13 +433,20 @@ where
     R: XPath2Resolver,
 {
     if index == bindings.len() {
-        result.extend(evaluate_expr(body, ctx)?);
+        let body_value = evaluate_expr(body, ctx)?;
+        // Charge for items appended to the aggregate result. This bounds the
+        // total output of nested `for` expressions (cartesian blow-up), which
+        // `max_sequence_items` (a per-`to` cap) does not cover.
+        ctx.budget.charge(body_value.len().max(1))?;
+        result.extend(body_value);
         return Ok(());
     }
 
     let binding = &bindings[index];
     let sequence = evaluate_expr(&binding.in_expr, ctx)?;
     for item in sequence.into_items() {
+        // Charge per iteration so an empty-bodied deep `for` nest is still bounded.
+        ctx.budget.charge(1)?;
         ctx.push_variable(&binding.name, XPath2Value::new(vec![item]));
         evaluate_for_binding(bindings, body, index + 1, ctx, result)?;
         ctx.pop_variable();
@@ -416,10 +529,13 @@ where
         UnaryOp::Plus => Ok(XPath2Value::atomic(atomic)),
         UnaryOp::Minus => match atomic {
             XPath2AtomicValue::Integer(value) => {
-                let value = value.parse::<i128>().map_err(|_| {
+                let parsed = value.parse::<i128>().map_err(|_| {
                     XmlError::xpath(format!("cannot apply unary minus to '{}'", value))
                 })?;
-                Ok(XPath2Value::atomic(XPath2AtomicValue::integer(-value)))
+                let negated = parsed
+                    .checked_neg()
+                    .ok_or_else(|| XmlError::xpath("integer arithmetic overflow"))?;
+                Ok(XPath2Value::atomic(XPath2AtomicValue::integer(negated)))
             }
             other => Ok(XPath2Value::atomic(XPath2AtomicValue::double(
                 -other.as_f64()?,
@@ -462,6 +578,10 @@ where
         | BinaryOp::GeneralGe => {
             let left = evaluate_expr(left, ctx)?;
             let right = evaluate_expr(right, ctx)?;
+            // A general comparison is an O(n*m) cartesian scan; charge for it so
+            // `(//a) = (//b)` over large node-sets cannot run uncharged.
+            ctx.budget
+                .charge(left.len().saturating_mul(right.len()).max(1))?;
             Ok(XPath2Value::atomic(XPath2AtomicValue::Boolean(
                 general_compare(op, &left, &right, ctx.doc)?,
             )))
@@ -496,6 +616,7 @@ where
                         len, ctx.options.max_sequence_items
                     )));
                 }
+                ctx.budget.charge(len as usize)?;
                 for i in start..=end {
                     value.push(XPath2Item::Atomic(XPath2AtomicValue::integer(i)));
                 }
@@ -515,6 +636,8 @@ where
         BinaryOp::Union | BinaryOp::Intersect | BinaryOp::Except => {
             let left = evaluate_expr(left, ctx)?;
             let right = evaluate_expr(right, ctx)?;
+            ctx.budget
+                .charge(left.len().saturating_add(right.len()).max(1))?;
             node_set_operator(op, left, right)
         }
     }
@@ -572,6 +695,11 @@ where
                 node_matches(doc, *candidate, step.axis, &step.test, ctx.namespaces)
             })
             .collect();
+
+        // Charge for every candidate the axis produced — this is the primary
+        // node-multiplying operation and bounds `//`, predicate re-evaluation,
+        // and large axis fan-out.
+        ctx.budget.charge(candidates.len().max(1))?;
 
         for predicate in &step.predicates {
             candidates = apply_predicate(doc, ctx, &candidates, predicate)?;
@@ -1005,12 +1133,18 @@ fn arithmetic(
             let left = left.as_i128()?;
             let right = right.as_i128()?;
             let value = match op {
-                BinaryOp::Add => left + right,
-                BinaryOp::Subtract => left - right,
-                BinaryOp::Multiply => left * right,
-                BinaryOp::Mod => left % right,
+                BinaryOp::Add => left.checked_add(right),
+                BinaryOp::Subtract => left.checked_sub(right),
+                BinaryOp::Multiply => left.checked_mul(right),
+                BinaryOp::Mod => {
+                    if right == 0 {
+                        return Err(XmlError::xpath("division by zero in mod"));
+                    }
+                    left.checked_rem(right)
+                }
                 _ => unreachable!("integer arithmetic operator constrained by match guard"),
-            };
+            }
+            .ok_or_else(|| XmlError::xpath("integer arithmetic overflow"))?;
             Ok(XPath2Value::atomic(XPath2AtomicValue::integer(value)))
         }
         BinaryOp::Idiv => {
@@ -1192,26 +1326,83 @@ fn node_set_operator(
 ) -> XmlResult<XPath2Value> {
     let left = dedup_document_order(nodes_from_value(left)?);
     let right = dedup_document_order(nodes_from_value(right)?);
-    let mut nodes = match op {
-        BinaryOp::Union => {
-            let mut nodes = left;
-            nodes.extend(right);
-            nodes
-        }
-        BinaryOp::Intersect => left
-            .into_iter()
-            .filter(|node| right.contains(node))
-            .collect(),
-        BinaryOp::Except => left
-            .into_iter()
-            .filter(|node| !right.contains(node))
-            .collect(),
+    let nodes = match op {
+        BinaryOp::Union => union_sorted_nodes(&left, &right),
+        BinaryOp::Intersect => intersect_sorted_nodes(&left, &right),
+        BinaryOp::Except => except_sorted_nodes(&left, &right),
         _ => unreachable!("node set operator constrained by caller"),
     };
-    nodes = dedup_document_order(nodes);
     Ok(XPath2Value::new(
         nodes.into_iter().map(XPath2Item::Node).collect(),
     ))
+}
+
+fn union_sorted_nodes(left: &[NodeId], right: &[NodeId]) -> Vec<NodeId> {
+    let mut nodes = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut left_pos = 0;
+    let mut right_pos = 0;
+    while left_pos < left.len() && right_pos < right.len() {
+        match left[left_pos].index().cmp(&right[right_pos].index()) {
+            std::cmp::Ordering::Less => {
+                nodes.push(left[left_pos]);
+                left_pos += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                nodes.push(right[right_pos]);
+                right_pos += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                nodes.push(left[left_pos]);
+                left_pos += 1;
+                right_pos += 1;
+            }
+        }
+    }
+    nodes.extend_from_slice(&left[left_pos..]);
+    nodes.extend_from_slice(&right[right_pos..]);
+    nodes
+}
+
+fn intersect_sorted_nodes(left: &[NodeId], right: &[NodeId]) -> Vec<NodeId> {
+    let mut nodes = Vec::new();
+    let mut left_pos = 0;
+    let mut right_pos = 0;
+    while left_pos < left.len() && right_pos < right.len() {
+        match left[left_pos].index().cmp(&right[right_pos].index()) {
+            std::cmp::Ordering::Less => left_pos += 1,
+            std::cmp::Ordering::Greater => right_pos += 1,
+            std::cmp::Ordering::Equal => {
+                nodes.push(left[left_pos]);
+                left_pos += 1;
+                right_pos += 1;
+            }
+        }
+    }
+    nodes
+}
+
+fn except_sorted_nodes(left: &[NodeId], right: &[NodeId]) -> Vec<NodeId> {
+    let mut nodes = Vec::new();
+    let mut left_pos = 0;
+    let mut right_pos = 0;
+    while left_pos < left.len() {
+        if right_pos >= right.len() {
+            nodes.extend_from_slice(&left[left_pos..]);
+            break;
+        }
+        match left[left_pos].index().cmp(&right[right_pos].index()) {
+            std::cmp::Ordering::Less => {
+                nodes.push(left[left_pos]);
+                left_pos += 1;
+            }
+            std::cmp::Ordering::Greater => right_pos += 1,
+            std::cmp::Ordering::Equal => {
+                left_pos += 1;
+                right_pos += 1;
+            }
+        }
+    }
+    nodes
 }
 
 fn dedup_document_order(mut nodes: Vec<NodeId>) -> Vec<NodeId> {

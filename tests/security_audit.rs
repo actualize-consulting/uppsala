@@ -263,35 +263,27 @@ fn xpath_parser_deep_paren_stack_overflow() {
     let _ = eval.evaluate(&doc, root, &expr);
 }
 
-// ─── Finding F-09 — XPath substring() overflow in debug builds ──────────
+// ─── Finding F-09/F11 — XPath substring() overflow — FIXED ──────────────
 
 #[test]
-fn xpath_substring_overflow_debug() {
-    // substring(s, 1, +inf) — NaN/inf length coerces to usize::MAX via
-    // `f64::round() as usize`, then `start + len` overflows.
-    // In debug builds this panics; in release it wraps. We use
-    // catch_unwind so the test works either way, but assert that a
-    // panic IS observed under debug_assertions.
+fn xpath_substring_overflow_handled() {
+    // Regression for F11. `substring(s, start, +inf)` coerced the length to
+    // `usize::MAX`; `start + len` then overflowed (debug panic / release wrap
+    // into an out-of-order slice). `substring` now uses `saturating_add` and
+    // clamps, so a huge/`inf` length yields a normal (clamped) result with no
+    // panic in either build profile.
     use std::panic;
     let mut doc = parse("<r>hello</r>").unwrap();
     doc.prepare_xpath();
     let eval = XPathEvaluator::new();
     let root = doc.root();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        // start=5 (nonzero), len=+inf → (start + usize::MAX) overflows.
-        eval.evaluate(&doc, root, "substring('hello', 5, 1 div 0)")
+        eval.evaluate(&doc, root, "substring('hello', 2, 1 div 0)")
     }));
-    #[cfg(debug_assertions)]
-    {
-        assert!(
-            result.is_err(),
-            "expected panic on `start + len` overflow under debug_assertions"
-        );
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = result; // in release, wraps silently; don't assert
-    }
+    assert!(result.is_ok(), "substring must not panic on overflow");
+    let value = result.unwrap().expect("evaluation succeeds");
+    // start=2 (1-based) with an unbounded length returns the rest of the string.
+    assert_eq!(value.to_string_value(&doc), "ello");
 }
 
 // ─── Finding F-10 — XSD xs:include arbitrary local file read ────────────
@@ -534,23 +526,20 @@ fn namespace_resolver_accepts_xml_rebinding() {
     );
 }
 
-// ─── Finding F-16 — Control characters silently emitted on serialize ───
+// ─── Finding F-16 — Control characters silently emitted on serialize — FIXED ─
 
 #[test]
-fn control_char_emitted_on_attribute_write() {
+fn control_char_sanitized_on_attribute_write() {
     // Construct an attribute value containing U+0001 (an illegal Char
-    // in XML 1.0) and serialize. Writer must either reject or
-    // numeric-escape; current behavior emits raw.
+    // in XML 1.0) and serialize. The writer now replaces invalid XML
+    // characters with U+FFFD so the output remains parseable.
     let mut w = XmlWriter::new();
     w.start_element("r", &[("a", "x\u{0001}y")]);
     w.end_element("r");
     let out = w.into_string();
-    // The resulting XML should NOT reparse — the 0x01 byte is invalid.
-    let reparsed = parse(&out);
-    assert!(
-        reparsed.is_err(),
-        "serializer allowed U+0001 to reach output, producing invalid XML"
-    );
+    assert!(!out.contains('\u{0001}'));
+    assert!(out.contains('\u{FFFD}'));
+    parse(&out).expect("sanitized output must reparse");
 }
 
 // ─── Finding F-17 — XPath //a//b//c cross-product blow-up ──────────────

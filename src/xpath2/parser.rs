@@ -22,6 +22,8 @@ struct XPath2Parser<'tokens, 'expr> {
     position: usize,
     depth: u32,
     max_depth: u32,
+    nodes: usize,
+    max_nodes: usize,
 }
 
 impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
@@ -31,7 +33,28 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
             position: 0,
             depth: 0,
             max_depth,
+            nodes: 0,
+            // Cap total AST nodes. Left-associative operator chains
+            // (`1 or 1 or …`) are parsed iteratively, so the `max_depth`
+            // nesting guard does not bound them; an unbounded chain builds a
+            // deep AST that overflows the stack when evaluated *or dropped*
+            // (recursive `Box<Expr>` destructor). This monotonic cap bounds the
+            // whole tree. The multiplier keeps it generous for real expressions
+            // while staying well below any stack-overflow threshold.
+            max_nodes: (max_depth as usize).saturating_mul(64).max(1024),
         }
+    }
+
+    /// Count one AST node, failing closed when the tree grows too large.
+    fn charge_node(&mut self) -> XmlResult<()> {
+        self.nodes += 1;
+        if self.nodes > self.max_nodes {
+            return Err(XmlError::xpath(format!(
+                "XPath 2.0 expression exceeds maximum of {} nodes",
+                self.max_nodes
+            )));
+        }
+        Ok(())
     }
 
     fn parse_complete(mut self) -> XmlResult<Expr<'expr>> {
@@ -142,6 +165,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
     fn parse_or_expr(&mut self) -> XmlResult<Expr<'expr>> {
         let mut expr = self.parse_and_expr()?;
         while self.consume_name("or") {
+            self.charge_node()?;
             expr = Expr::Binary {
                 op: BinaryOp::Or,
                 left: Box::new(expr),
@@ -154,6 +178,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
     fn parse_and_expr(&mut self) -> XmlResult<Expr<'expr>> {
         let mut expr = self.parse_comparison_expr()?;
         while self.consume_name("and") {
+            self.charge_node()?;
             expr = Expr::Binary {
                 op: BinaryOp::And,
                 left: Box::new(expr),
@@ -168,6 +193,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
         let Some(op) = self.parse_comparison_operator() else {
             return Ok(left);
         };
+        self.charge_node()?;
         Ok(Expr::Binary {
             op,
             left: Box::new(left),
@@ -178,6 +204,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
     fn parse_range_expr(&mut self) -> XmlResult<Expr<'expr>> {
         let left = self.parse_additive_expr()?;
         if self.consume_name("to") {
+            self.charge_node()?;
             return Ok(Expr::Binary {
                 op: BinaryOp::RangeTo,
                 left: Box::new(left),
@@ -200,6 +227,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
             let Some(op) = op else {
                 break;
             };
+            self.charge_node()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
@@ -226,6 +254,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
             let Some(op) = op else {
                 break;
             };
+            self.charge_node()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
@@ -238,6 +267,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
     fn parse_union_expr(&mut self) -> XmlResult<Expr<'expr>> {
         let mut expr = self.parse_intersect_except_expr()?;
         while self.consume_token(TokenDiscriminant::Pipe) || self.consume_name("union") {
+            self.charge_node()?;
             expr = Expr::Binary {
                 op: BinaryOp::Union,
                 left: Box::new(expr),
@@ -260,6 +290,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
             let Some(op) = op else {
                 break;
             };
+            self.charge_node()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
@@ -283,6 +314,7 @@ impl<'tokens, 'expr> XPath2Parser<'tokens, 'expr> {
 
         let mut expr = self.parse_path_expr()?;
         for op in ops.into_iter().rev() {
+            self.charge_node()?;
             expr = Expr::Unary {
                 op,
                 expr: Box::new(expr),

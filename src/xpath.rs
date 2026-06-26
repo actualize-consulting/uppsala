@@ -1087,11 +1087,13 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
         Expr::Eq(left, right) => {
             let l = evaluate_expr(left, ctx)?;
             let r = evaluate_expr(right, ctx)?;
+            charge_comparison(&l, &r, ctx)?;
             Ok(XPathValue::Boolean(xpath_equal(&l, &r, ctx.doc)))
         }
         Expr::NotEq(left, right) => {
             let l = evaluate_expr(left, ctx)?;
             let r = evaluate_expr(right, ctx)?;
+            charge_comparison(&l, &r, ctx)?;
             Ok(XPathValue::Boolean(!xpath_equal(&l, &r, ctx.doc)))
         }
         Expr::Lt(left, right) => {
@@ -1147,6 +1149,18 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
         Expr::NumberLiteral(n) => Ok(XPathValue::Number(*n)),
         Expr::FunctionCall(name, args) => evaluate_function(name, args, ctx),
     }
+}
+
+/// Charge the evaluation budget for an `=`/`!=` comparison.
+///
+/// Node-set comparison is an O(n*m) cartesian scan over string-values, and that
+/// work is not otherwise charged (the budget only covers node-set *building*).
+/// Without this, `(/r/a) = (/r/b)` over disjoint-valued sets built via cheap
+/// child-axis paths runs for minutes while staying under the node-visit cap.
+fn charge_comparison(left: &XPathValue, right: &XPathValue, ctx: &EvalContext) -> XmlResult<()> {
+    let l = left.as_node_set().len().max(1);
+    let r = right.as_node_set().len().max(1);
+    ctx.budget.charge(l.saturating_mul(r))
 }
 
 /// XPath equality comparison (handles node-set vs string/number/boolean).
@@ -1574,8 +1588,12 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
             let start = start.max(0) as usize;
             if args.len() == 3 {
                 let len = evaluate_expr(&args[2], ctx)?.to_number(ctx.doc).round() as usize;
-                let end = (start + len).min(chars.len());
-                let result: String = chars[start.min(chars.len())..end].iter().collect();
+                let begin = start.min(chars.len());
+                // `saturating_add` avoids the usize overflow that a huge/`inf`
+                // length argument would otherwise cause (debug panic / release
+                // wrap into an out-of-order slice).
+                let end = start.saturating_add(len).min(chars.len()).max(begin);
+                let result: String = chars[begin..end].iter().collect();
                 Ok(XPathValue::String(result))
             } else {
                 let result: String = chars[start.min(chars.len())..].iter().collect();

@@ -763,21 +763,12 @@ fn match_repetition(
         current_positions = next;
     }
 
-    // Greedy loop accumulator: a direct-indexed `seen` bitmap (positions
-    // are bounded by `input.len()`) gives O(1) membership test per
-    // candidate. Combined with a parallel `results` Vec that holds only
-    // the unique reachable end-positions, total work is O(N) insertions
-    // plus one O(N log N) final sort — vs the O(N^2) cost a
-    // merge-into-sorted-vec accumulator would incur on linear patterns
-    // like `[a-z]+` over a long string of `a`s.
-    let mut seen: Vec<bool> = vec![false; input.len() + 1];
-    let mut results: Vec<usize> = Vec::new();
-    for &p in &current_positions {
-        if p < seen.len() && !seen[p] {
-            seen[p] = true;
-            results.push(p);
-        }
-    }
+    // `results` accumulates the unique reachable end-positions. The initial
+    // positions are typically already sorted+deduped (from the required-min
+    // loop, or a single start position), so a cheap sort+dedup suffices.
+    let mut results: Vec<usize> = current_positions.clone();
+    results.sort_unstable();
+    results.dedup();
 
     // Defence-in-depth: `parse_brace_quantifier` rejects `{n,m}` with
     // `m < n` at compile time, so reaching the panic-on-underflow path
@@ -791,6 +782,16 @@ fn match_repetition(
         None => input.len().saturating_add(1), // More than enough
     };
 
+    // The `seen` membership bitmap is sized to `input.len()` — an O(N)
+    // allocation. It is materialized LAZILY, only on the first greedy
+    // iteration that actually advances. A repetition that cannot match even
+    // once (the common `a*b*`-over-`aaaa…` shape, where the inner atom fails
+    // immediately) therefore never pays the O(N) allocation. Without this, an
+    // outer repetition that invokes `match_repetition` O(N) times would incur
+    // an O(N) allocation each time — O(N^2) total work that the per-`match_node`
+    // step budget cannot bound, since a single tick covers an O(N) memset.
+    let mut seen: Vec<bool> = Vec::new();
+
     for _ in 0..remaining {
         let mut next = Vec::new();
         for &pos in &current_positions {
@@ -800,6 +801,17 @@ fn match_repetition(
         next.dedup();
         if next.is_empty() {
             break;
+        }
+
+        if seen.is_empty() {
+            // First productive iteration: build the bitmap and seed it with the
+            // end-positions already in `results`.
+            seen = vec![false; input.len() + 1];
+            for &p in &results {
+                if p < seen.len() {
+                    seen[p] = true;
+                }
+            }
         }
 
         let mut added = false;
@@ -1042,6 +1054,11 @@ fn property_matches(prop: &UnicodeProperty, ch: char) -> bool {
 /// silently widening a pattern (a validation bypass). The supplied char is
 /// irrelevant to known-ness — a recognized property yields `Some(_)` and an
 /// unrecognized one yields `None`.
+///
+/// The recognized set is the **closed** list XSD 1.0 Part 2 defines: the Unicode
+/// general categories plus the Appendix-F `IsBlock` names (see
+/// [`match_unicode_block`]). A name outside that list is not a valid escape, so
+/// rejecting it is spec-correct rather than an over-restriction.
 fn is_known_property_name(name: &str) -> bool {
     match_property_name(name, 'a').is_some()
 }
@@ -1715,6 +1732,14 @@ fn is_assigned(ch: char) -> bool {
 
 /// Match a Unicode block name (the part after `Is`). Returns `None` when the
 /// block name is not recognized so callers can fail closed.
+///
+/// The recognized names are the **closed** set of `IsBlock` identifiers defined
+/// by XSD 1.0 Part 2 Appendix F (the Unicode 3.1 block list), plus a few later
+/// blocks. Because XSD defines this as a closed list, a name outside it is not a
+/// valid block escape and is correctly rejected at compile time (`None`) rather
+/// than silently matching nothing — which would let `\P{IsTypo}` match every
+/// character (a validation bypass). Adding a genuinely new block is therefore a
+/// deliberate table edit, not an open-ended fallback.
 fn match_unicode_block(block_name: &str, ch: char) -> Option<bool> {
     let c = ch as u32;
     let matched = match block_name {

@@ -1290,17 +1290,36 @@ impl<'a> Document<'a> {
                 // Track names already emitted for this start tag so sanitized
                 // programmatic attributes cannot collide into duplicate XML.
                 let mut seen_attrs = Vec::new();
-                // Namespace declarations
+                // Namespace declarations. Sanitized prefixes can collide (two
+                // distinct invalid prefixes both collapse to `_`), which would
+                // emit duplicate `xmlns:_` attributes and produce not-well-formed
+                // output. Disambiguate the prefix against names already emitted
+                // for this start tag so the result always re-parses.
                 for (prefix, uri) in &elem.namespace_declarations {
                     if prefix.is_empty() {
-                        out.write_str(" xmlns=\"")?;
+                        // A default-namespace declaration has the fixed name
+                        // `xmlns`, which cannot be disambiguated; skip a
+                        // duplicate rather than emit a malformed document.
+                        if seen_attrs.iter().any(|name| name == "xmlns") {
+                            continue;
+                        }
                         seen_attrs.push("xmlns".to_string());
+                        out.write_str(" xmlns=\"")?;
                     } else {
-                        let prefix = crate::writer::safe_xml_ncname(prefix);
+                        let safe = crate::writer::safe_xml_ncname(prefix).into_owned();
+                        let mut candidate = safe.clone();
+                        let mut suffix = 1usize;
+                        while seen_attrs
+                            .iter()
+                            .any(|name| name == &format!("xmlns:{}", candidate))
+                        {
+                            candidate = format!("{}_{}", safe, suffix);
+                            suffix += 1;
+                        }
+                        seen_attrs.push(format!("xmlns:{}", candidate));
                         out.write_str(" xmlns:")?;
-                        out.write_str(&prefix)?;
+                        out.write_str(&candidate)?;
                         out.write_str("=\"")?;
-                        seen_attrs.push(format!("xmlns:{}", prefix));
                     }
                     write_escaped_attr(out, uri)?;
                     out.write_char('"')?;
@@ -1507,7 +1526,7 @@ fn write_escaped_text(out: &mut dyn fmt::Write, s: &str) -> fmt::Result {
             '<' => out.write_str("&lt;")?,
             '>' => out.write_str("&gt;")?,
             '\r' => out.write_str("&#xD;")?,
-            _ => out.write_char(c)?,
+            _ => out.write_char(crate::writer::sanitized_xml_char(c))?,
         }
     }
     Ok(())
@@ -1533,7 +1552,7 @@ fn write_escaped_attr(out: &mut dyn fmt::Write, s: &str) -> fmt::Result {
             '\t' => out.write_str("&#x9;")?,
             '\n' => out.write_str("&#xA;")?,
             '\r' => out.write_str("&#xD;")?,
-            _ => out.write_char(c)?,
+            _ => out.write_char(crate::writer::sanitized_xml_char(c))?,
         }
     }
     Ok(())

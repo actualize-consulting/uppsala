@@ -4,7 +4,7 @@
 //! constraints, computing the intersection and union of namespace constraints,
 //! and determining the stricter of two processContents values.
 //!
-//! These are used by [`AttributeWildcard`](super::types::AttributeWildcard) methods
+//! These are used by `AttributeWildcard` methods
 //! and by element wildcard validation in the validation module.
 
 use super::types::{NamespaceConstraint, ProcessContents};

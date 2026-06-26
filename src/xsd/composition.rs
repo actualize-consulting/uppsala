@@ -21,7 +21,12 @@
 //!    group or attributeGroup references may have changed.
 
 use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
@@ -55,6 +60,34 @@ pub(super) struct CompositionState {
     pub(super) depth: u8,
 }
 
+struct ResolvedSchemaPath {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    Some(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
 impl CompositionState {
     /// Fresh state, seeded with the top-level schema's canonical path so
     /// the very first include won't try to re-load the outer document.
@@ -70,14 +103,14 @@ impl CompositionState {
 }
 
 /// Resolve a `schemaLocation` attribute to a filesystem path, applying
-/// F-10 containment, F-11 cycle detection, and the F-12 / TOCTOU fix in
-/// a single canonicalize step.
+/// F-10 containment, F-11 cycle detection, and the first half of the
+/// F-12 TOCTOU defense.
 ///
 /// Returns:
-/// * `Ok(Some(canonical))` — load this path. The returned `PathBuf` has
-///   already been canonicalized (symlinks resolved), so the caller can
-///   pass it directly to `std::fs::read_to_string` without a race
-///   between the containment check and the read.
+/// * `Ok(Some(resolved))` — load this path through `read_resolved_schema`,
+///   not directly. The path has been canonicalized and paired with the file
+///   identity observed during resolution so the read side can detect a later
+///   symlink swap before trusting bytes from the opened handle.
 /// * `Ok(None)` — silent-skip: either the target doesn't exist (matches
 ///   pre-fix behaviour for relative `schemaLocation` typos) or the file
 ///   was already loaded earlier in this build (cycle short-circuit).
@@ -90,7 +123,7 @@ fn resolve_include_path(
     canonical_base: Option<&Path>,
     state: &mut CompositionState,
     kind: &str,
-) -> XmlResult<Option<PathBuf>> {
+) -> XmlResult<Option<ResolvedSchemaPath>> {
     let resolved_path = match base_dir {
         Some(dir) => dir.join(schema_location),
         None => PathBuf::from(schema_location),
@@ -128,12 +161,39 @@ fn resolve_include_path(
         }
     }
 
-    // Prefer the canonical path for the subsequent read — that path has
-    // had its symlinks resolved, so a concurrent symlink swap cannot
-    // redirect the read outside the containment check we just passed.
-    // Fall back to the lexical `resolved_path` only when there's no
-    // containment to enforce (no base_dir), which is the pre-fix shape.
-    Ok(Some(canonical.unwrap_or(resolved_path)))
+    let path = canonical.unwrap_or(resolved_path);
+    let identity = fs::metadata(&path).ok().and_then(|m| file_identity(&m));
+    Ok(Some(ResolvedSchemaPath { path, identity }))
+}
+
+fn read_resolved_schema(
+    resolved: &ResolvedSchemaPath,
+    schema_location: &str,
+    kind: &str,
+) -> XmlResult<Option<String>> {
+    let mut file = match File::open(&resolved.path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+
+    if let Some(expected) = resolved.identity {
+        let actual = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| file_identity(&metadata));
+        if actual != Some(expected) {
+            return Err(XmlError::validation(format!(
+                "Cannot resolve {} schemaLocation '{}': file changed during resolution",
+                kind, schema_location
+            )));
+        }
+    }
+
+    let mut contents = String::new();
+    match file.read_to_string(&mut contents) {
+        Ok(_) => Ok(Some(contents)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Process `xs:include`, `xs:redefine`, and `xs:import` elements in a schema
@@ -196,12 +256,13 @@ pub(super) fn process_schema_composition(
                         None => continue, // No schemaLocation, skip
                     };
 
-                    // Resolve the schemaLocation to a canonical path,
-                    // enforcing F-10 containment, F-11 cycle detection,
-                    // and closing the TOCTOU window against concurrent
-                    // symlink swaps (F-12) in a single helper.
+                    // Resolve the schemaLocation to a contained canonical path
+                    // and remember the resolved file identity. The subsequent
+                    // read verifies the opened handle still has that identity;
+                    // the race is closed by the resolve/read pair, not by this
+                    // path helper alone.
                     let kind = if is_redefine { "redefine" } else { "include" };
-                    let canonical_path = match resolve_include_path(
+                    let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir,
                         canonical_base.as_deref(),
@@ -212,13 +273,17 @@ pub(super) fn process_schema_composition(
                         None => continue,
                     };
 
-                    // Load and parse the external schema from the
-                    // canonicalized path — symlinks already resolved,
-                    // so the read can't be redirected after the check.
-                    let ext_str = match std::fs::read_to_string(&canonical_path) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                    // Load through the resolved descriptor. Canonicalization
+                    // proves the path was contained at check time; on Unix the
+                    // stored file identity also proves the opened handle is the
+                    // same file, closing the symlink-swap race. Other platforms
+                    // retain canonical containment but need platform handle APIs
+                    // for the same post-open identity guarantee.
+                    let ext_str =
+                        match read_resolved_schema(&resolved_schema, schema_location, kind)? {
+                            Some(s) => s,
+                            None => continue,
+                        };
                     let ext_doc = match crate::parse(&ext_str) {
                         Ok(d) => d,
                         Err(_) => continue,
@@ -233,7 +298,7 @@ pub(super) fn process_schema_composition(
                     state.depth += 1;
                     let ext_validator_res = XsdValidator::from_schema_with_composition_state(
                         &ext_doc,
-                        Some(&canonical_path),
+                        Some(&resolved_schema.path),
                         state,
                     );
                     state.depth -= 1;
@@ -265,7 +330,7 @@ pub(super) fn process_schema_composition(
                     };
 
                     // Same resolve-then-read sequence as include/redefine.
-                    let canonical_path = match resolve_include_path(
+                    let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir,
                         canonical_base.as_deref(),
@@ -276,11 +341,14 @@ pub(super) fn process_schema_composition(
                         None => continue,
                     };
 
-                    // Load and parse the external schema.
-                    let ext_str = match std::fs::read_to_string(&canonical_path) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                    // Load and parse the external schema, verifying after open
+                    // that the handle still matches the resolved file identity
+                    // where the platform exposes one through std.
+                    let ext_str =
+                        match read_resolved_schema(&resolved_schema, schema_location, "import")? {
+                            Some(s) => s,
+                            None => continue,
+                        };
                     let ext_doc = match crate::parse(&ext_str) {
                         Ok(d) => d,
                         Err(_) => continue,
@@ -294,7 +362,7 @@ pub(super) fn process_schema_composition(
                     state.depth += 1;
                     let ext_validator_res = XsdValidator::from_schema_with_composition_state(
                         &ext_doc,
-                        Some(&canonical_path),
+                        Some(&resolved_schema.path),
                         state,
                     );
                     state.depth -= 1;
@@ -663,4 +731,39 @@ fn is_absolute_uri(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_resolved_schema_detects_stale_file_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "uppsala-composition-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("include.xsd");
+        fs::write(&path, "old").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let resolved = ResolvedSchemaPath {
+            path: path.clone(),
+            identity: file_identity(&metadata),
+        };
+        let replacement = dir.join("replacement.xsd");
+        fs::write(&replacement, "new").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let err = read_resolved_schema(&resolved, "include.xsd", "include")
+            .expect_err("changed file identity must be rejected");
+        assert!(err.to_string().contains("file changed during resolution"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use uppsala::{
     parse, Document, NodeId, QName, XPath2Evaluator, XPathEvaluator, XmlWriter, XsdValidator,
@@ -247,6 +248,67 @@ fn xpath2_range_allocation_is_bounded() {
         .evaluate(&doc, root, "1 to 3")
         .unwrap();
     assert_eq!(value.items().len(), 3);
+}
+
+#[test]
+fn xpath2_set_operators_are_linear_and_correct() {
+    let mut xml = String::from("<r>");
+    for i in 0..8_000 {
+        xml.push_str(&format!(r#"<a id="{}"/>"#, i));
+    }
+    xml.push_str("</r>");
+    let mut doc = parse(&xml).unwrap();
+    doc.prepare_xpath();
+    let root = doc.root();
+    let evaluator = XPath2Evaluator::new().with_max_work(100_000);
+
+    let start = Instant::now();
+    let intersect = evaluator.evaluate(&doc, root, "//a intersect //a").unwrap();
+    let except = evaluator.evaluate(&doc, root, "//a except //a").unwrap();
+
+    assert_eq!(intersect.items().len(), 8_000);
+    assert!(except.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "set operators must stay linear, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn serializers_replace_invalid_xml_characters() {
+    let mut writer = XmlWriter::new();
+    writer.start_element("r", &[("a", "x\u{0001}y")]);
+    writer.text("t\u{0000}u");
+    writer.comment("c\u{0008}d");
+    writer.processing_instruction("p", Some("q\u{000C}r"));
+    writer.cdata("z\u{000B}w");
+    writer.end_element("r");
+    let xml = writer.into_string();
+
+    assert!(!xml.contains('\u{0000}'));
+    assert!(!xml.contains('\u{0001}'));
+    assert!(!xml.contains('\u{0008}'));
+    assert!(!xml.contains('\u{000B}'));
+    assert!(!xml.contains('\u{000C}'));
+    assert!(xml.contains('\u{FFFD}'));
+    parse(&xml).expect("sanitized writer output must reparse");
+
+    let mut doc = Document::new();
+    let root = doc.root();
+    let elem = doc.create_element(QName::local("r"));
+    doc.append_child(root, elem);
+    doc.element_mut(elem)
+        .unwrap()
+        .set_attribute(QName::local("a"), Cow::Borrowed("x\u{0001}y"));
+    let text = doc.create_text("t\u{0000}u");
+    doc.append_child(elem, text);
+    let output = doc.to_xml();
+
+    assert!(!output.contains('\u{0000}'));
+    assert!(!output.contains('\u{0001}'));
+    assert!(output.contains('\u{FFFD}'));
+    parse(&output).expect("sanitized DOM output must reparse");
 }
 
 #[test]

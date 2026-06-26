@@ -339,12 +339,13 @@ impl std::fmt::Display for XmlWriter {
 /// intent of the text is preserved; a human reading the comment sees the
 /// same words) but byte-inequivalent.
 pub(crate) fn sanitize_comment_content(s: &str) -> Cow<'_, str> {
-    if !s.contains("--") && !s.ends_with('-') {
+    if !s.contains("--") && !s.ends_with('-') && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len() + 4);
     let mut prev_was_dash = false;
     for c in s.chars() {
+        let c = sanitized_xml_char(c);
         if c == '-' && prev_was_dash {
             out.push(' ');
         }
@@ -361,10 +362,21 @@ pub(crate) fn sanitize_comment_content(s: &str) -> Cow<'_, str> {
 /// is inserted between the `?` and `>` so the byte sequence no longer
 /// matches the parser's terminator scan.
 pub(crate) fn sanitize_pi_data(s: &str) -> Cow<'_, str> {
-    if !s.contains("?>") {
+    if !s.contains("?>") && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.replace("?>", "? >"))
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let c = sanitized_xml_char(c);
+        if c == '?' && chars.peek() == Some(&'>') {
+            out.push('?');
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Sanitize a PI target so it cannot collide with the reserved name
@@ -375,10 +387,19 @@ pub(crate) fn sanitize_pi_data(s: &str) -> Cow<'_, str> {
 /// reparse-rejected document. Renaming to `_xml` preserves the "this
 /// is a PI" intent while making the output unambiguously a PI node.
 pub(crate) fn sanitize_pi_target(s: &str) -> Cow<'_, str> {
+    // The reserved target `xml` (any case) is renamed so the PI cannot be
+    // mistaken for an XML declaration.
     if s.eq_ignore_ascii_case("xml") {
-        Cow::Owned(format!("_{}", s))
-    } else {
+        return Cow::Owned(format!("_{}", s));
+    }
+    // A PI target must be a valid XML Name. Without this check a target
+    // containing `?>` plus markup (e.g. `foo?><evil>`) is written verbatim
+    // between `<?` and the data, breaking out of PI position and smuggling
+    // sibling elements into the output. Any invalid target collapses to `_`.
+    if is_valid_xml_ncname(s) {
         Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
     }
 }
 
@@ -392,10 +413,28 @@ pub(crate) fn sanitize_pi_target(s: &str) -> Cow<'_, str> {
 /// `<![CDATA[hello]]]]><![CDATA[>world]]>`, which reparses as two adjacent
 /// CDATA sections concatenating to `"hello]]>world"`.
 pub(crate) fn split_cdata_content(s: &str) -> Cow<'_, str> {
-    if !s.contains("]]>") {
+    if !s.contains("]]>") && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.replace("]]>", "]]]]><![CDATA[>"))
+    let sanitized: String = s.chars().map(sanitized_xml_char).collect();
+    Cow::Owned(sanitized.replace("]]>", "]]]]><![CDATA[>"))
+}
+
+pub(crate) fn sanitized_xml_char(c: char) -> char {
+    if is_xml_char(c) {
+        c
+    } else {
+        '\u{FFFD}'
+    }
+}
+
+pub(crate) fn is_xml_char(c: char) -> bool {
+    matches!(c,
+        '\u{9}' | '\u{A}' | '\u{D}' |
+        '\u{20}'..='\u{D7FF}' |
+        '\u{E000}'..='\u{FFFD}' |
+        '\u{10000}'..='\u{10FFFF}'
+    )
 }
 
 /// Return `s` if it is a version this library can both serialize and
@@ -544,7 +583,7 @@ fn write_escaped_text_to_string(buf: &mut String, s: &str) {
             '<' => buf.push_str("&lt;"),
             '>' => buf.push_str("&gt;"),
             '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(c),
+            _ => buf.push(sanitized_xml_char(c)),
         }
     }
 }
@@ -560,7 +599,7 @@ fn write_escaped_attr_to_string(buf: &mut String, s: &str) {
             '\t' => buf.push_str("&#x9;"),
             '\n' => buf.push_str("&#xA;"),
             '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(c),
+            _ => buf.push(sanitized_xml_char(c)),
         }
     }
 }
