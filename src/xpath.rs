@@ -1044,7 +1044,10 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
             }
-            Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
+            // `apply_step` already returns a deduplicated, document-ordered
+            // vector, so an extra dedup pass here would be redundant (and
+            // uncharged) work.
+            Ok(XPathValue::NodeSet(nodes))
         }
         Expr::AbsolutePath(steps) => {
             // Find the document root
@@ -1056,7 +1059,8 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
             }
-            Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
+            // Already deduplicated and document-ordered by `apply_step`.
+            Ok(XPathValue::NodeSet(nodes))
         }
         Expr::Union(left, right) => {
             let left_val = evaluate_expr(left, ctx)?;
@@ -1155,10 +1159,19 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
 /// work is not otherwise charged (the budget only covers node-set *building*).
 /// Without this, `(/r/a) = (/r/b)` over disjoint-valued sets built via cheap
 /// child-axis paths runs for minutes while staying under the node-visit cap.
+///
+/// Only node-set work is charged: a pure scalar-vs-scalar comparison (e.g.
+/// `1 = 1`) performs no node visits, so it must not consume budget — otherwise
+/// it would fail under a zero budget despite touching no nodes. Scalar-vs-node-set
+/// is charged as `1 * N`.
 fn charge_comparison(left: &XPathValue, right: &XPathValue, ctx: &EvalContext) -> XmlResult<()> {
-    let l = left.as_node_set().len().max(1);
-    let r = right.as_node_set().len().max(1);
-    ctx.budget.charge(l.saturating_mul(r))
+    let l = left.as_node_set().len();
+    let r = right.as_node_set().len();
+    if l == 0 && r == 0 {
+        // Neither operand is a (non-empty) node-set: no cartesian scan happens.
+        return Ok(());
+    }
+    ctx.budget.charge(l.max(1).saturating_mul(r.max(1)))
 }
 
 /// XPath equality comparison (handles node-set vs string/number/boolean).

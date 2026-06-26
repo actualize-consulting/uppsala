@@ -13,7 +13,8 @@ use uppsala::{parse, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
 
 /// Canonical Billion Laughs. `&lol9;` expands to 10^9 characters.
 /// Must either be rejected *before* expansion (size cap / depth cap)
-/// or complete in bounded time. Current code fully expands it.
+/// or complete in bounded time. The assertion below pins the hardened
+/// behavior: parsing fails closed in well under a second.
 #[test]
 #[ignore = "OOMs / hangs the test runner — run explicitly to confirm"]
 fn billion_laughs_full() {
