@@ -137,7 +137,7 @@ fn xpath_axis_expansion_is_budgeted() {
         .with_max_node_visits(2)
         .select_nodes(&doc, root, "//b")
         .expect_err("low node visit budget must stop expansion");
-    assert!(err.to_string().contains("node visit budget"));
+    assert!(err.to_string().contains("maximum node visit budget of 2"));
 
     let nodes = XPathEvaluator::new()
         .with_max_node_visits(100)
@@ -175,7 +175,9 @@ fn xsd_rejects_malformed_time_and_datetime_values() {
     assert!(!validate(schema, "<t>12:00:00:99</t>").is_empty());
     assert!(!validate(schema, "<t>12:00:00+99:00</t>").is_empty());
     assert!(!validate(schema, "<t>24:00:01</t>").is_empty());
+    assert!(!validate(schema, "<t>12:00:0é0+000</t>").is_empty());
     assert!(!validate(schema, "<dt>2024-01-01T12:00:00+99:00</dt>").is_empty());
+    assert!(!validate(schema, "<dt>2024-01-01T12:00:0é0+000</dt>").is_empty());
 }
 
 #[test]

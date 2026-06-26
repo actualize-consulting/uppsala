@@ -1011,12 +1011,14 @@ struct EvalContext<'a, 'b> {
 
 struct EvalBudget {
     remaining: Cell<usize>,
+    max_visits: usize,
 }
 
 impl EvalBudget {
     fn new(max_visits: usize) -> Self {
         Self {
             remaining: Cell::new(max_visits),
+            max_visits,
         }
     }
 
@@ -1025,7 +1027,7 @@ impl EvalBudget {
         if amount > remaining {
             return Err(XmlError::xpath(format!(
                 "XPath evaluation exceeded maximum node visit budget of {}",
-                remaining + amount
+                self.max_visits
             )));
         }
         self.remaining.set(remaining - amount);

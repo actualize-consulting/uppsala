@@ -212,7 +212,8 @@ fn evaluates_prefix_and_local_wildcards() {
         </root>
     "#;
     let doc = parse(xml).unwrap();
-    let eval = XPath2Evaluator::new();
+    let mut eval = XPath2Evaluator::new();
+    eval.add_namespace("ns", "urn:a");
 
     assert_eq!(
         eval.select_nodes(&doc, doc.root(), "//ns:*").unwrap().len(),
@@ -224,6 +225,34 @@ fn evaluates_prefix_and_local_wildcards() {
             .len(),
         2
     );
+}
+
+#[test]
+fn evaluates_name_tests_against_namespace_uris() {
+    let xml = r#"
+        <root xmlns:a="urn:evil" xmlns:b="urn:a">
+            <a:item/>
+            <b:item/>
+            <item/>
+        </root>
+    "#;
+    let doc = parse(xml).unwrap();
+    let root = doc.document_element().unwrap();
+
+    let eval = XPath2Evaluator::new();
+    assert_eq!(eval.select_nodes(&doc, root, "a:item").unwrap().len(), 0);
+    assert_eq!(eval.select_nodes(&doc, root, "item").unwrap().len(), 1);
+
+    let mut eval = XPath2Evaluator::new();
+    eval.add_namespace("a", "urn:a");
+
+    let nodes = eval.select_nodes(&doc, root, "a:item").unwrap();
+    assert_eq!(nodes.len(), 1);
+    let element = doc.element(nodes[0]).unwrap();
+    assert_eq!(element.name.namespace_uri.as_deref(), Some("urn:a"));
+    assert_eq!(element.name.prefix.as_deref(), Some("b"));
+
+    assert_eq!(eval.select_nodes(&doc, root, "a:*").unwrap().len(), 1);
 }
 
 #[test]

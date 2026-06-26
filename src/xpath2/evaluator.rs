@@ -1,5 +1,7 @@
 //! XPath 2.0 evaluator.
 
+use std::collections::HashMap;
+
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
 
@@ -62,6 +64,7 @@ pub const DEFAULT_MAX_XPATH2_SEQUENCE_ITEMS: usize = 100_000;
 pub struct XPath2Evaluator<R = NoopXPath2Resolver> {
     options: XPath2Options,
     resolver: R,
+    namespaces: HashMap<String, String>,
 }
 
 impl XPath2Evaluator<NoopXPath2Resolver> {
@@ -70,6 +73,7 @@ impl XPath2Evaluator<NoopXPath2Resolver> {
         Self {
             options: XPath2Options::default(),
             resolver: NoopXPath2Resolver,
+            namespaces: HashMap::new(),
         }
     }
 }
@@ -92,7 +96,19 @@ where
         XPath2Evaluator {
             options: self.options,
             resolver,
+            namespaces: self.namespaces,
         }
+    }
+
+    /// Register a namespace prefix for use in XPath 2.0 expressions.
+    pub fn add_namespace(&mut self, prefix: impl Into<String>, uri: impl Into<String>) {
+        self.namespaces.insert(prefix.into(), uri.into());
+    }
+
+    /// Register a namespace prefix and return `self` for builder-style setup.
+    pub fn with_namespace(mut self, prefix: impl Into<String>, uri: impl Into<String>) -> Self {
+        self.add_namespace(prefix, uri);
+        self
     }
 
     /// Enable or disable XPath 1.0 compatibility mode.
@@ -130,6 +146,7 @@ where
             doc,
             &self.resolver,
             &self.options,
+            &self.namespaces,
             XPath2Item::Node(context_node),
         );
         evaluate_expr(&expr, &mut ctx)
@@ -163,6 +180,7 @@ where
     doc: &'doc Document<'input>,
     resolver: &'doc R,
     options: &'doc XPath2Options,
+    namespaces: &'doc HashMap<String, String>,
     context_item: XPath2Item,
     position: usize,
     size: usize,
@@ -177,12 +195,14 @@ where
         doc: &'doc Document<'input>,
         resolver: &'doc R,
         options: &'doc XPath2Options,
+        namespaces: &'doc HashMap<String, String>,
         context_item: XPath2Item,
     ) -> Self {
         Self {
             doc,
             resolver,
             options,
+            namespaces,
             context_item,
             position: 1,
             size: 1,
@@ -195,6 +215,7 @@ where
             doc: self.doc,
             resolver: self.resolver,
             options: self.options,
+            namespaces: self.namespaces,
             context_item,
             position,
             size,
@@ -540,7 +561,9 @@ where
     for node in context_nodes {
         let mut candidates: Vec<NodeId> = axis_nodes(doc, *node, step.axis)
             .into_iter()
-            .filter(|candidate| node_matches(doc, *candidate, step.axis, &step.test))
+            .filter(|candidate| {
+                node_matches(doc, *candidate, step.axis, &step.test, ctx.namespaces)
+            })
             .collect();
 
         for predicate in &step.predicates {
@@ -661,32 +684,40 @@ fn descendant_or_self_nodes(doc: &Document<'_>, nodes: &[NodeId]) -> Vec<NodeId>
     )
 }
 
-fn node_matches(doc: &Document<'_>, node: NodeId, axis: Axis, test: &NodeTest<'_>) -> bool {
+fn node_matches(
+    doc: &Document<'_>,
+    node: NodeId,
+    axis: Axis,
+    test: &NodeTest<'_>,
+    namespaces: &HashMap<String, String>,
+) -> bool {
     match test {
         NodeTest::Any => match axis {
             Axis::Attribute => matches!(doc.node_kind(node), Some(NodeKind::Attribute(_, _))),
             _ => matches!(doc.node_kind(node), Some(NodeKind::Element(_))),
         },
         NodeTest::Name(name) => match doc.node_kind(node) {
-            Some(NodeKind::Element(element)) => {
-                element.name.local_name.as_ref() == name.local
-                    && name
-                        .prefix
-                        .map(|prefix| element.name.prefix.as_deref() == Some(prefix))
-                        .unwrap_or(true)
-            }
-            Some(NodeKind::Attribute(attr_name, _)) => {
-                attr_name.local_name.as_ref() == name.local
-                    && name
-                        .prefix
-                        .map(|prefix| attr_name.prefix.as_deref() == Some(prefix))
-                        .unwrap_or(true)
-            }
+            Some(NodeKind::Element(element)) => expanded_name_matches(
+                name,
+                element.name.local_name.as_ref(),
+                element.name.namespace_uri.as_deref(),
+                namespaces,
+            ),
+            Some(NodeKind::Attribute(attr_name, _)) => expanded_name_matches(
+                name,
+                attr_name.local_name.as_ref(),
+                attr_name.namespace_uri.as_deref(),
+                namespaces,
+            ),
             _ => false,
         },
         NodeTest::PrefixWildcard(prefix) => match doc.node_kind(node) {
-            Some(NodeKind::Element(element)) => element.name.prefix.as_deref() == Some(*prefix),
-            Some(NodeKind::Attribute(attr_name, _)) => attr_name.prefix.as_deref() == Some(*prefix),
+            Some(NodeKind::Element(element)) => {
+                namespace_matches(prefix, element.name.namespace_uri.as_deref(), namespaces)
+            }
+            Some(NodeKind::Attribute(attr_name, _)) => {
+                namespace_matches(prefix, attr_name.namespace_uri.as_deref(), namespaces)
+            }
             _ => false,
         },
         NodeTest::LocalNameWildcard(local) => match doc.node_kind(node) {
@@ -708,6 +739,32 @@ fn node_matches(doc: &Document<'_>, node: NodeId, axis: Axis, test: &NodeTest<'_
             _ => false,
         },
     }
+}
+
+fn expanded_name_matches(
+    name: &QName<'_>,
+    actual_local: &str,
+    actual_namespace: Option<&str>,
+    namespaces: &HashMap<String, String>,
+) -> bool {
+    if actual_local != name.local {
+        return false;
+    }
+
+    match name.prefix {
+        Some(prefix) => namespace_matches(prefix, actual_namespace, namespaces),
+        None => actual_namespace.is_none(),
+    }
+}
+
+fn namespace_matches(
+    prefix: &str,
+    actual_namespace: Option<&str>,
+    namespaces: &HashMap<String, String>,
+) -> bool {
+    namespaces
+        .get(prefix)
+        .is_some_and(|expected| actual_namespace == Some(expected.as_str()))
 }
 
 fn apply_predicate<R>(

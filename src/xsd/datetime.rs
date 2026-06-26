@@ -470,10 +470,9 @@ fn strip_time_timezone(s: &str) -> Option<&str> {
     // A timezone offset has the form [+-]dd:dd at the end (6 chars)
     if s.len() >= 6 {
         let tz_start = s.len() - 6;
-        let tz = &s[tz_start..];
-        let b = tz.as_bytes();
-        if b[0] == b'+' || b[0] == b'-' {
-            if !valid_timezone_offset(tz) {
+        let tz = &s.as_bytes()[tz_start..];
+        if tz[0] == b'+' || tz[0] == b'-' {
+            if !s.is_char_boundary(tz_start) || !valid_timezone_offset_bytes(tz) {
                 return None;
             }
             return Some(&s[..tz_start]);
@@ -508,27 +507,26 @@ pub(crate) fn strip_timezone(s: &str) -> &str {
     s
 }
 
-fn valid_timezone_offset(tz: &str) -> bool {
-    let b = tz.as_bytes();
-    if b.len() != 6
-        || !(b[0] == b'+' || b[0] == b'-')
-        || !b[1].is_ascii_digit()
-        || !b[2].is_ascii_digit()
-        || b[3] != b':'
-        || !b[4].is_ascii_digit()
-        || !b[5].is_ascii_digit()
-    {
+fn valid_timezone_offset_bytes(tz: &[u8]) -> bool {
+    if tz.len() != 6 || !(tz[0] == b'+' || tz[0] == b'-') || tz[3] != b':' {
         return false;
     }
 
-    let hour = match tz[1..3].parse::<u32>() {
-        Ok(value) => value,
-        Err(_) => return false,
+    let hour = match two_digit_value(tz[1], tz[2]) {
+        Some(value) => value,
+        None => return false,
     };
-    let minute = match tz[4..6].parse::<u32>() {
-        Ok(value) => value,
-        Err(_) => return false,
+    let minute = match two_digit_value(tz[4], tz[5]) {
+        Some(value) => value,
+        None => return false,
     };
 
     hour < 14 && minute <= 59 || hour == 14 && minute == 0
+}
+
+fn two_digit_value(tens: u8, ones: u8) -> Option<u32> {
+    if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+        return None;
+    }
+    Some(((tens - b'0') as u32) * 10 + (ones - b'0') as u32)
 }
