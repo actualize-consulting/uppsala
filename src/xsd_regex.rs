@@ -480,6 +480,9 @@ fn parse_escape(chars: &[char], pos: &mut usize) -> Result<RegexNode, String> {
                 }
                 let name: String = chars[start..*pos].iter().collect();
                 *pos += 1; // skip '}'
+                if !is_known_property_name(&name) {
+                    return Err(format!("Unknown Unicode property '{}'", name));
+                }
                 Ok(RegexNode::CharClass(CharClass {
                     negated: false,
                     members: vec![ClassMember::Property(UnicodeProperty { negated, name })],
@@ -629,6 +632,9 @@ fn parse_class_atom(chars: &[char], pos: &mut usize) -> Result<ClassMember, Stri
                         }
                         let name: String = chars[start..*pos].iter().collect();
                         *pos += 1;
+                        if !is_known_property_name(&name) {
+                            return Err(format!("Unknown Unicode property '{}'", name));
+                        }
                         Ok(ClassMember::Property(UnicodeProperty { negated, name }))
                     } else {
                         Err("Expected '{' after \\p or \\P in character class".into())
@@ -1017,7 +1023,11 @@ fn is_extender(ch: char) -> bool {
 
 /// Match Unicode property \p{...} or \P{...}.
 fn property_matches(prop: &UnicodeProperty, ch: char) -> bool {
-    let base_match = match_property_name(&prop.name, ch);
+    // Unknown property names are rejected at compile time (see
+    // `is_known_property_name`), so they cannot reach here. Treat the
+    // impossible unknown case as "matches nothing" (fail-closed) so a
+    // future regression can never make `\P{unknown}` admit every char.
+    let base_match = match_property_name(&prop.name, ch).unwrap_or(false);
     if prop.negated {
         !base_match
     } else {
@@ -1025,9 +1035,21 @@ fn property_matches(prop: &UnicodeProperty, ch: char) -> bool {
     }
 }
 
-/// Match a Unicode general category or block name.
-fn match_property_name(name: &str, ch: char) -> bool {
-    match name {
+/// Returns `true` if `name` is a recognized Unicode general category or block.
+///
+/// Unknown property names must be rejected at compile time: otherwise
+/// `\p{unknown}` matches nothing and `\P{unknown}` matches *every* character,
+/// silently widening a pattern (a validation bypass). The supplied char is
+/// irrelevant to known-ness — a recognized property yields `Some(_)` and an
+/// unrecognized one yields `None`.
+fn is_known_property_name(name: &str) -> bool {
+    match_property_name(name, 'a').is_some()
+}
+
+/// Match a Unicode general category or block name. Returns `None` when `name`
+/// is not a recognized property (so callers can fail closed).
+fn match_property_name(name: &str, ch: char) -> Option<bool> {
+    let matched = match name {
         // General categories
         "L" => ch.is_alphabetic(),
         "Lu" => ch.is_uppercase(),
@@ -1066,9 +1088,10 @@ fn match_property_name(name: &str, ch: char) -> bool {
         "Co" => is_private_use(ch),
         "Cn" => !ch.is_alphanumeric() && !is_assigned(ch),
         // Unicode block escapes (Is...)
-        _ if name.starts_with("Is") => match_unicode_block(&name[2..], ch),
-        _ => false,
-    }
+        _ if name.starts_with("Is") => return match_unicode_block(&name[2..], ch),
+        _ => return None,
+    };
+    Some(matched)
 }
 
 // ─── Unicode category helpers ────────────────────────────────────────────────
@@ -1690,9 +1713,11 @@ fn is_assigned(ch: char) -> bool {
 
 // ─── Unicode Block matching ─────────────────────────────────────────────────
 
-fn match_unicode_block(block_name: &str, ch: char) -> bool {
+/// Match a Unicode block name (the part after `Is`). Returns `None` when the
+/// block name is not recognized so callers can fail closed.
+fn match_unicode_block(block_name: &str, ch: char) -> Option<bool> {
     let c = ch as u32;
-    match block_name {
+    let matched = match block_name {
         "BasicLatin" => (0x0000..=0x007F).contains(&c),
         "Latin-1Supplement" => (0x0080..=0x00FF).contains(&c),
         "LatinExtended-A" => (0x0100..=0x017F).contains(&c),
@@ -1809,8 +1834,9 @@ fn match_unicode_block(block_name: &str, ch: char) -> bool {
         "CJKUnifiedIdeographsExtensionB" => (0x20000..=0x2A6DF).contains(&c),
         "CJKCompatibilityIdeographsSupplement" => (0x2F800..=0x2FA1F).contains(&c),
         "Tags" => (0xE0000..=0xE007F).contains(&c),
-        _ => false,
-    }
+        _ => return None,
+    };
+    Some(matched)
 }
 
 #[cfg(test)]

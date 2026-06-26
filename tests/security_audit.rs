@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uppsala::{parse, Parser, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
+use uppsala::{parse, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
 
 // Wall-clock cap for DoS tests. Well under a typical cargo-test default.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -198,23 +198,48 @@ fn xsd_regex_polynomial_redos_heavy() {
 
 #[test]
 fn xsd_regex_unbounded_brace_accepted() {
-    // A schema can specify a{0,4_000_000_000}. Compile succeeds today.
-    let re = XsdRegex::compile("a{0,4000000000}");
-    assert!(re.is_ok(), "compile should (per fix) reject huge bounds");
+    // A schema may legitimately specify a large upper bound such as
+    // a{0,4_000_000_000}. Compile intentionally accepts it: the upper
+    // bound never drives allocation or a fixed iteration count. Matching
+    // is bounded instead by input saturation and the per-match step
+    // budget (ADR 0004, finding F-05), so a huge `m` cannot cause a
+    // time/memory blow-up. We therefore assert acceptance, and separately
+    // assert that matching such a pattern stays fast.
+    let re = XsdRegex::compile("a{0,4000000000}").expect("large bounds accepted");
+    let input: String = "a".repeat(10_000);
+    let start = Instant::now();
+    assert!(re.is_match(&input), "linear match should succeed");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "huge upper bound must not slow matching (step budget bounds it)"
+    );
 }
 
 // ─── Finding F-07 — \p{unknown} silently matches nothing;
-//                   \P{unknown} matches everything (bypass) ─────────────
+//                   \P{unknown} matches everything (bypass) — FIXED ──────
 
 #[test]
-fn xsd_regex_unknown_prop_bypass() {
-    // \P{unknown} should be an error; today it matches every char,
-    // so an "only-letters" pattern accidentally admits anything.
-    let re = XsdRegex::compile("\\P{unknowncategory}+").expect("compile");
+fn xsd_regex_unknown_prop_rejected() {
+    // Regression: an unknown Unicode property must be rejected at compile
+    // time (fail-closed). Previously `\P{unknown}` compiled and matched
+    // every character, silently widening an "only-letters" pattern into one
+    // that admits arbitrary markup. Both `\p{...}` and `\P{...}` forms, and
+    // the in-character-class form, must error.
     assert!(
-        re.is_match("<script>"),
-        "\\P{{unknown}} should fail to compile; today it matches everything"
+        XsdRegex::compile("\\P{unknowncategory}+").is_err(),
+        "\\P{{unknown}} must fail to compile, not match everything"
     );
+    assert!(
+        XsdRegex::compile("\\p{unknowncategory}+").is_err(),
+        "\\p{{unknown}} must fail to compile"
+    );
+    assert!(
+        XsdRegex::compile("[\\p{unknowncategory}]").is_err(),
+        "\\p{{unknown}} inside a character class must fail to compile"
+    );
+    // Known categories and blocks still compile.
+    assert!(XsdRegex::compile("\\p{Lu}+").is_ok());
+    assert!(XsdRegex::compile("\\p{IsBasicLatin}+").is_ok());
 }
 
 // ─── Finding F-08 — XPath parser stack overflow ─────────────────────────
@@ -438,26 +463,25 @@ fn roundtrip_cdata_smuggle() {
     );
 }
 
-// ─── Finding F-12 — UTF-16 decoder silently drops odd trailing byte ────
+// ─── Finding F-12 — UTF-16 decoder silently drops odd trailing byte — FIXED ─
 
 #[test]
-fn utf16_odd_byte_silently_truncated() {
-    // Valid UTF-16 LE BOM, then `<r/>` encoded as UTF-16 LE, then a
-    // single stray byte with no pair-mate. decode_xml_bytes's
-    // `chunks(2).filter(|c| c.len() == 2)` silently drops it.
+fn utf16_odd_byte_rejected() {
+    // Regression: a UTF-16 byte stream with an odd length has an incomplete
+    // trailing code unit. Previously the decoder's `chunks(2)` silently
+    // dropped the stray byte, hiding mid-code-unit truncation. The decoder
+    // now rejects odd-length input instead of fabricating a valid document.
     let mut bytes = vec![0xFFu8, 0xFE]; // BOM LE
     for c in "<r/>".chars() {
         let cu = c as u16;
         bytes.push(cu as u8);
         bytes.push((cu >> 8) as u8);
     }
-    bytes.push(0x41); // stray trailing byte
+    bytes.push(0x41); // stray trailing byte → odd total length
     let res = uppsala::parse_bytes(&bytes);
-    // The parser has no indication the input was mid-codeunit — at
-    // minimum the decoder should signal an error.
     assert!(
-        res.is_ok(),
-        "parser should have errored on incomplete UTF-16 tail; current behavior silently drops"
+        res.is_err(),
+        "parser must error on incomplete UTF-16 tail, not silently drop it"
     );
 }
 
@@ -488,7 +512,7 @@ fn xpath_variable_reference_unsupported() {
     let root = doc.root();
     let res = eval.evaluate(&doc, root, "$x");
     assert!(
-        matches!(res, Err(_)),
+        res.is_err(),
         "XPath 1.0 variable reference is not implemented — library documents support for XPath 1.0"
     );
 }

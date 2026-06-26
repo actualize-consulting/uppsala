@@ -499,20 +499,39 @@ pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
 }
 
 pub(crate) fn is_valid_xml_ncname(s: &str) -> bool {
-    let mut bytes = s.bytes();
-    match bytes.next() {
-        Some(b) if is_xml_name_start_byte(b) => {}
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if is_ncname_start_char(c) => {}
         _ => return false,
     }
-    bytes.all(is_xml_name_char_byte)
+    chars.all(is_ncname_char)
 }
 
-fn is_xml_name_start_byte(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+/// XML 1.0 `NCNameStartChar` — the full `NameStartChar` production minus `:`.
+///
+/// Must mirror the parser's accepted ranges so that names produced by the
+/// parser round-trip through serialization without being sanitized to `_`
+/// (e.g. `<é/>`). Sanitization only exists to neutralize *invalid*
+/// programmatic names, not to reject valid non-ASCII ones.
+fn is_ncname_start_char(c: char) -> bool {
+    matches!(c,
+        'A'..='Z' | '_' | 'a'..='z' |
+        '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' |
+        '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' |
+        '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' |
+        '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' |
+        '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' |
+        '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}'
+    )
 }
 
-fn is_xml_name_char_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+/// XML 1.0 `NCNameChar` — the full `NameChar` production minus `:`.
+fn is_ncname_char(c: char) -> bool {
+    is_ncname_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' |
+            '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
+        )
 }
 
 // ─── Internal escaping helpers (write directly to String, no allocation) ───

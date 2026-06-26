@@ -138,6 +138,14 @@ pub(super) fn union_namespace_constraints(
         },
         (NamespaceConstraint::NotLocal, NamespaceConstraint::Local)
         | (NamespaceConstraint::Local, NamespaceConstraint::NotLocal) => NamespaceConstraint::Any,
+        // `TargetNamespace(None)` is the no-namespace case (≡ `Local`). Its
+        // union with `NotLocal` (every non-empty namespace) covers all names,
+        // so the result is `Any` — not `NotLocal`, which would wrongly exclude
+        // no-namespace names.
+        (NamespaceConstraint::NotLocal, NamespaceConstraint::TargetNamespace(None))
+        | (NamespaceConstraint::TargetNamespace(None), NamespaceConstraint::NotLocal) => {
+            NamespaceConstraint::Any
+        }
         (NamespaceConstraint::NotLocal, _) | (_, NamespaceConstraint::NotLocal) => {
             NamespaceConstraint::NotLocal
         }
@@ -240,5 +248,43 @@ fn not_constraint(excluded: Vec<String>) -> NamespaceConstraint {
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.contains(&value) {
         values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn union_notlocal_with_no_target_namespace_is_any() {
+        // `TargetNamespace(None)` is the no-namespace case (≡ Local). Its
+        // union with NotLocal must cover every name → Any, not NotLocal
+        // (which would wrongly exclude no-namespace names).
+        let a = NamespaceConstraint::NotLocal;
+        let b = NamespaceConstraint::TargetNamespace(None);
+        assert!(matches!(
+            union_namespace_constraints(&a, &b),
+            NamespaceConstraint::Any
+        ));
+        assert!(matches!(
+            union_namespace_constraints(&b, &a),
+            NamespaceConstraint::Any
+        ));
+        // The resulting constraint must admit both no-namespace and any URI.
+        let result = union_namespace_constraints(&a, &b);
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:x")));
+    }
+
+    #[test]
+    fn union_notlocal_with_specific_target_namespace_stays_notlocal() {
+        // A specific (non-empty) target namespace is itself non-local, so the
+        // union with NotLocal contributes nothing new and remains NotLocal.
+        let a = NamespaceConstraint::NotLocal;
+        let b = NamespaceConstraint::TargetNamespace(Some("urn:x".into()));
+        assert!(matches!(
+            union_namespace_constraints(&a, &b),
+            NamespaceConstraint::NotLocal
+        ));
     }
 }
