@@ -375,10 +375,15 @@ fn idc_step_matches(
 
 /// Collect all descendant element nodes.
 fn idc_collect_descendants(doc: &Document, node: NodeId, result: &mut Vec<NodeId>) {
-    for child in doc.children(node) {
-        if let Some(NodeKind::Element(_)) = doc.node_kind(child) {
-            result.push(child);
-            idc_collect_descendants(doc, child, result);
+    let mut stack = doc.children(node);
+    stack.reverse();
+
+    while let Some(current) = stack.pop() {
+        if let Some(NodeKind::Element(_)) = doc.node_kind(current) {
+            result.push(current);
+            let mut children = doc.children(current);
+            children.reverse();
+            stack.extend(children);
         }
     }
 }

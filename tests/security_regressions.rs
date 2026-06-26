@@ -276,6 +276,27 @@ fn xpath_axis_budget_is_not_double_charged_after_name_test() {
 }
 
 #[test]
+fn xpath_predicate_budget_charges_candidates_once() {
+    // Predicate filtering visits each candidate once. Kept nodes are a subset
+    // of those candidates and must not be charged a second time.
+    let doc = parse("<r><a/><b/></r>").unwrap();
+    let root = doc.document_element().unwrap();
+
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(4)
+        .select_nodes(&doc, root, "*[1]")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.element(nodes[0]).unwrap().name.local_name, "a");
+
+    let err = XPathEvaluator::new()
+        .with_max_node_visits(3)
+        .select_nodes(&doc, root, "*[1]")
+        .expect_err("predicate candidates must still be budgeted");
+    assert!(err.to_string().contains("maximum node visit budget of 3"));
+}
+
+#[test]
 fn xpath_id_function_scan_is_budgeted() {
     // id() performs a document-wide lookup. It must consume the same visit
     // budget as axis expansion so callers can bound adversarial lookups.
@@ -693,6 +714,61 @@ fn xsd_keyref_field_uses_local_namespace_scope() {
     assert!(
         errors.iter().any(|e| e.contains("no matching key value")),
         "expected field-local namespace to expose bad keyref, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_identity_selector_handles_deep_programmatic_dom() {
+    // `.//` identity-constraint selectors must use heap-backed traversal just
+    // like XPath axes, because callers can construct deeper DOMs than the
+    // parser accepts.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:v="urn:v"
+           targetNamespace="urn:v"
+           elementFormDefault="qualified">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:any namespace="##any" processContents="skip" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key name="leaf_ids">
+      <xs:selector xpath=".//v:leaf"/>
+      <xs:field xpath="@id"/>
+    </xs:key>
+  </xs:element>
+</xs:schema>"###;
+    let schema_doc = parse(schema).unwrap();
+    let validator = XsdValidator::from_schema(&schema_doc).unwrap();
+
+    let mut doc = Document::new();
+    let doc_root = doc.root();
+    let root = doc.create_element(QName::full("v", "urn:v", "root"));
+    doc.append_child(doc_root, root);
+
+    let mut parent = root;
+    for _ in 0..4096 {
+        let child = doc.create_element(QName::full("v", "urn:v", "n"));
+        doc.append_child(parent, child);
+        parent = child;
+    }
+
+    let first = doc.create_element(QName::full("v", "urn:v", "leaf"));
+    doc.element_mut(first)
+        .unwrap()
+        .set_attribute(QName::local("id"), Cow::Borrowed("same"));
+    doc.append_child(parent, first);
+
+    let second = doc.create_element(QName::full("v", "urn:v", "leaf"));
+    doc.element_mut(second)
+        .unwrap()
+        .set_attribute(QName::local("id"), Cow::Borrowed("same"));
+    doc.append_child(parent, second);
+
+    let errors = validator.validate(&doc);
+    assert!(
+        errors.iter().any(|e| e.message.contains("duplicate value")),
+        "expected deep identity selector to find duplicate key, got {errors:?}"
     );
 }
 

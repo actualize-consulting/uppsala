@@ -1276,7 +1276,7 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
             result.push(node);
         }
     }
-    ctx.budget.charge(nodes.len() + result.len())?;
+    ctx.budget.charge(nodes.len())?;
     Ok(result)
 }
 
