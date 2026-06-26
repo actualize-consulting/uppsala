@@ -254,6 +254,36 @@ fn xpath_id_function_scan_is_budgeted() {
 }
 
 #[test]
+fn xpath_id_function_handles_deep_programmatic_dom() {
+    // id() scans the whole document. It must use heap-backed traversal too,
+    // because callers can build deeper DOMs than the parser accepts.
+    let mut doc = Document::new();
+    let mut parent = doc.root();
+    for _ in 0..4096 {
+        let child = doc.create_element(QName::local("n"));
+        doc.append_child(parent, child);
+        parent = child;
+    }
+    let leaf = doc.create_element(QName::local("leaf"));
+    doc.element_mut(leaf)
+        .unwrap()
+        .set_attribute(QName::local("id"), Cow::Borrowed("target"));
+    doc.append_child(parent, leaf);
+
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(10_000)
+        .select_nodes(&doc, doc.root(), "id('target')")
+        .unwrap();
+    assert_eq!(nodes, vec![leaf]);
+
+    let err = XPathEvaluator::new()
+        .with_max_node_visits(32)
+        .select_nodes(&doc, doc.root(), "id('target')")
+        .expect_err("deep id() traversal must remain budgeted");
+    assert!(err.to_string().contains("maximum node visit budget of 32"));
+}
+
+#[test]
 fn xpath_descendant_collection_handles_deep_programmatic_dom() {
     // Programmatic DOM construction can exceed parser depth caps. Descendant
     // axes must use heap-backed traversal so a deep chain is still budgeted.

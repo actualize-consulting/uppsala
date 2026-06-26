@@ -5,38 +5,9 @@
 //! `#[ignore]` so the default `cargo test` run remains safe; invoke them
 //! explicitly with `cargo test --test security_audit -- --ignored`.
 //!
-//! Tests that time-bound a DoS use a worker thread plus a wall-clock
-//! timeout — if the worker doesn't finish within `TIMEOUT`, the test fails
-//! with "DoS: took > TIMEOUT".
-
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use uppsala::{parse, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
-
-// Wall-clock cap for DoS tests. Well under a typical cargo-test default.
-const TIMEOUT: Duration = Duration::from_secs(5);
-
-fn run_with_timeout<F, R>(label: &'static str, f: F) -> R
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let r = f();
-        let _ = tx.send(r);
-    });
-    match rx.recv_timeout(TIMEOUT) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}: exceeded {}s timeout (DoS confirmed)",
-            label,
-            TIMEOUT.as_secs()
-        ),
-    }
-}
 
 // ─── Finding F-01 — Billion Laughs (entity expansion) ──────────────────
 
@@ -170,15 +141,18 @@ fn xsd_regex_deep_paren_stack_overflow() {
 #[test]
 fn xsd_regex_polynomial_redos() {
     // (a*)*b against N 'a's. Matcher is O(n^3)/O(n^4); at N=200
-    // it should finish quickly. If the dedup guard regresses, this
-    // will blow past TIMEOUT.
+    // it should finish quickly under the matcher step budget.
     let re = XsdRegex::compile("(a*)*b").expect("compile");
     let input: String = "a".repeat(200);
-    run_with_timeout("polynomial_redos", move || {
-        // Intentionally no 'b' => matcher explores every way to partition
-        // the 'a's before failing. This is the worst case.
-        assert!(!re.is_match(&input));
-    });
+    let start = Instant::now();
+    // Intentionally no 'b' => matcher explores every way to partition
+    // the 'a's before failing. This is the worst case.
+    assert!(!re.is_match(&input));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "polynomial ReDoS regression: 200-byte input took {:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -561,12 +535,15 @@ fn xpath_double_slash_blowup() {
         xml.push_str(&format!("</l{}>", i));
     }
     xml.push_str("</r>");
-    // Move the owned String into the worker so &doc stays alive for 'static.
-    run_with_timeout("xpath_double_slash", move || {
-        let mut doc = parse(&xml).unwrap();
-        doc.prepare_xpath();
-        let eval = XPathEvaluator::new();
-        let root = doc.root();
-        let _ = eval.evaluate(&doc, root, "//*[//leaf]");
-    });
+    let mut doc = parse(&xml).unwrap();
+    doc.prepare_xpath();
+    let eval = XPathEvaluator::new();
+    let root = doc.root();
+    let start = Instant::now();
+    let _ = eval.evaluate(&doc, root, "//*[//leaf]");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "XPath double-slash regression: query took {:?}",
+        start.elapsed()
+    );
 }

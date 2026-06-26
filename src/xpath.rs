@@ -1043,7 +1043,6 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let mut nodes = vec![ctx.node];
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
-                nodes = dedup_document_order(nodes);
             }
             Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
         }
@@ -1056,7 +1055,6 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
             let mut nodes = vec![root];
             for step in steps {
                 nodes = apply_step(step, &nodes, ctx)?;
-                nodes = dedup_document_order(nodes);
             }
             Ok(XPathValue::NodeSet(dedup_document_order(nodes)))
         }
@@ -1757,20 +1755,26 @@ fn collect_elements_with_id(
     result: &mut Vec<NodeId>,
     budget: &EvalBudget,
 ) -> XmlResult<()> {
-    budget.charge(1)?;
-    if let Some(NodeKind::Element(e)) = doc.node_kind(node) {
-        for attr in &e.attributes {
-            if (&*attr.name.local_name == "id" || &*attr.name.local_name == "ID")
-                && ids.contains(&&*attr.value)
-            {
-                result.push(node);
-                break;
+    let mut stack = vec![node];
+
+    while let Some(current) = stack.pop() {
+        budget.charge(1)?;
+        if let Some(NodeKind::Element(e)) = doc.node_kind(current) {
+            for attr in &e.attributes {
+                if (&*attr.name.local_name == "id" || &*attr.name.local_name == "ID")
+                    && ids.contains(&&*attr.value)
+                {
+                    result.push(current);
+                    break;
+                }
             }
         }
+
+        let mut children = doc.children(current);
+        children.reverse();
+        stack.extend(children);
     }
-    for child in doc.children(node) {
-        collect_elements_with_id(doc, child, ids, result, budget)?;
-    }
+
     Ok(())
 }
 
