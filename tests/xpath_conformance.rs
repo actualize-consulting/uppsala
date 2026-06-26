@@ -3,7 +3,7 @@
 //! Tests cover axes, node tests, predicates, functions, operators,
 //! and the attribute axis implementation.
 
-use uppsala::dom::{NodeId, NodeKind, QName};
+use uppsala::dom::NodeId;
 use uppsala::xpath::XPathValue;
 
 fn parse_and_eval(xml: &str, xpath: &str) -> XPathValue {

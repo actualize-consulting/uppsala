@@ -10,6 +10,8 @@
 //! - xsi:type resolution and type substitution blocking checks
 //! - Substitution group matching for element declarations
 
+use std::collections::HashSet;
+
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
 use crate::namespace::build_resolver_for_node;
@@ -71,10 +73,13 @@ impl XsdValidator {
         );
         let key_no_ns = (None, elem.name.local_name.to_string());
 
-        let decl = self
-            .elements
-            .get(&key_with_ns)
-            .or_else(|| self.elements.get(&key_no_ns));
+        let decl = self.elements.get(&key_with_ns).or_else(|| {
+            if elem.name.namespace_uri.is_none() {
+                self.elements.get(&key_no_ns)
+            } else {
+                None
+            }
+        });
 
         match decl {
             Some(decl) => {
@@ -244,6 +249,7 @@ impl XsdValidator {
         let mut has_extension_in_chain = false;
         let mut has_restriction_in_chain = false;
         let mut current = xsi_type;
+        let mut seen = HashSet::new();
 
         while let TypeDef::Complex(ct) = current {
             let is_extension = match ct.derived_by_extension {
@@ -284,6 +290,12 @@ impl XsdValidator {
 
             // Move up to base type
             if let Some(ref base_key) = ct.base_type {
+                if !seen.insert(base_key.clone()) {
+                    return Some(format!(
+                        "Type derivation cycle detected involving '{}'",
+                        base_key.1
+                    ));
+                }
                 if let Some(base_td) = self.types.get(base_key) {
                     current = base_td;
                 } else {
@@ -422,11 +434,22 @@ impl XsdValidator {
     /// effective wildcard and the derived type's own wildcard.
     /// For restriction types or types not derived, this is just the type's own wildcard.
     fn compute_effective_wildcard(&self, ct: &ComplexTypeDef) -> Option<AttributeWildcard> {
+        self.compute_effective_wildcard_inner(ct, &mut HashSet::new())
+    }
+
+    fn compute_effective_wildcard_inner(
+        &self,
+        ct: &ComplexTypeDef,
+        seen: &mut HashSet<(Option<String>, String)>,
+    ) -> Option<AttributeWildcard> {
         if ct.derived_by_extension == Some(true) {
             // Get the base type's effective wildcard (recursively)
             let base_wildcard = if let Some(ref base_key) = ct.base_type {
+                if !seen.insert(base_key.clone()) {
+                    return None;
+                }
                 if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                    self.compute_effective_wildcard(base_ct)
+                    self.compute_effective_wildcard_inner(base_ct, seen)
                 } else {
                     None
                 }
@@ -455,10 +478,21 @@ impl XsdValidator {
     ///   the restriction are inherited; prohibited attributes are removed
     /// - **Not derived**: just the type's own attributes
     fn compute_effective_attributes(&self, ct: &ComplexTypeDef) -> Vec<AttributeDecl> {
+        self.compute_effective_attributes_inner(ct, &mut HashSet::new())
+    }
+
+    fn compute_effective_attributes_inner(
+        &self,
+        ct: &ComplexTypeDef,
+        seen: &mut HashSet<(Option<String>, String)>,
+    ) -> Vec<AttributeDecl> {
         // Get base type's effective attributes
         let base_attrs = if let Some(ref base_key) = ct.base_type {
+            if !seen.insert(base_key.clone()) {
+                return Vec::new();
+            }
             if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                self.compute_effective_attributes(base_ct)
+                self.compute_effective_attributes_inner(base_ct, seen)
             } else {
                 Vec::new()
             }
@@ -525,25 +559,36 @@ impl XsdValidator {
     ///
     /// Returns `None` if the type is not an extension or cannot be merged.
     fn compute_effective_particles(&self, ct: &ComplexTypeDef) -> Option<Vec<Particle>> {
+        self.compute_effective_particles_inner(ct, &mut HashSet::new())
+    }
+
+    fn compute_effective_particles_inner(
+        &self,
+        ct: &ComplexTypeDef,
+        seen: &mut HashSet<(Option<String>, String)>,
+    ) -> Option<Vec<Particle>> {
         if ct.derived_by_extension != Some(true) {
             return None;
         }
         let (base_ns, base_name) = ct.base_type.as_ref()?;
         let key = (base_ns.clone(), base_name.clone());
+        if !seen.insert(key.clone()) {
+            return None;
+        }
         let base_type = self.types.get(&key)?;
         if let TypeDef::Complex(base_ct) = base_type {
             // Recursively get the base type's effective particles
-            let base_particles = if let Some(recursive) = self.compute_effective_particles(base_ct)
-            {
-                recursive
-            } else {
-                // No further merging needed, just get the base type's own particles
-                match &base_ct.content {
-                    ContentModel::Sequence(particles, _, _) => particles.clone(),
-                    ContentModel::Empty => Vec::new(),
-                    _ => return None, // Can't merge non-sequence base content
-                }
-            };
+            let base_particles =
+                if let Some(recursive) = self.compute_effective_particles_inner(base_ct, seen) {
+                    recursive
+                } else {
+                    // No further merging needed, just get the base type's own particles
+                    match &base_ct.content {
+                        ContentModel::Sequence(particles, _, _) => particles.clone(),
+                        ContentModel::Empty => Vec::new(),
+                        _ => return None, // Can't merge non-sequence base content
+                    }
+                };
 
             // Get the extension's own particles
             let ext_particles = match &ct.content {
@@ -559,6 +604,23 @@ impl XsdValidator {
         } else {
             None
         }
+    }
+
+    fn has_complex_derivation_cycle(&self, ct: &ComplexTypeDef) -> bool {
+        let mut seen = HashSet::new();
+        let mut current = ct;
+
+        while let Some(base_key) = &current.base_type {
+            if !seen.insert(base_key.clone()) {
+                return true;
+            }
+            match self.types.get(base_key) {
+                Some(TypeDef::Complex(base_ct)) => current = base_ct,
+                _ => return false,
+            }
+        }
+
+        false
     }
 
     /// Validate a single element against its element declaration.
@@ -772,8 +834,8 @@ impl XsdValidator {
             }
             None => {
                 // If type can't be resolved, check if it's a built-in
-                if let TypeRef::BuiltIn(bt) = &decl.type_ref {
-                    match bt {
+                match &decl.type_ref {
+                    TypeRef::BuiltIn(bt) => match bt {
                         BuiltInType::AnyType => {
                             // AnyType allows any content, but we should still
                             // validate child elements against their own declarations.
@@ -787,20 +849,31 @@ impl XsdValidator {
                                     .map(|e| &*e.name.local_name)
                                     .unwrap_or("?");
                                 errors.push(ValidationError {
-                                    message: format!(
-                                        "Element '{}' has simple type '{:?}' but contains child elements",
-                                        elem_name, bt
-                                    ),
-                                    line: Some(doc.node_line(node)),
-                                    column: Some(doc.node_column(node)),
-                                });
+                                message: format!(
+                                    "Element '{}' has simple type '{:?}' but contains child elements",
+                                    elem_name, bt
+                                ),
+                                line: Some(doc.node_line(node)),
+                                column: Some(doc.node_column(node)),
+                            });
                             }
                             let text = doc.text_content_deep(node);
                             validate_builtin_value(&text, bt, doc, node, errors);
                         }
+                    },
+                    TypeRef::Named(ns, name) => {
+                        let display = ns
+                            .as_ref()
+                            .map(|uri| format!("{{{}}}{}", uri, name))
+                            .unwrap_or_else(|| name.clone());
+                        errors.push(ValidationError {
+                            message: format!("Type '{}' not found", display),
+                            line: Some(doc.node_line(node)),
+                            column: Some(doc.node_column(node)),
+                        });
                     }
+                    TypeRef::Inline(_) => {}
                 }
-                // Otherwise, no validation possible (unknown type)
             }
         }
 
@@ -866,10 +939,13 @@ impl XsdValidator {
                 );
                 let key_no_ns = (None, child_elem.name.local_name.to_string());
 
-                let child_decl = self
-                    .elements
-                    .get(&key_with_ns)
-                    .or_else(|| self.elements.get(&key_no_ns));
+                let child_decl = self.elements.get(&key_with_ns).or_else(|| {
+                    if child_elem.name.namespace_uri.is_none() {
+                        self.elements.get(&key_no_ns)
+                    } else {
+                        None
+                    }
+                });
 
                 if let Some(decl) = child_decl {
                     self.validate_element(doc, child, decl, errors);
@@ -899,6 +975,15 @@ impl XsdValidator {
         ct: &ComplexTypeDef,
         errors: &mut Vec<ValidationError>,
     ) {
+        if self.has_complex_derivation_cycle(ct) {
+            errors.push(ValidationError {
+                message: "Complex type derivation cycle detected".to_string(),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+            return;
+        }
+
         // Compute effective attributes (including inherited from base types)
         let effective_attrs = self.compute_effective_attributes(ct);
 
@@ -1846,43 +1931,42 @@ impl XsdValidator {
                         ParticleKind::Any {
                             namespace_constraint,
                             process_contents,
-                        } => {
-                            if wildcard_allows_namespace(
-                                namespace_constraint,
-                                elem.name.namespace_uri.as_deref(),
-                            ) {
-                                matched[i] = true;
-                                match process_contents {
-                                    ProcessContents::Skip => {}
-                                    ProcessContents::Lax => {
-                                        if let Some(global_decl) = self.find_global_element(
-                                            &elem.name.local_name,
-                                            elem.name.namespace_uri.as_deref(),
-                                        ) {
-                                            self.validate_element(doc, child, &global_decl, errors);
-                                        }
-                                    }
-                                    ProcessContents::Strict => {
-                                        if let Some(global_decl) = self.find_global_element(
-                                            &elem.name.local_name,
-                                            elem.name.namespace_uri.as_deref(),
-                                        ) {
-                                            self.validate_element(doc, child, &global_decl, errors);
-                                        } else {
-                                            errors.push(ValidationError {
-                                                message: format!(
-                                                    "No global element declaration found for '{}' (strict wildcard)",
-                                                    elem.name.local_name
-                                                ),
-                                                line: Some(doc.node_line(child)),
-                                                column: Some(doc.node_column(child)),
-                                            });
-                                        }
+                        } if wildcard_allows_namespace(
+                            namespace_constraint,
+                            elem.name.namespace_uri.as_deref(),
+                        ) =>
+                        {
+                            matched[i] = true;
+                            match process_contents {
+                                ProcessContents::Skip => {}
+                                ProcessContents::Lax => {
+                                    if let Some(global_decl) = self.find_global_element(
+                                        &elem.name.local_name,
+                                        elem.name.namespace_uri.as_deref(),
+                                    ) {
+                                        self.validate_element(doc, child, &global_decl, errors);
                                     }
                                 }
-                                found = true;
-                                break;
+                                ProcessContents::Strict => {
+                                    if let Some(global_decl) = self.find_global_element(
+                                        &elem.name.local_name,
+                                        elem.name.namespace_uri.as_deref(),
+                                    ) {
+                                        self.validate_element(doc, child, &global_decl, errors);
+                                    } else {
+                                        errors.push(ValidationError {
+                                            message: format!(
+                                                "No global element declaration found for '{}' (strict wildcard)",
+                                                elem.name.local_name
+                                            ),
+                                            line: Some(doc.node_line(child)),
+                                            column: Some(doc.node_column(child)),
+                                        });
+                                    }
+                                }
                             }
+                            found = true;
+                            break;
                         }
                         _ => {}
                     }

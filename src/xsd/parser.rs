@@ -103,7 +103,7 @@ pub(super) fn parse_element_decl(
     };
 
     let type_ref = if let Some(type_name) = elem.get_attribute("type") {
-        resolve_type_name(type_name, schema_target_ns)
+        resolve_type_name(doc, node, type_name, schema_target_ns)?
     } else {
         // Check for inline type definition
         let mut inline_type = TypeRef::BuiltIn(BuiltInType::AnyType);
@@ -211,17 +211,29 @@ fn parse_identity_constraints(doc: &Document, elem_node: NodeId) -> Vec<Identity
                     kind, name, selector, fields, refer
                 );
 
+                let namespaces = identity_constraint_namespaces(doc, child);
+
                 constraints.push(IdentityConstraint {
                     name,
                     kind,
                     selector,
                     fields,
                     refer,
+                    namespaces,
                 });
             }
         }
     }
     constraints
+}
+
+fn identity_constraint_namespaces(doc: &Document, node: NodeId) -> HashMap<String, String> {
+    build_resolver_for_node(doc, node)
+        .in_scope_namespaces()
+        .into_iter()
+        .filter(|(prefix, _)| !prefix.is_empty())
+        .map(|(prefix, uri)| (prefix.to_string(), uri.to_string()))
+        .collect()
 }
 
 /// Parse the `substitutionGroup` attribute from an element declaration.
@@ -259,7 +271,12 @@ fn parse_substitution_group(
 ///
 /// If the name matches a built-in XSD type, returns `TypeRef::BuiltIn`.
 /// Otherwise returns `TypeRef::Named` with the appropriate namespace.
-pub(super) fn resolve_type_name(type_name: &str, target_ns: &Option<String>) -> TypeRef {
+pub(super) fn resolve_type_name(
+    doc: &Document,
+    node: NodeId,
+    type_name: &str,
+    target_ns: &Option<String>,
+) -> XmlResult<TypeRef> {
     // Check for xs: prefix
     let (prefix, local) = if let Some(colon) = type_name.find(':') {
         (&type_name[..colon], &type_name[colon + 1..])
@@ -271,7 +288,7 @@ pub(super) fn resolve_type_name(type_name: &str, target_ns: &Option<String>) -> 
 
     if is_builtin {
         if let Some(bt) = parse_builtin_type(local) {
-            return TypeRef::BuiltIn(bt);
+            return Ok(TypeRef::BuiltIn(bt));
         }
     }
 
@@ -280,19 +297,32 @@ pub(super) fn resolve_type_name(type_name: &str, target_ns: &Option<String>) -> 
     // (e.g., xmlns="http://www.w3.org/2001/XMLSchema").
     if prefix.is_empty() {
         if let Some(bt) = parse_builtin_type(local) {
-            return TypeRef::BuiltIn(bt);
+            return Ok(TypeRef::BuiltIn(bt));
         }
     }
 
     // Named type reference
     if is_builtin {
-        TypeRef::Named(Some(XS_NAMESPACE.to_string()), local.to_string())
+        Ok(TypeRef::Named(
+            Some(XS_NAMESPACE.to_string()),
+            local.to_string(),
+        ))
     } else if prefix.is_empty() {
-        TypeRef::Named(target_ns.clone(), local.to_string())
+        Ok(TypeRef::Named(target_ns.clone(), local.to_string()))
     } else {
-        // Non-builtin prefixed type — assume it's in the target namespace
-        // (In a full implementation we'd resolve the prefix via namespace declarations)
-        TypeRef::Named(target_ns.clone(), local.to_string())
+        let resolver = build_resolver_for_node(doc, node);
+        let ns_uri = resolver.resolve(prefix).ok_or_else(|| {
+            XmlError::validation(format!(
+                "Undeclared namespace prefix '{}' in type QName '{}'",
+                prefix, type_name
+            ))
+        })?;
+        if ns_uri.as_ref() == XS_NAMESPACE {
+            if let Some(bt) = parse_builtin_type(local) {
+                return Ok(TypeRef::BuiltIn(bt));
+            }
+        }
+        Ok(TypeRef::Named(Some(ns_uri.to_string()), local.to_string()))
     }
 }
 
@@ -538,7 +568,12 @@ pub(super) fn parse_complex_type(
                                     if let Some(base) = gc_elem.get_attribute("base") {
                                         // Track base type for block checking
                                         // Type references always resolve against the schema target namespace
-                                        let base_ref = resolve_type_name(base, schema_target_ns);
+                                        let base_ref = resolve_type_name(
+                                            doc,
+                                            grandchild,
+                                            base,
+                                            schema_target_ns,
+                                        )?;
                                         if let TypeRef::Named(ns, ln) = &base_ref {
                                             base_type = Some((ns.clone(), ln.clone()));
                                         }
@@ -1161,7 +1196,7 @@ fn parse_attribute_decl(doc: &Document, node: NodeId) -> XmlResult<AttributeDecl
     };
 
     let type_ref = if let Some(type_name) = elem.get_attribute("type") {
-        resolve_type_name(type_name, &None)
+        resolve_type_name(doc, node, type_name, &None)?
     } else {
         // Check for inline simpleType child
         let mut found_inline = None;

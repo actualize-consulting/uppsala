@@ -31,7 +31,12 @@ impl XsdValidator {
                 continue; // Process keyrefs in second pass
             }
 
-            let selected = idc_select_nodes(doc, context_node, &constraint.selector);
+            let selected = idc_select_nodes(
+                doc,
+                context_node,
+                &constraint.selector,
+                &constraint.namespaces,
+            );
             debug_log!(
                 "identity constraint '{}' ({:?}): selector='{}' selected {} nodes",
                 constraint.name,
@@ -50,7 +55,7 @@ impl XsdValidator {
 
                 for field_xpath in &constraint.fields {
                     let (value, match_count, source_node) =
-                        idc_evaluate_field(doc, sel_node, field_xpath);
+                        idc_evaluate_field(doc, sel_node, field_xpath, &constraint.namespaces);
                     // For xs:key (and xs:unique), if a field selects more than one node,
                     // that's an error per XSD spec §3.11.4
                     if match_count > 1 && constraint.kind == IdentityConstraintKind::Key {
@@ -172,7 +177,12 @@ impl XsdValidator {
             }
             let referred_tuples = referred_tuples.unwrap();
 
-            let selected = idc_select_nodes(doc, context_node, &constraint.selector);
+            let selected = idc_select_nodes(
+                doc,
+                context_node,
+                &constraint.selector,
+                &constraint.namespaces,
+            );
             debug_log!(
                 "keyref '{}': selector='{}' selected {} nodes, referred key '{}' has {} tuples",
                 constraint.name,
@@ -189,7 +199,7 @@ impl XsdValidator {
 
                 for field_xpath in &constraint.fields {
                     let (value, _match_count, source_node) =
-                        idc_evaluate_field(doc, sel_node, field_xpath);
+                        idc_evaluate_field(doc, sel_node, field_xpath, &constraint.namespaces);
                     if value.is_none() {
                         all_present = false;
                     }
@@ -246,7 +256,12 @@ impl XsdValidator {
 ///   path     ::= ('.//') ? step ('/' step)*
 ///   step     ::= '.' | nametest
 ///   nametest ::= qname | '*'
-fn idc_select_nodes(doc: &Document, context: NodeId, selector: &str) -> Vec<NodeId> {
+fn idc_select_nodes(
+    doc: &Document,
+    context: NodeId,
+    selector: &str,
+    namespaces: &HashMap<String, String>,
+) -> Vec<NodeId> {
     let mut results = Vec::new();
 
     // Split on '|' for union
@@ -263,7 +278,9 @@ fn idc_select_nodes(doc: &Document, context: NodeId, selector: &str) -> Vec<Node
             let mut descendants = Vec::new();
             idc_collect_descendants(doc, context, &mut descendants);
             for desc in descendants {
-                if idc_match_steps(doc, context, desc, &steps, 0) && !results.contains(&desc) {
+                if idc_match_steps(doc, context, desc, &steps, namespaces)
+                    && !results.contains(&desc)
+                {
                     results.push(desc);
                 }
             }
@@ -275,7 +292,7 @@ fn idc_select_nodes(doc: &Document, context: NodeId, selector: &str) -> Vec<Node
                 for &cand in &candidates {
                     for child in doc.children(cand) {
                         if let Some(NodeKind::Element(_)) = doc.node_kind(child) {
-                            if idc_step_matches(doc, child, step) {
+                            if idc_step_matches(doc, child, step, namespaces) {
                                 if i == steps.len() - 1 {
                                     if !results.contains(&child) {
                                         results.push(child);
@@ -317,7 +334,12 @@ fn idc_parse_path(path: &str) -> (bool, Vec<String>) {
 }
 
 /// Check if a node matches a single step (name test or wildcard).
-fn idc_step_matches(doc: &Document, node: NodeId, step: &str) -> bool {
+fn idc_step_matches(
+    doc: &Document,
+    node: NodeId,
+    step: &str,
+    namespaces: &HashMap<String, String>,
+) -> bool {
     if step == "*" {
         // Wildcard matches any element
         return doc.element(node).is_some();
@@ -329,17 +351,14 @@ fn idc_step_matches(doc: &Document, node: NodeId, step: &str) -> bool {
     if let Some(elem) = doc.element(node) {
         // Check name match. The step might have a namespace prefix.
         if let Some(colon) = step.find(':') {
-            let _prefix = &step[..colon];
+            let prefix = &step[..colon];
             let local = &step[colon + 1..];
-            // For namespace-qualified steps, compare local name and check that
-            // the element has a namespace matching the prefix's namespace.
-            // In XSD identity constraints, the prefix is resolved from the schema document's
-            // namespace bindings, which typically match the instance document's target namespace.
-            elem.name.local_name == local
+            namespaces.get(prefix).is_some_and(|expected_ns| {
+                elem.name.local_name == local
+                    && elem.name.namespace_uri.as_deref() == Some(expected_ns.as_str())
+            })
         } else {
-            // Unprefixed: match local name, typically for elements in a namespace
-            // (the schema's target namespace)
-            elem.name.local_name == step
+            elem.name.local_name == step && elem.name.namespace_uri.is_none()
         }
     } else {
         false
@@ -367,7 +386,7 @@ fn idc_match_steps(
     context: NodeId,
     target: NodeId,
     steps: &[String],
-    _step_idx: usize,
+    namespaces: &HashMap<String, String>,
 ) -> bool {
     if steps.is_empty() {
         return false;
@@ -395,7 +414,7 @@ fn idc_match_steps(
     // `.//v:state/v:vehicle` to match a vehicle whose immediate parent is a state.
     let offset = path_to_target.len() - steps.len();
     for (i, step) in steps.iter().enumerate() {
-        if !idc_step_matches(doc, path_to_target[offset + i], step) {
+        if !idc_step_matches(doc, path_to_target[offset + i], step, namespaces) {
             return false;
         }
     }
@@ -419,6 +438,7 @@ fn idc_evaluate_field(
     doc: &Document,
     node: NodeId,
     field: &str,
+    namespaces: &HashMap<String, String>,
 ) -> (Option<String>, usize, Option<NodeId>) {
     let field = field.trim();
 
@@ -445,7 +465,7 @@ fn idc_evaluate_field(
             let mut count = 0;
             let mut value = None;
             for attr in &elem.attributes {
-                if attr.name.local_name == attr_name {
+                if idc_attr_matches(&attr.name, attr_name, namespaces) {
                     count += 1;
                     if value.is_none() {
                         value = Some(attr.value.to_string());
@@ -470,7 +490,7 @@ fn idc_evaluate_field(
         for &cn in &current_nodes {
             for child in doc.children(cn) {
                 if let Some(NodeKind::Element(_)) = doc.node_kind(child) {
-                    if idc_step_matches(doc, child, part) {
+                    if idc_step_matches(doc, child, part, namespaces) {
                         next_nodes.push(child);
                     }
                 }
@@ -497,6 +517,22 @@ fn idc_evaluate_field(
         (Some(trimmed.to_string()), match_count, Some(result_node))
     } else {
         (None, 0, None)
+    }
+}
+
+fn idc_attr_matches(
+    name: &crate::dom::QName<'_>,
+    test: &str,
+    namespaces: &HashMap<String, String>,
+) -> bool {
+    if let Some(colon) = test.find(':') {
+        let prefix = &test[..colon];
+        let local = &test[colon + 1..];
+        namespaces.get(prefix).is_some_and(|expected_ns| {
+            name.local_name == local && name.namespace_uri.as_deref() == Some(expected_ns.as_str())
+        })
+    } else {
+        name.local_name == test && name.namespace_uri.is_none()
     }
 }
 

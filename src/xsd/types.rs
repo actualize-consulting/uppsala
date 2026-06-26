@@ -104,6 +104,8 @@ pub(crate) struct IdentityConstraint {
     pub(super) fields: Vec<String>,
     /// For keyref: the name of the referred key/unique constraint.
     pub(super) refer: Option<String>,
+    /// Prefix bindings used by selector and field XPath expressions.
+    pub(super) namespaces: HashMap<String, String>,
 }
 
 /// The kind of identity constraint.
@@ -148,6 +150,10 @@ pub(crate) enum NamespaceConstraint {
     TargetNamespace(Option<String>), // holds the target namespace
     /// Explicit list of namespace URIs
     List(Vec<String>),
+    /// Any namespace-qualified name, but not no-namespace names.
+    NotLocal,
+    /// Any namespace-qualified name except the listed namespace URIs.
+    Not(Vec<String>),
 }
 
 /// processContents for wildcards.
@@ -202,6 +208,10 @@ impl AttributeWildcard {
                 None => uris.iter().any(|u| u == "##local"),
                 Some(ns) => uris.iter().any(|u| u == ns),
             },
+            NamespaceConstraint::NotLocal => attr_ns.is_some(),
+            NamespaceConstraint::Not(excluded) => {
+                matches!(attr_ns, Some(ns) if !excluded.iter().any(|u| u == ns))
+            }
         }
     }
 

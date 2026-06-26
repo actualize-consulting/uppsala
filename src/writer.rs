@@ -94,14 +94,12 @@ impl XmlWriter {
     /// assert_eq!(w.into_string(), r#"<div class="main" id="content">Hello</div>"#);
     /// ```
     pub fn start_element(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            self.buf.push(' ');
-            self.buf.push_str(key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push('>');
     }
@@ -118,14 +116,12 @@ impl XmlWriter {
     /// assert_eq!(w.into_string(), "<br/>");
     /// ```
     pub fn empty_element(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            self.buf.push(' ');
-            self.buf.push_str(key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push_str("/>");
     }
@@ -153,14 +149,17 @@ impl XmlWriter {
         K: AsRef<str>,
         V: AsRef<str>,
     {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for (key, val) in attrs {
-            self.buf.push(' ');
-            self.buf.push_str(key.as_ref());
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val.as_ref());
-            self.buf.push('"');
+            write_sanitized_attr_to_string(
+                &mut self.buf,
+                key.as_ref(),
+                val.as_ref(),
+                &mut seen_attrs,
+            );
         }
         self.buf.push('>');
     }
@@ -186,14 +185,17 @@ impl XmlWriter {
         K: AsRef<str>,
         V: AsRef<str>,
     {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for (key, val) in attrs {
-            self.buf.push(' ');
-            self.buf.push_str(key.as_ref());
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val.as_ref());
-            self.buf.push('"');
+            write_sanitized_attr_to_string(
+                &mut self.buf,
+                key.as_ref(),
+                val.as_ref(),
+                &mut seen_attrs,
+            );
         }
         self.buf.push_str("/>");
     }
@@ -202,24 +204,23 @@ impl XmlWriter {
     ///
     /// This is the form required by W3C Canonical XML (C14N).
     pub fn empty_element_expanded(&mut self, name: &str, attrs: &[(&str, &str)]) {
+        let name = safe_xml_qname(name);
         self.buf.push('<');
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
+        let mut seen_attrs = Vec::new();
         for &(key, val) in attrs {
-            self.buf.push(' ');
-            self.buf.push_str(key);
-            self.buf.push_str("=\"");
-            write_escaped_attr_to_string(&mut self.buf, val);
-            self.buf.push('"');
+            write_sanitized_attr_to_string(&mut self.buf, key, val, &mut seen_attrs);
         }
         self.buf.push_str("></");
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         self.buf.push('>');
     }
 
     /// Close an element: `</name>`.
     pub fn end_element(&mut self, name: &str) {
+        let name = safe_xml_qname(name);
         self.buf.push_str("</");
-        self.buf.push_str(name);
+        self.buf.push_str(&name);
         self.buf.push('>');
     }
 
@@ -338,12 +339,13 @@ impl std::fmt::Display for XmlWriter {
 /// intent of the text is preserved; a human reading the comment sees the
 /// same words) but byte-inequivalent.
 pub(crate) fn sanitize_comment_content(s: &str) -> Cow<'_, str> {
-    if !s.contains("--") && !s.ends_with('-') {
+    if !s.contains("--") && !s.ends_with('-') && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len() + 4);
     let mut prev_was_dash = false;
     for c in s.chars() {
+        let c = sanitized_xml_char(c);
         if c == '-' && prev_was_dash {
             out.push(' ');
         }
@@ -360,10 +362,21 @@ pub(crate) fn sanitize_comment_content(s: &str) -> Cow<'_, str> {
 /// is inserted between the `?` and `>` so the byte sequence no longer
 /// matches the parser's terminator scan.
 pub(crate) fn sanitize_pi_data(s: &str) -> Cow<'_, str> {
-    if !s.contains("?>") {
+    if !s.contains("?>") && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.replace("?>", "? >"))
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let c = sanitized_xml_char(c);
+        if c == '?' && chars.peek() == Some(&'>') {
+            out.push('?');
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Sanitize a PI target so it cannot collide with the reserved name
@@ -374,10 +387,19 @@ pub(crate) fn sanitize_pi_data(s: &str) -> Cow<'_, str> {
 /// reparse-rejected document. Renaming to `_xml` preserves the "this
 /// is a PI" intent while making the output unambiguously a PI node.
 pub(crate) fn sanitize_pi_target(s: &str) -> Cow<'_, str> {
+    // The reserved target `xml` (any case) is renamed so the PI cannot be
+    // mistaken for an XML declaration.
     if s.eq_ignore_ascii_case("xml") {
-        Cow::Owned(format!("_{}", s))
-    } else {
+        return Cow::Owned(format!("_{}", s));
+    }
+    // A PI target must be a valid XML Name. Without this check a target
+    // containing `?>` plus markup (e.g. `foo?><evil>`) is written verbatim
+    // between `<?` and the data, breaking out of PI position and smuggling
+    // sibling elements into the output. Any invalid target collapses to `_`.
+    if is_valid_xml_ncname(s) {
         Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
     }
 }
 
@@ -391,10 +413,28 @@ pub(crate) fn sanitize_pi_target(s: &str) -> Cow<'_, str> {
 /// `<![CDATA[hello]]]]><![CDATA[>world]]>`, which reparses as two adjacent
 /// CDATA sections concatenating to `"hello]]>world"`.
 pub(crate) fn split_cdata_content(s: &str) -> Cow<'_, str> {
-    if !s.contains("]]>") {
+    if !s.contains("]]>") && s.chars().all(is_xml_char) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.replace("]]>", "]]]]><![CDATA[>"))
+    let sanitized: String = s.chars().map(sanitized_xml_char).collect();
+    Cow::Owned(sanitized.replace("]]>", "]]]]><![CDATA[>"))
+}
+
+pub(crate) fn sanitized_xml_char(c: char) -> char {
+    if is_xml_char(c) {
+        c
+    } else {
+        '\u{FFFD}'
+    }
+}
+
+pub(crate) fn is_xml_char(c: char) -> bool {
+    matches!(c,
+        '\u{9}' | '\u{A}' | '\u{D}' |
+        '\u{20}'..='\u{D7FF}' |
+        '\u{E000}'..='\u{FFFD}' |
+        '\u{10000}'..='\u{10FFFF}'
+    )
 }
 
 /// Return `s` if it is a version this library can both serialize and
@@ -441,6 +481,98 @@ fn is_valid_xml_encoding(s: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Return a safe XML QName for structural markup names. Invalid names are
+/// replaced by `_` so programmatic name input cannot break out of tag or
+/// attribute-name position and smuggle markup into serialized output.
+pub(crate) fn safe_xml_qname(s: &str) -> Cow<'_, str> {
+    if is_valid_xml_qname(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
+    }
+}
+
+/// Return a safe XML NCName for namespace declaration prefixes.
+pub(crate) fn safe_xml_ncname(s: &str) -> Cow<'_, str> {
+    if is_valid_xml_ncname(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Borrowed("_")
+    }
+}
+
+/// Return a safe XML QName that is unique among names already emitted for
+/// the same element.
+///
+/// Sanitization can collapse distinct invalid inputs such as `"bad attr"` and
+/// `"bad\tattr"` to the same fallback name (`"_"`). XML forbids duplicate
+/// attribute names, so callers pass a per-element `seen` set and this helper
+/// appends deterministic suffixes (`_1`, `_2`, ...) when needed.
+pub(crate) fn unique_safe_xml_qname(s: &str, seen: &mut Vec<String>) -> String {
+    let base = safe_xml_qname(s).into_owned();
+    if !seen.contains(&base) {
+        seen.push(base.clone());
+        return base;
+    }
+
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{}_{}", base, suffix);
+        if !seen.contains(&candidate) {
+            seen.push(candidate.clone());
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return is_valid_xml_ncname(first);
+    };
+    parts.next().is_none() && is_valid_xml_ncname(first) && is_valid_xml_ncname(second)
+}
+
+pub(crate) fn is_valid_xml_ncname(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if is_ncname_start_char(c) => {}
+        _ => return false,
+    }
+    chars.all(is_ncname_char)
+}
+
+/// XML 1.0 `NCNameStartChar` — the full `NameStartChar` production minus `:`.
+///
+/// Must mirror the parser's accepted ranges so that names produced by the
+/// parser round-trip through serialization without being sanitized to `_`
+/// (e.g. `<é/>`). Sanitization only exists to neutralize *invalid*
+/// programmatic names, not to reject valid non-ASCII ones.
+fn is_ncname_start_char(c: char) -> bool {
+    matches!(c,
+        'A'..='Z' | '_' | 'a'..='z' |
+        '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' |
+        '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' |
+        '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' |
+        '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' |
+        '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' |
+        '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+/// XML 1.0 `NCNameChar` — the full `NameChar` production minus `:`.
+fn is_ncname_char(c: char) -> bool {
+    is_ncname_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' |
+            '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
+        )
+}
+
 // ─── Internal escaping helpers (write directly to String, no allocation) ───
 
 /// Write text content with XML escaping directly to a String.
@@ -451,7 +583,7 @@ fn write_escaped_text_to_string(buf: &mut String, s: &str) {
             '<' => buf.push_str("&lt;"),
             '>' => buf.push_str("&gt;"),
             '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(c),
+            _ => buf.push(sanitized_xml_char(c)),
         }
     }
 }
@@ -467,9 +599,25 @@ fn write_escaped_attr_to_string(buf: &mut String, s: &str) {
             '\t' => buf.push_str("&#x9;"),
             '\n' => buf.push_str("&#xA;"),
             '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(c),
+            _ => buf.push(sanitized_xml_char(c)),
         }
     }
+}
+
+/// Write one attribute after structural-name sanitization and per-element
+/// collision disambiguation.
+fn write_sanitized_attr_to_string(
+    buf: &mut String,
+    key: &str,
+    value: &str,
+    seen_attrs: &mut Vec<String>,
+) {
+    let key = unique_safe_xml_qname(key, seen_attrs);
+    buf.push(' ');
+    buf.push_str(&key);
+    buf.push_str("=\"");
+    write_escaped_attr_to_string(buf, value);
+    buf.push('"');
 }
 
 #[cfg(test)]

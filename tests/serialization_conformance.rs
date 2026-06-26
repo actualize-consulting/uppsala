@@ -1,6 +1,15 @@
-//! Comprehensive tests for XML serialization, round-trip fidelity, and the XmlWriter builder.
+//! Comprehensive tests for XML serialization, round-trip fidelity, and the
+//! `XmlWriter` builder.
+//!
+//! The suite is grouped by serialization surface. Simple round-trip cases pin
+//! byte-for-byte behavior for parsed XML, while later sections cover security
+//! defaults, subtree serialization, writer escaping, and streaming output.
 
 // ─── Round-trip: to_xml() ───────────────────────────────────────────────────
+
+// These tests cover parsed XML that should serialize back to the same compact
+// representation. They intentionally use small fixtures so each XML construct
+// is isolated when a round-trip regression occurs.
 
 #[test]
 fn roundtrip_simple() {
@@ -136,34 +145,44 @@ fn roundtrip_attr_with_lt() {
     assert_eq!(doc.to_xml(), xml);
 }
 
-// ─── DOCTYPE preservation ───────────────────────────────────────────────────
+// ─── DOCTYPE handling ───────────────────────────────────────────────────────
+
+// DOCTYPE declarations are stored on the Document but omitted by default when
+// serializing. These tests pin both the secure default and the explicit trusted
+// opt-in path.
 
 #[test]
-fn doctype_preserved_system() {
+fn doctype_omitted_by_default_system() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE root SYSTEM "root.dtd"><root/>"#;
     let doc = uppsala::parse(xml).unwrap();
     assert_eq!(
         doc.doctype.as_deref(),
         Some(r#"<!DOCTYPE root SYSTEM "root.dtd">"#)
     );
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), r#"<?xml version="1.0"?><root/>"#);
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]
-fn doctype_preserved_public() {
+fn doctype_omitted_by_default_public() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html/>"#;
     let doc = uppsala::parse(xml).unwrap();
     assert!(doc.doctype.is_some());
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), r#"<?xml version="1.0"?><html/>"#);
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]
-fn doctype_preserved_internal_subset() {
+fn doctype_omitted_by_default_internal_subset() {
     let xml =
         "<?xml version=\"1.0\"?><!DOCTYPE root [\n<!ELEMENT root (#PCDATA)>\n]><root>hello</root>";
     let doc = uppsala::parse(xml).unwrap();
     assert!(doc.doctype.is_some());
-    assert_eq!(doc.to_xml(), xml);
+    assert_eq!(doc.to_xml(), "<?xml version=\"1.0\"?><root>hello</root>");
+    let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
+    assert_eq!(doc.to_xml_with_options(&opts), xml);
 }
 
 #[test]
@@ -174,6 +193,9 @@ fn no_doctype_is_none() {
 }
 
 // ─── Escaping edge cases ────────────────────────────────────────────────────
+
+// Escaping tests verify that the serializer emits XML syntax characters as
+// entity references in text and attribute-value positions.
 
 #[test]
 fn text_escaping_amp_lt_gt() {
@@ -191,6 +213,9 @@ fn attr_escaping_quote() {
 
 // ─── Display trait ──────────────────────────────────────────────────────────
 
+// Display is intended as a convenience wrapper over the compact XML
+// serializer, so it should stay byte-equivalent with `to_xml()`.
+
 #[test]
 fn display_matches_to_xml() {
     let xml =
@@ -206,6 +231,9 @@ fn display_simple() {
 }
 
 // ─── node_to_xml (subtree serialization) ────────────────────────────────────
+
+// Subtree serialization excludes document-level metadata and writes only the
+// selected node and descendants. Text nodes still need normal escaping.
 
 #[test]
 fn node_to_xml_document_element() {
@@ -242,6 +270,9 @@ fn node_to_xml_text_node() {
 
 // ─── write_to (io::Write streaming) ────────────────────────────────────────
 
+// The streaming API should produce the same bytes as `to_xml()` without
+// requiring callers to allocate the final String themselves.
+
 #[test]
 fn write_to_vec() {
     let xml = "<root><child>text</child></root>";
@@ -262,6 +293,9 @@ fn write_to_matches_to_xml() {
 }
 
 // ─── XmlWriteOptions: expand_empty_elements ─────────────────────────────────
+
+// `expand_empty_elements` is required for canonical-style output. These tests
+// verify it affects both nested empty elements and an empty document element.
 
 #[test]
 fn expand_empty_elements() {
@@ -290,6 +324,9 @@ fn self_closing_default() {
 }
 
 // ─── XmlWriteOptions: pretty-printing ───────────────────────────────────────
+
+// Pretty-printing should indent element-only content while preserving mixed
+// content exactly, because injected whitespace would change text semantics.
 
 #[test]
 fn pretty_print_simple() {
@@ -350,6 +387,9 @@ fn pretty_print_expand_empty() {
 
 // ─── node_to_xml_with_options ───────────────────────────────────────────────
 
+// Options passed to subtree serialization should apply to the selected node in
+// the same way they apply to full-document serialization.
+
 #[test]
 fn node_to_xml_with_expand_empty() {
     let xml = "<root><a/></root>";
@@ -361,6 +401,9 @@ fn node_to_xml_with_expand_empty() {
 }
 
 // ─── Namespace declarations in serialization ────────────────────────────────
+
+// Namespace declarations are part of the element start tag and must survive
+// parse/serialize cycles so prefixed and default namespaces remain meaningful.
 
 #[test]
 fn namespace_declarations_preserved() {
@@ -381,6 +424,9 @@ fn prefixed_namespace_preserved() {
 }
 
 // ─── XmlWriter builder tests ────────────────────────────────────────────────
+
+// XmlWriter is the programmatic construction API. These tests cover the same
+// XML constructs as DOM serialization, but through direct builder calls.
 
 #[test]
 fn writer_basic() {
@@ -532,7 +578,7 @@ fn writer_namespace_attrs() {
 
 #[test]
 fn writer_rsa_key_value_pattern() {
-    // This mimics the pattern from bergshamra's key.rs
+    // XML signature key material exercises nested prefixed element names.
     let mut w = uppsala::XmlWriter::new();
     let prefix = "ds";
     w.start_element(&format!("{prefix}:RSAKeyValue"), &[]);
@@ -551,7 +597,8 @@ fn writer_rsa_key_value_pattern() {
 
 #[test]
 fn writer_ec_key_value_pattern() {
-    // Mimics bergshamra's ECKeyValue pattern
+    // ECKeyValue output combines a default namespace, an empty element with an
+    // attribute, and base64-like text content.
     let mut w = uppsala::XmlWriter::new();
     w.start_element(
         "ECKeyValue",
@@ -608,6 +655,8 @@ fn writer_into_bytes() {
 }
 
 // ─── write_to_with_options ──────────────────────────────────────────────────
+
+// This pins the combination of streaming output and non-default write options.
 
 #[test]
 fn write_to_with_pretty_options() {
