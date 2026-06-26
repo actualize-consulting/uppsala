@@ -38,6 +38,10 @@ pub(crate) fn wildcard_allows_namespace(
         NamespaceConstraint::Not(excluded) => {
             matches!(ns, Some(uri) if !excluded.iter().any(|u| u == uri))
         }
+        NamespaceConstraint::AnyExcept(excluded) => match ns {
+            None => true,
+            Some(uri) => !excluded.iter().any(|u| u == uri),
+        },
     }
 }
 
@@ -92,6 +96,14 @@ pub(super) fn intersect_namespace_constraints(
         | (NamespaceConstraint::NotLocal, NamespaceConstraint::Other(excluded)) => {
             Some(NamespaceConstraint::Other(excluded.clone()))
         }
+        (NamespaceConstraint::Other(excluded), NamespaceConstraint::AnyExcept(other_excluded))
+        | (NamespaceConstraint::AnyExcept(other_excluded), NamespaceConstraint::Other(excluded)) => {
+            let mut excluded_uris = other_excluded.clone();
+            if let Some(uri) = excluded {
+                push_unique(&mut excluded_uris, uri.clone());
+            }
+            Some(not_constraint(excluded_uris))
+        }
         (NamespaceConstraint::Not(a), NamespaceConstraint::Not(b)) => {
             let mut excluded = a.clone();
             for uri in b {
@@ -99,9 +111,28 @@ pub(super) fn intersect_namespace_constraints(
             }
             Some(not_constraint(excluded))
         }
+        (NamespaceConstraint::Not(excluded), NamespaceConstraint::AnyExcept(other_excluded))
+        | (NamespaceConstraint::AnyExcept(other_excluded), NamespaceConstraint::Not(excluded)) => {
+            let mut excluded_uris = excluded.clone();
+            for uri in other_excluded {
+                push_unique(&mut excluded_uris, uri.clone());
+            }
+            Some(not_constraint(excluded_uris))
+        }
         (NamespaceConstraint::Not(excluded), NamespaceConstraint::NotLocal)
         | (NamespaceConstraint::NotLocal, NamespaceConstraint::Not(excluded)) => {
             Some(not_constraint(excluded.clone()))
+        }
+        (NamespaceConstraint::NotLocal, NamespaceConstraint::AnyExcept(excluded))
+        | (NamespaceConstraint::AnyExcept(excluded), NamespaceConstraint::NotLocal) => {
+            Some(not_constraint(excluded.clone()))
+        }
+        (NamespaceConstraint::AnyExcept(a), NamespaceConstraint::AnyExcept(b)) => {
+            let mut excluded = a.clone();
+            for uri in b {
+                push_unique(&mut excluded, uri.clone());
+            }
+            Some(any_except_constraint(excluded))
         }
         (NamespaceConstraint::NotLocal, NamespaceConstraint::NotLocal) => {
             Some(NamespaceConstraint::NotLocal)
@@ -127,10 +158,55 @@ pub(super) fn union_namespace_constraints(
         }
         return constraint_from_finite(finite_a).unwrap_or(NamespaceConstraint::Any);
     }
+    if let Some(finite) = finite_namespaces(a) {
+        match b {
+            NamespaceConstraint::Other(excluded) => {
+                return union_other_with_finite(excluded, finite)
+            }
+            NamespaceConstraint::NotLocal => return union_notlocal_with_finite(finite),
+            NamespaceConstraint::Not(excluded) => return union_not_with_finite(excluded, finite),
+            NamespaceConstraint::AnyExcept(excluded) => {
+                return union_any_except_with_finite(excluded, finite);
+            }
+            _ => {}
+        }
+    }
+    if let Some(finite) = finite_namespaces(b) {
+        match a {
+            NamespaceConstraint::Other(excluded) => {
+                return union_other_with_finite(excluded, finite)
+            }
+            NamespaceConstraint::NotLocal => return union_notlocal_with_finite(finite),
+            NamespaceConstraint::Not(excluded) => return union_not_with_finite(excluded, finite),
+            NamespaceConstraint::AnyExcept(excluded) => {
+                return union_any_except_with_finite(excluded, finite);
+            }
+            _ => {}
+        }
+    }
 
     match (a, b) {
         // Any union anything = Any
         (NamespaceConstraint::Any, _) | (_, NamespaceConstraint::Any) => NamespaceConstraint::Any,
+        (NamespaceConstraint::AnyExcept(excluded), NamespaceConstraint::Other(other))
+        | (NamespaceConstraint::Other(other), NamespaceConstraint::AnyExcept(excluded)) => {
+            let common = match other {
+                Some(uri) if excluded.contains(uri) => vec![uri.clone()],
+                _ => Vec::new(),
+            };
+            any_except_constraint(common)
+        }
+        (NamespaceConstraint::AnyExcept(_), NamespaceConstraint::NotLocal)
+        | (NamespaceConstraint::NotLocal, NamespaceConstraint::AnyExcept(_)) => {
+            NamespaceConstraint::Any
+        }
+        (NamespaceConstraint::AnyExcept(a), NamespaceConstraint::Not(b))
+        | (NamespaceConstraint::Not(b), NamespaceConstraint::AnyExcept(a)) => {
+            any_except_constraint(common_exclusions(a, b))
+        }
+        (NamespaceConstraint::AnyExcept(a), NamespaceConstraint::AnyExcept(b)) => {
+            any_except_constraint(common_exclusions(a, b))
+        }
         (NamespaceConstraint::Other(a), NamespaceConstraint::Other(b)) => match (a, b) {
             (Some(left), Some(right)) if left == right => NamespaceConstraint::Other(a.clone()),
             (None, None) => NamespaceConstraint::Other(None),
@@ -151,15 +227,20 @@ pub(super) fn union_namespace_constraints(
                 NamespaceConstraint::Other(excluded.clone())
             }
         }
-        (NamespaceConstraint::Other(_), NamespaceConstraint::Local)
-        | (NamespaceConstraint::Local, NamespaceConstraint::Other(_)) => NamespaceConstraint::Any,
+        (NamespaceConstraint::Other(excluded), NamespaceConstraint::Local)
+        | (NamespaceConstraint::Local, NamespaceConstraint::Other(excluded)) => match excluded {
+            Some(uri) => any_except_constraint(vec![uri.clone()]),
+            None => NamespaceConstraint::Any,
+        },
         (NamespaceConstraint::Not(excluded), NamespaceConstraint::TargetNamespace(Some(ns)))
         | (NamespaceConstraint::TargetNamespace(Some(ns)), NamespaceConstraint::Not(excluded)) => {
             let reduced: Vec<String> = excluded.iter().filter(|u| *u != ns).cloned().collect();
             not_constraint(reduced)
         }
-        (NamespaceConstraint::Not(_), NamespaceConstraint::Local)
-        | (NamespaceConstraint::Local, NamespaceConstraint::Not(_)) => NamespaceConstraint::Any,
+        (NamespaceConstraint::Not(excluded), NamespaceConstraint::Local)
+        | (NamespaceConstraint::Local, NamespaceConstraint::Not(excluded)) => {
+            any_except_constraint(excluded.clone())
+        }
         (NamespaceConstraint::Not(a), NamespaceConstraint::Not(b)) => {
             let common: Vec<String> = a.iter().filter(|u| b.contains(u)).cloned().collect();
             not_constraint(common)
@@ -206,12 +287,20 @@ fn intersection_from_finite(
 }
 
 fn constraint_from_finite(values: Vec<Option<String>>) -> Option<NamespaceConstraint> {
+    // Sort + dedup so the result is deterministic and duplicate-free regardless
+    // of input ordering. Plain `dedup` only removes *adjacent* duplicates, so a
+    // non-adjacent repeat (e.g. `[a, b, a]`) would otherwise slip through.
     let mut values = values;
+    values.sort();
     values.dedup();
     match values.as_slice() {
         [] => None,
         [None] => Some(NamespaceConstraint::Local),
-        [Some(uri)] => Some(NamespaceConstraint::TargetNamespace(Some(uri.clone()))),
+        // A single explicit URI is just the set `{uri}`. Represent it as a
+        // one-element `List`, not `TargetNamespace`: the latter carries dedicated
+        // `##targetNamespace` semantics that the union/intersection arms special-
+        // case, so reusing it for an arbitrary singleton can skew wildcard merges.
+        [Some(uri)] => Some(NamespaceConstraint::List(vec![uri.clone()])),
         _ => {
             let mut uris = Vec::new();
             for value in values {
@@ -241,6 +330,84 @@ fn not_constraint(excluded: Vec<String>) -> NamespaceConstraint {
     } else {
         NamespaceConstraint::Not(excluded)
     }
+}
+
+fn any_except_constraint(excluded: Vec<String>) -> NamespaceConstraint {
+    let mut deduped = Vec::new();
+    for uri in excluded {
+        push_unique(&mut deduped, uri);
+    }
+    if deduped.is_empty() {
+        NamespaceConstraint::Any
+    } else {
+        NamespaceConstraint::AnyExcept(deduped)
+    }
+}
+
+fn common_exclusions(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().filter(|u| b.contains(u)).cloned().collect()
+}
+
+fn union_other_with_finite(
+    excluded: &Option<String>,
+    finite: Vec<Option<String>>,
+) -> NamespaceConstraint {
+    let includes_local = finite.contains(&None);
+    match excluded {
+        Some(uri) if finite.contains(&Some(uri.clone())) => {
+            if includes_local {
+                NamespaceConstraint::Any
+            } else {
+                NamespaceConstraint::NotLocal
+            }
+        }
+        Some(uri) => {
+            if includes_local {
+                any_except_constraint(vec![uri.clone()])
+            } else {
+                NamespaceConstraint::Other(Some(uri.clone()))
+            }
+        }
+        None => {
+            if includes_local {
+                NamespaceConstraint::Any
+            } else {
+                NamespaceConstraint::NotLocal
+            }
+        }
+    }
+}
+
+fn union_notlocal_with_finite(finite: Vec<Option<String>>) -> NamespaceConstraint {
+    if finite.contains(&None) {
+        NamespaceConstraint::Any
+    } else {
+        NamespaceConstraint::NotLocal
+    }
+}
+
+fn union_not_with_finite(excluded: &[String], finite: Vec<Option<String>>) -> NamespaceConstraint {
+    let includes_local = finite.contains(&None);
+    let mut reduced = excluded.to_vec();
+    for ns in finite.into_iter().flatten() {
+        reduced.retain(|excluded_ns| excluded_ns != &ns);
+    }
+    if includes_local {
+        any_except_constraint(reduced)
+    } else {
+        not_constraint(reduced)
+    }
+}
+
+fn union_any_except_with_finite(
+    excluded: &[String],
+    finite: Vec<Option<String>>,
+) -> NamespaceConstraint {
+    let mut reduced = excluded.to_vec();
+    for ns in finite.into_iter().flatten() {
+        reduced.retain(|excluded_ns| excluded_ns != &ns);
+    }
+    any_except_constraint(reduced)
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -300,5 +467,39 @@ mod tests {
             union_namespace_constraints(&a, &b),
             NamespaceConstraint::NotLocal
         ));
+    }
+
+    #[test]
+    fn union_other_with_local_excludes_target_namespace() {
+        let other = NamespaceConstraint::Other(Some("urn:t".into()));
+        let local = NamespaceConstraint::Local;
+
+        let result = union_namespace_constraints(&other, &local);
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:f")));
+        assert!(!wildcard_allows_namespace(&result, Some("urn:t")));
+
+        let result = union_namespace_constraints(&local, &other);
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:f")));
+        assert!(!wildcard_allows_namespace(&result, Some("urn:t")));
+    }
+
+    #[test]
+    fn union_other_with_finite_list_is_precise() {
+        let other = NamespaceConstraint::Other(Some("urn:t".into()));
+        let list = NamespaceConstraint::List(vec!["##local".into(), "urn:f".into()]);
+
+        let result = union_namespace_constraints(&other, &list);
+        assert!(wildcard_allows_namespace(&result, None));
+        assert!(wildcard_allows_namespace(&result, Some("urn:f")));
+        assert!(wildcard_allows_namespace(&result, Some("urn:g")));
+        assert!(!wildcard_allows_namespace(&result, Some("urn:t")));
+
+        let list = NamespaceConstraint::List(vec!["urn:t".into()]);
+        let result = union_namespace_constraints(&other, &list);
+        assert!(wildcard_allows_namespace(&result, Some("urn:t")));
+        assert!(wildcard_allows_namespace(&result, Some("urn:g")));
+        assert!(!wildcard_allows_namespace(&result, None));
     }
 }

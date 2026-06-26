@@ -1241,16 +1241,16 @@ fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlRe
     let mut result = Vec::new();
     for &node in context_nodes {
         let axis_nodes = select_axis(&step.axis, node, ctx)?;
+        let mut step_nodes = Vec::new();
         for &candidate in &axis_nodes {
             if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
-                result.push(candidate);
+                step_nodes.push(candidate);
             }
         }
-    }
-    // Apply predicates
-    for pred in &step.predicates {
-        result = apply_predicate(pred, &result, ctx)?;
-        result = dedup_document_order(result);
+        for pred in &step.predicates {
+            step_nodes = apply_predicate(pred, &step_nodes, ctx)?;
+        }
+        result.extend(step_nodes);
     }
     Ok(dedup_document_order(result))
 }

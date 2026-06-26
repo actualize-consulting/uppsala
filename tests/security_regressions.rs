@@ -703,6 +703,39 @@ fn xsd_attribute_wildcard_union_stays_namespace_precise() {
 }
 
 #[test]
+fn xsd_attribute_wildcard_union_other_plus_local_excludes_target() {
+    // ##other excludes both the schema target namespace and local attributes;
+    // unioning it with ##local should add local attributes without admitting
+    // target-namespace attributes.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="urn:t"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified">
+  <xs:complexType name="Base">
+    <xs:anyAttribute namespace="##other" processContents="skip"/>
+  </xs:complexType>
+  <xs:complexType name="Derived">
+    <xs:complexContent>
+      <xs:extension base="t:Base">
+        <xs:anyAttribute namespace="##local" processContents="skip"/>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+  <xs:element name="r" type="t:Derived"/>
+</xs:schema>"###;
+
+    let valid = r#"<t:r xmlns:t="urn:t" xmlns:f="urn:f" local="ok" f:foreign="ok"/>"#;
+    assert!(validate(schema, valid).is_empty());
+
+    let invalid = r#"<t:r xmlns:t="urn:t" t:target="no"/>"#;
+    let errors = validate(schema, invalid);
+    assert!(
+        errors.iter().any(|e| e.contains("not allowed by wildcard")),
+        "expected target-namespace wildcard error, got {errors:?}"
+    );
+}
+
+#[test]
 fn xsd_complex_type_derivation_cycles_are_rejected() {
     // Recursive complex-type derivation can otherwise loop while resolving the
     // effective content model. The validator should detect the cycle and report

@@ -158,6 +158,8 @@ pub(crate) enum NamespaceConstraint {
     NotLocal,
     /// Any namespace-qualified name except the listed namespace URIs.
     Not(Vec<String>),
+    /// Any namespace, including no namespace, except the listed namespace URIs.
+    AnyExcept(Vec<String>),
 }
 
 /// processContents for wildcards.
@@ -216,6 +218,10 @@ impl AttributeWildcard {
             NamespaceConstraint::Not(excluded) => {
                 matches!(attr_ns, Some(ns) if !excluded.iter().any(|u| u == ns))
             }
+            NamespaceConstraint::AnyExcept(excluded) => match attr_ns {
+                None => true,
+                Some(ns) => !excluded.iter().any(|u| u == ns),
+            },
         }
     }
 
