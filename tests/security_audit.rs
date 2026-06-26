@@ -340,7 +340,7 @@ fn xsd_include_circular_stack_overflow() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-// ─── Finding F-11 — Round-trip injection via programmatic comment ──────
+// ─── Finding F-13 — Round-trip injection via programmatic comment ──────
 
 #[test]
 fn roundtrip_comment_smuggle() {
