@@ -20,7 +20,7 @@ use crate::error::{XmlError, XmlResult};
 
 use super::composition::{process_schema_composition, CompositionState};
 use super::facet_resolution::{
-    resolve_content_model_list_item_facets, resolve_inline_list_item_facets,
+    resolve_content_model_list_item_facets, resolve_inline_list_item_facets, ListBasesMap,
 };
 use super::parser::{
     parse_attribute_group_def, parse_complex_type, parse_element_decl, parse_model_group_def,
@@ -453,11 +453,27 @@ impl XsdValidator {
                 })
                 .collect();
 
+        // Named simple types that are list types, so an inline type restricting
+        // one can inherit `is_list`/`item_type`/`item_facets` (issue #12). Built
+        // after the named-type list-resolution passes above, so the entries
+        // already carry resolved item types.
+        let list_bases: ListBasesMap = validator
+            .types
+            .iter()
+            .filter_map(|(k, td)| match td {
+                TypeDef::Simple(st) if st.is_list => {
+                    Some((k.clone(), (st.item_type.clone(), st.item_facets.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+
         // Resolve inline list types in global element declarations
         for elem_decl in validator.elements.values_mut() {
             resolve_inline_list_item_facets(
                 &mut elem_decl.type_ref,
                 &resolved_items,
+                &list_bases,
                 &validator.target_namespace,
             );
         }
@@ -469,6 +485,7 @@ impl XsdValidator {
                 resolve_content_model_list_item_facets(
                     &mut ct.content,
                     &resolved_items,
+                    &list_bases,
                     &validator.target_namespace,
                 );
             }

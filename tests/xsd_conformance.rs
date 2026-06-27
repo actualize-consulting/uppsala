@@ -513,3 +513,36 @@ fn xsd_nested_complex_types() {
     let xml = "<order><customer><name>Bob</name></customer><total>99.95</total></order>";
     assert!(validate_xml_against_xsd(xml, xsd).is_ok());
 }
+
+// ─── List-type inheritance (issue #12) ─────────────────────────────
+
+#[test]
+fn xsd_list_inheritance() {
+    // An inline <xs:simpleType> restricting a named list type must inherit
+    // `is_list` from the base, so a `length` facet counts list *items*, not
+    // characters. Regression test for issue #12.
+    let xsd = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="DoubleListSimpleType">
+    <xs:list itemType="xs:double"/>
+  </xs:simpleType>
+  <xs:element name="ThreePoint" nillable="false">
+    <xs:simpleType>
+      <xs:restriction base="DoubleListSimpleType">
+        <xs:length value="3" fixed="true"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    // Exactly three list items — valid regardless of each item's char length.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4 4.5</ThreePoint>", xsd).is_ok());
+    assert!(validate_xml_against_xsd("<ThreePoint>1 2 3</ThreePoint>", xsd).is_ok());
+
+    // Wrong number of items — must fail the length facet.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4</ThreePoint>", xsd).is_err());
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4 3 4</ThreePoint>", xsd).is_err());
+
+    // Item type is still enforced: a non-double item must fail.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 abc 4.5</ThreePoint>", xsd).is_err());
+}
