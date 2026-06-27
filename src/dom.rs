@@ -1545,7 +1545,10 @@ impl<'a> NsScope<'a> {
     }
 
     /// Find a non-empty prefix currently bound to `uri`, respecting shadowing
-    /// (the innermost binding for each prefix wins).
+    /// (the innermost binding for each prefix wins). The reserved `xml` and
+    /// `xmlns` prefixes are never returned: reusing them for an arbitrary URI
+    /// would defeat the "reserved prefixes are never rebound" guarantee and
+    /// produce output that re-parses into the wrong namespace.
     fn prefix_for(&self, uri: &str) -> Option<String> {
         // Track seen prefixes by reference (no cloning); the innermost binding
         // for each prefix is its effective one, so a prefix seen earlier shadows
@@ -1554,7 +1557,12 @@ impl<'a> NsScope<'a> {
         let mut cur = Some(self);
         while let Some(s) = cur {
             for (p, u) in s.local.iter().rev() {
-                if seen.insert(p.as_ref()) && !p.is_empty() && u.as_ref() == uri {
+                if seen.insert(p.as_ref())
+                    && !p.is_empty()
+                    && p.as_ref() != "xml"
+                    && p.as_ref() != "xmlns"
+                    && u.as_ref() == uri
+                {
                     return Some(p.as_ref().to_string());
                 }
             }
@@ -1666,6 +1674,7 @@ fn plan_element_namespaces<'e>(
     scope: &NsScope,
 ) -> (Option<String>, Vec<Option<String>>, Vec<NsDecl<'e>>) {
     let xml_ns = crate::namespace::XML_NAMESPACE;
+    let xmlns_ns = crate::namespace::XMLNS_NAMESPACE;
     let mut child_local: Vec<NsDecl<'e>> = elem
         .namespace_declarations
         .iter()
@@ -1700,7 +1709,15 @@ fn plan_element_namespaces<'e>(
         // is reserved and cannot be rebound.
         (Some("xml"), Some(u)) if u == xml_ns => None,
         (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", elem.name.local_name)),
-        (Some("xml"), Some(u)) => {
+        // The `xmlns` prefix and the XMLNS namespace are reserved for namespace
+        // declarations. Emitting `xmlns`/`xmlns:*` as a literal element name
+        // would re-parse as a declaration, and the parser ignores any binding
+        // to the XMLNS namespace, so rebind to a fresh non-reserved prefix.
+        (_, Some(u)) if u == xmlns_ns => {
+            let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
+            Some(format!("{}:{}", pfx, elem.name.local_name))
+        }
+        (Some("xml"), Some(u)) | (Some("xmlns"), Some(u)) => {
             let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
             Some(format!("{}:{}", pfx, elem.name.local_name))
         }
@@ -1722,7 +1739,14 @@ fn plan_element_namespaces<'e>(
             (_, None) => None,
             (Some("xml"), Some(u)) if u == xml_ns => None,
             (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", attr.name.local_name)),
-            (Some("xml"), Some(u)) => {
+            // Reserved `xmlns` prefix / XMLNS namespace: see the element-name
+            // planning above. Rebind to a fresh non-reserved prefix so the
+            // attribute does not masquerade as a namespace declaration.
+            (_, Some(u)) if u == xmlns_ns => {
+                let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
+                Some(format!("{}:{}", pfx, attr.name.local_name))
+            }
+            (Some("xml"), Some(u)) | (Some("xmlns"), Some(u)) => {
                 let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
                 Some(format!("{}:{}", pfx, attr.name.local_name))
             }
