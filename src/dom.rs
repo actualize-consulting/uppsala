@@ -1674,8 +1674,10 @@ fn ensure_binding<'e>(
 ///   uses it as the child scope.
 ///
 /// For a parsed document the stored declarations already satisfy every QName, so
-/// nothing is synthesized and output is byte-identical to before. Stored
-/// declarations are borrowed (not cloned), so a no-op plan allocates nothing.
+/// nothing is synthesized and output is byte-identical to before. The per-element
+/// cost is building the small planning vectors (`child_local` borrows the stored
+/// declarations rather than cloning them; `attr_overrides`); synthesized bindings
+/// and renamed QNames allocate only when actually required.
 fn plan_element_namespaces<'e>(
     elem: &'e Element,
     scope: &NsScope,
@@ -1709,6 +1711,11 @@ fn plan_element_namespaces<'e>(
             }
             None
         }
+        // A reserved prefix with no namespace URI must still be stripped: `xml`
+        // and `xmlns` are implicitly bound, so `xml:Foo` would re-parse into the
+        // XML namespace and `xmlns:Foo` into the XMLNS namespace, silently
+        // changing the element's namespace. Serialize the bare local name.
+        (Some("xml"), None) | (Some("xmlns"), None) => Some(elem.name.local_name.to_string()),
         (Some(_), None) => None, // prefixed but no URI: leave the name as-is
         // The XML namespace is bound to `xml` and only `xml`, and is never
         // declared. Any other prefix (or none) for that URI is rewritten to
@@ -1744,6 +1751,11 @@ fn plan_element_namespaces<'e>(
             attr.name.prefix.as_deref(),
             attr.name.namespace_uri.as_deref(),
         ) {
+            // A reserved prefix with no namespace URI is stripped: `xml`/`xmlns`
+            // are implicitly bound, so `xml:foo` would re-parse into the XML
+            // namespace and `xmlns:foo` would be read as a namespace declaration,
+            // changing the attribute's effective namespace.
+            (Some("xml"), None) | (Some("xmlns"), None) => Some(attr.name.local_name.to_string()),
             (_, None) => None,
             (Some("xml"), Some(u)) if u == xml_ns => None,
             (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", attr.name.local_name)),

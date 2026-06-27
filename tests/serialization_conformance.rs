@@ -956,9 +956,12 @@ fn ns_two_attributes_same_prefix_distinct_uris() {
 #[test]
 fn ns_xmlns_prefix_does_not_masquerade_as_declaration() {
     use uppsala::{Document, QName};
-    // The `xmlns` prefix is reserved for namespace declarations. A programmatic
-    // QName using prefix `xmlns` must not serialize as `xmlns:...`, which the
-    // parser would treat as a namespace declaration rather than an element name.
+    // The `xmlns` prefix is reserved and implicitly bound to the XMLNS
+    // namespace. A programmatic QName using prefix `xmlns` must not serialize as
+    // `xmlns:...`: an `xmlns:`-prefixed element name would re-parse bound to the
+    // XMLNS namespace (silently losing `urn:custom`), and an `xmlns`/`xmlns:*`
+    // attribute would be parsed as a namespace declaration instead of an
+    // attribute.
     let mut doc = Document::new();
     let el = doc.create_element(QName::full("xmlns", "urn:custom", "Foo"));
     doc.append_child(doc.root(), el);
@@ -1045,4 +1048,55 @@ fn ns_xmlns_namespace_attribute_is_dropped_on_serialization() {
     let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
+}
+
+#[test]
+fn ns_reserved_element_prefix_without_uri_is_stripped() {
+    use uppsala::{Document, QName};
+    // A QName carrying a reserved prefix but no namespace URI must not serialize
+    // verbatim: `xml`/`xmlns` are implicitly bound, so `xml:Foo`/`xmlns:Foo`
+    // would re-parse into the XML/XMLNS namespace, silently changing the
+    // element's namespace. The bare local name is emitted instead.
+    for prefix in ["xml", "xmlns"] {
+        let mut doc = Document::new();
+        let mut name = QName::local("Foo");
+        name.prefix = Some(std::borrow::Cow::Borrowed(prefix));
+        let el = doc.create_element(name);
+        doc.append_child(doc.root(), el);
+        let out = doc.to_xml();
+        assert_eq!(
+            out, "<Foo/>",
+            "reserved prefix {prefix} not stripped: {out}"
+        );
+        let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+        let root = re.element(re.document_element().unwrap()).unwrap();
+        assert!(
+            root.name.namespace_uri.is_none(),
+            "spurious namespace: {out}"
+        );
+    }
+}
+
+#[test]
+fn ns_reserved_attribute_prefix_without_uri_is_stripped() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    for prefix in ["xml", "xmlns"] {
+        let mut doc = Document::new();
+        let el = doc.create_element(QName::local("r"));
+        doc.append_child(doc.root(), el);
+        let mut name = QName::local("a");
+        name.prefix = Some(Cow::Borrowed(prefix));
+        doc.element_mut(el)
+            .unwrap()
+            .set_attribute(name, Cow::Borrowed("v"));
+        let out = doc.to_xml();
+        assert_eq!(
+            out, r#"<r a="v"/>"#,
+            "reserved prefix {prefix} not stripped: {out}"
+        );
+        let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+        let root = re.element(re.document_element().unwrap()).unwrap();
+        assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
+    }
 }
