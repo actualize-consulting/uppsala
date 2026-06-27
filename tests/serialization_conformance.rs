@@ -1051,6 +1051,36 @@ fn ns_xmlns_namespace_attribute_is_dropped_on_serialization() {
 }
 
 #[test]
+fn ns_stored_reserved_declarations_are_filtered() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // Stored namespace declarations holding reserved bindings (the `xmlns`
+    // prefix, the `xml` prefix bound to a non-XML URI, or any prefix bound to the
+    // XMLNS namespace) must not be emitted: the parser's resolver ignores them, so
+    // serializing them would produce namespace-not-well-formed output.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    {
+        let e = doc.element_mut(el).unwrap();
+        e.namespace_declarations
+            .push((Cow::Borrowed("xmlns"), Cow::Borrowed("urn:bad")));
+        e.namespace_declarations
+            .push((Cow::Borrowed("xml"), Cow::Borrowed("urn:notxml")));
+        e.namespace_declarations.push((
+            Cow::Borrowed("p"),
+            Cow::Borrowed("http://www.w3.org/2000/xmlns/"),
+        ));
+    }
+    let out = doc.to_xml();
+    assert_eq!(out, "<r/>", "reserved declarations were emitted: {out}");
+    assert!(
+        uppsala::parse(&out).is_ok(),
+        "output not well-formed: {out}"
+    );
+}
+
+#[test]
 fn ns_reserved_element_prefix_without_uri_is_stripped() {
     use uppsala::{Document, QName};
     // A QName carrying a reserved prefix but no namespace URI must not serialize

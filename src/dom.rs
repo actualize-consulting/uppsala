@@ -1684,9 +1684,19 @@ fn plan_element_namespaces<'e>(
 ) -> (Option<String>, Vec<Option<String>>, Vec<NsDecl<'e>>) {
     let xml_ns = crate::namespace::XML_NAMESPACE;
     let xmlns_ns = crate::namespace::XMLNS_NAMESPACE;
+    // Borrow the stored declarations, but drop the reserved bindings the parser's
+    // `NamespaceResolver::declare` ignores (namespace.rs): the `xmlns` prefix can
+    // never be declared, the `xml` prefix may only bind the XML namespace, and no
+    // prefix may bind the XMLNS namespace. Emitting them (e.g. `xmlns:xmlns=...`)
+    // would produce namespace-not-well-formed output.
     let mut child_local: Vec<NsDecl<'e>> = elem
         .namespace_declarations
         .iter()
+        .filter(|(p, u)| {
+            p.as_ref() != "xmlns"
+                && !(p.as_ref() == "xml" && u.as_ref() != xml_ns)
+                && u.as_ref() != xmlns_ns
+        })
         .map(|(p, u)| (Cow::Borrowed(p.as_ref()), Cow::Borrowed(u.as_ref())))
         .collect();
 
