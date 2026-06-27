@@ -812,3 +812,56 @@ fn ns_parsed_document_roundtrips_byte_identical() {
     let doc = uppsala::parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
+
+#[test]
+fn ns_same_prefix_conflict_does_not_misbind() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // The element carries a stored declaration `p -> urn:old`, but its QName uses
+    // prefix `p` bound to `urn:new`. A start tag cannot declare `p` twice, so the
+    // element name must be rewritten to a fresh prefix that is bound to `urn:new`
+    // — otherwise `p:Foo` would silently resolve to `urn:old`.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::full("p", "urn:new", "Foo"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el)
+        .unwrap()
+        .namespace_declarations
+        .push((Cow::Borrowed("p"), Cow::Borrowed("urn:old")));
+
+    let out = doc.to_xml();
+    // Output must re-parse and the element must actually be in urn:new.
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.document_element().unwrap();
+    assert_eq!(
+        re.element(root).unwrap().name.namespace_uri.as_deref(),
+        Some("urn:new"),
+        "element silently re-bound to the wrong namespace: {out}"
+    );
+    // The conflicting stored prefix is preserved for any descendants that use it.
+    assert!(
+        out.contains(r#"xmlns:p="urn:old""#),
+        "stored declaration dropped: {out}"
+    );
+}
+
+#[test]
+fn ns_two_attributes_same_prefix_distinct_uris() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // Two attributes both want prefix `p` but for different URIs; only one can
+    // keep `p`, the other must be rewritten so both resolve correctly.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("Foo"));
+    doc.append_child(doc.root(), el);
+    {
+        let e = doc.element_mut(el).unwrap();
+        e.set_attribute(QName::full("p", "urn:a", "one"), Cow::Borrowed("1"));
+        e.set_attribute(QName::full("p", "urn:b", "two"), Cow::Borrowed("2"));
+    }
+    let out = doc.to_xml();
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(root.get_attribute_ns("urn:a", "one"), Some("1"), "{out}");
+    assert_eq!(root.get_attribute_ns("urn:b", "two"), Some("2"), "{out}");
+}

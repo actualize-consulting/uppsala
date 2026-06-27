@@ -6,7 +6,7 @@
 //! mutation straightforward.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// A unique identifier for a node within a [`Document`].
@@ -1330,19 +1330,22 @@ impl<'a> Document<'a> {
                     write_indent(out, opts, depth)?;
                 }
                 out.write_char('<')?;
-                let raw_pname = elem.name.prefixed_name();
-                let pname = crate::writer::safe_xml_qname(&raw_pname);
-                out.write_str(&pname)?;
-                // Track names already emitted for this start tag so sanitized
-                // programmatic attributes cannot collide into duplicate XML.
-                let mut seen_attrs = Vec::new();
                 // Namespace-aware serialization: alongside the element's stored
                 // declarations, synthesize any declarations needed so its own
                 // QName and its attributes' QNames resolve under the current
                 // scope (issue #2). For parsed documents the stored declarations
                 // already satisfy every QName, so nothing extra is emitted.
-                let (synthesized, attr_overrides, child_local) =
+                let (synthesized, elem_name_override, attr_overrides, child_local) =
                     plan_element_namespaces(elem, scope);
+                let raw_pname = match &elem_name_override {
+                    Some(name) => Cow::Borrowed(name.as_str()),
+                    None => elem.name.prefixed_name(),
+                };
+                let pname = crate::writer::safe_xml_qname(&raw_pname);
+                out.write_str(&pname)?;
+                // Track names already emitted for this start tag so sanitized
+                // programmatic attributes cannot collide into duplicate XML.
+                let mut seen_attrs = Vec::new();
                 // Namespace declarations. Sanitized prefixes can collide (two
                 // distinct invalid prefixes both collapse to `_`), which would
                 // emit duplicate `xmlns:_` attributes and produce not-well-formed
@@ -1540,15 +1543,14 @@ impl<'a> NsScope<'a> {
     /// Find a non-empty prefix currently bound to `uri`, respecting shadowing
     /// (the innermost binding for each prefix wins).
     fn prefix_for(&self, uri: &str) -> Option<String> {
-        let mut seen: Vec<String> = Vec::new();
+        // Track seen prefixes by reference (no cloning); the innermost binding
+        // for each prefix is its effective one, so a prefix seen earlier shadows
+        // any later (outer) binding.
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut cur = Some(self);
         while let Some(s) = cur {
             for (p, u) in s.local.iter().rev() {
-                if seen.iter().any(|x| x == p) {
-                    continue;
-                }
-                seen.push(p.clone());
-                if !p.is_empty() && u == uri {
+                if seen.insert(p.as_str()) && !p.is_empty() && u == uri {
                     return Some(p.clone());
                 }
             }
@@ -1558,13 +1560,98 @@ impl<'a> NsScope<'a> {
     }
 }
 
+/// Allocate a fresh `nsN` prefix that is not currently bound in `scope` plus the
+/// declarations collected so far for this element.
+fn alloc_ns_prefix(scope: &NsScope, child_local: &[NsDecl]) -> String {
+    let mut n = 0usize;
+    loop {
+        let cand = format!("ns{}", n);
+        let taken = {
+            let cur = NsScope {
+                parent: Some(scope),
+                local: child_local,
+            };
+            cur.resolve(&cand).is_some()
+        };
+        if !taken {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Return an existing non-empty prefix bound to `uri`, or allocate a fresh one
+/// and record a declaration for it. Used when a prefix is required (namespaced
+/// attribute) or when the desired prefix is unusable.
+fn prefix_for_or_alloc(
+    scope: &NsScope,
+    child_local: &mut Vec<NsDecl>,
+    synthesized: &mut Vec<NsDecl>,
+    uri: &str,
+) -> String {
+    let reuse = {
+        let cur = NsScope {
+            parent: Some(scope),
+            local: child_local,
+        };
+        cur.prefix_for(uri)
+    };
+    if let Some(p) = reuse {
+        return p;
+    }
+    let p = alloc_ns_prefix(scope, child_local);
+    child_local.push((p.clone(), uri.to_string()));
+    synthesized.push((p.clone(), uri.to_string()));
+    p
+}
+
+/// Ensure `desired_prefix` (empty string = default namespace) resolves to `uri`
+/// for this element, recording any declaration that must be emitted. Returns
+/// `Some(prefix)` when the QName must be rewritten to use a *different* prefix —
+/// because `desired_prefix` is already declared on this same start tag bound to
+/// another URI and a start tag cannot carry two bindings for one prefix — or
+/// `None` when `desired_prefix` works as-is.
+fn ensure_binding(
+    scope: &NsScope,
+    child_local: &mut Vec<NsDecl>,
+    synthesized: &mut Vec<NsDecl>,
+    desired_prefix: &str,
+    uri: &str,
+) -> Option<String> {
+    let current = {
+        let cur = NsScope {
+            parent: Some(scope),
+            local: child_local,
+        };
+        cur.resolve(desired_prefix).map(|s| s.to_string())
+    };
+    if current.as_deref() == Some(uri) {
+        return None; // already correctly bound (here or via an ancestor)
+    }
+    if !child_local.iter().any(|(p, _)| p == desired_prefix) {
+        // Not declared on this element yet: declare it here, shadowing any
+        // ancestor binding. The QName keeps its own prefix.
+        child_local.push((desired_prefix.to_string(), uri.to_string()));
+        synthesized.push((desired_prefix.to_string(), uri.to_string()));
+        return None;
+    }
+    // Same-element conflict: `desired_prefix` is already bound here to a different
+    // URI and cannot be redeclared, so bind `uri` to a different prefix and
+    // rewrite the QName to use it (otherwise the QName would silently resolve to
+    // the colliding declaration).
+    Some(prefix_for_or_alloc(scope, child_local, synthesized, uri))
+}
+
 /// Compute the namespace declarations a serialized element must emit so its own
 /// QName and its attributes' QNames resolve correctly under the inherited
 /// `scope`. Returns:
 /// - `synthesized` — declarations to emit *in addition to* the element's stored
 ///   `namespace_declarations` (which are still emitted verbatim),
+/// - `elem_name_override` — a replacement element tag name, set only when the
+///   element's own prefix collides with a stored declaration,
 /// - `attr_overrides` — a per-attribute display-name override, set only for a
-///   namespaced attribute that needs a prefix it does not carry, and
+///   namespaced attribute that needs a prefix it does not carry (or whose prefix
+///   collides), and
 /// - `child_local` — every binding (stored + synthesized) this element
 ///   introduces, for building the child scope.
 ///
@@ -1573,7 +1660,12 @@ impl<'a> NsScope<'a> {
 fn plan_element_namespaces(
     elem: &Element,
     scope: &NsScope,
-) -> (Vec<NsDecl>, Vec<Option<String>>, Vec<NsDecl>) {
+) -> (
+    Vec<NsDecl>,
+    Option<String>,
+    Vec<Option<String>>,
+    Vec<NsDecl>,
+) {
     let mut child_local: Vec<NsDecl> = elem
         .namespace_declarations
         .iter()
@@ -1581,18 +1673,8 @@ fn plan_element_namespaces(
         .collect();
     let mut synthesized: Vec<NsDecl> = Vec::new();
 
-    // Resolve `prefix` against the inherited scope plus the bindings collected so
-    // far for this element.
-    let bound = |prefix: &str, local: &[NsDecl]| -> Option<String> {
-        let cur = NsScope {
-            parent: Some(scope),
-            local,
-        };
-        cur.resolve(prefix).map(|s| s.to_string())
-    };
-
     // Element QName.
-    match (
+    let elem_name_override = match (
         elem.name.prefix.as_deref(),
         elem.name.namespace_uri.as_deref(),
     ) {
@@ -1600,30 +1682,30 @@ fn plan_element_namespaces(
             // Unprefixed element in no namespace: if a non-empty default
             // namespace is in scope it would otherwise capture this element, so
             // undeclare it with `xmlns=""`.
-            if matches!(bound("", &child_local).as_deref(), Some(d) if !d.is_empty()) {
+            let default_ns = {
+                let cur = NsScope {
+                    parent: Some(scope),
+                    local: &child_local,
+                };
+                cur.resolve("").map(|s| s.to_string())
+            };
+            if matches!(default_ns.as_deref(), Some(d) if !d.is_empty()) {
                 synthesized.push((String::new(), String::new()));
                 child_local.push((String::new(), String::new()));
             }
+            None
         }
-        (Some(_), None) => { /* prefixed but no URI: leave the name as-is */ }
-        (Some("xml"), Some(_)) => { /* the xml prefix is implicitly bound */ }
-        (Some(p), Some(u)) => {
-            if bound(p, &child_local).as_deref() != Some(u) {
-                synthesized.push((p.to_string(), u.to_string()));
-                child_local.push((p.to_string(), u.to_string()));
-            }
-        }
-        (None, Some(u)) => {
-            if bound("", &child_local).as_deref() != Some(u) {
-                synthesized.push((String::new(), u.to_string()));
-                child_local.push((String::new(), u.to_string()));
-            }
-        }
-    }
+        (Some(_), None) => None, // prefixed but no URI: leave the name as-is
+        (Some("xml"), Some(_)) => None, // the xml prefix is implicitly bound
+        (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, p, u)
+            .map(|q| format!("{}:{}", q, elem.name.local_name)),
+        (None, Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, "", u)
+            .map(|q| format!("{}:{}", q, elem.name.local_name)),
+    };
 
     // Attributes. An empty prefix never works for an attribute (attributes are
     // not in the default namespace), so a namespaced-but-prefixless attribute is
-    // given a prefix.
+    // always given a prefix.
     let mut attr_overrides = Vec::with_capacity(elem.attributes.len());
     for attr in &elem.attributes {
         let override_name = match (
@@ -1631,51 +1713,17 @@ fn plan_element_namespaces(
             attr.name.namespace_uri.as_deref(),
         ) {
             (_, None) | (Some("xml"), Some(_)) => None,
-            (Some(p), Some(u)) => {
-                if bound(p, &child_local).as_deref() != Some(u) {
-                    synthesized.push((p.to_string(), u.to_string()));
-                    child_local.push((p.to_string(), u.to_string()));
-                }
-                None
-            }
+            (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, p, u)
+                .map(|q| format!("{}:{}", q, attr.name.local_name)),
             (None, Some(u)) => {
-                let existing = {
-                    let cur = NsScope {
-                        parent: Some(scope),
-                        local: &child_local,
-                    };
-                    cur.prefix_for(u)
-                };
-                let pfx = match existing {
-                    Some(p) => p,
-                    None => {
-                        let mut n = 0usize;
-                        let p = loop {
-                            let cand = format!("ns{}", n);
-                            let unbound = {
-                                let cur = NsScope {
-                                    parent: Some(scope),
-                                    local: &child_local,
-                                };
-                                cur.resolve(&cand).is_none()
-                            };
-                            if unbound {
-                                break cand;
-                            }
-                            n += 1;
-                        };
-                        synthesized.push((p.clone(), u.to_string()));
-                        child_local.push((p.clone(), u.to_string()));
-                        p
-                    }
-                };
+                let pfx = prefix_for_or_alloc(scope, &mut child_local, &mut synthesized, u);
                 Some(format!("{}:{}", pfx, attr.name.local_name))
             }
         };
         attr_overrides.push(override_name);
     }
 
-    (synthesized, attr_overrides, child_local)
+    (synthesized, elem_name_override, attr_overrides, child_local)
 }
 
 impl<'a> Default for Document<'a> {
