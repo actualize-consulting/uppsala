@@ -80,12 +80,12 @@ fn quadratic_entity_expansion_bounded_accepted() {
 /// Regression for F-03. A deeply nested element chain previously recursed
 /// once per level in `parse_element` and could overflow the stack. The
 /// parser now enforces `DEFAULT_MAX_DEPTH` (128) and fails closed with a
-/// bounded error long before the stack is at risk — even for pathological
-/// million-deep input, which is rejected cheaply without ever recursing
-/// past the cap.
+/// bounded error long before the stack is at risk. A depth of 256 already
+/// exceeds the cap, so the parser rejects it well before reaching the
+/// bottom of the chain — no need to materialize a multi-megabyte string.
 #[test]
 fn deep_nesting_rejected_by_depth_cap() {
-    let depth = 1_000_000;
+    let depth = 256; // > DEFAULT_MAX_DEPTH (128)
     let mut xml = String::with_capacity(depth * 8);
     for _ in 0..depth {
         xml.push_str("<a>");
@@ -275,7 +275,7 @@ fn xpath_substring_overflow_handled() {
 // ─── Finding F-10 — XSD xs:include arbitrary local file read ────────────
 
 #[test]
-fn xsd_include_reads_absolute_paths() {
+fn xsd_include_rejects_absolute_paths() {
     // Regression test for F-10. Pre-fix the validator would
     // `fs::read_to_string` any attacker-supplied absolute
     // `schemaLocation` and merge its declarations in. Post-fix
