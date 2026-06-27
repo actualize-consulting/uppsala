@@ -872,6 +872,67 @@ fn ns_stored_default_does_not_capture_no_namespace_element() {
 }
 
 #[test]
+fn ns_xml_prefix_with_foreign_uri_is_reassigned() {
+    use uppsala::{Document, QName};
+    // The `xml` prefix is reserved and bound to the XML namespace. A QName that
+    // uses prefix `xml` for a *different* URI must not serialize as `xml:...`,
+    // which would silently re-bind it to the XML namespace on re-parse.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::full("xml", "urn:custom", "Foo"));
+    doc.append_child(doc.root(), el);
+    let out = doc.to_xml();
+    assert!(
+        !out.contains("<xml:Foo"),
+        "reserved xml prefix misused: {out}"
+    );
+    let re = uppsala::parse(&out).unwrap();
+    let root = re.document_element().unwrap();
+    assert_eq!(
+        re.element(root).unwrap().name.namespace_uri.as_deref(),
+        Some("urn:custom"),
+        "element silently re-bound to the XML namespace: {out}"
+    );
+}
+
+#[test]
+fn ns_xml_namespace_uses_reserved_prefix_without_declaration() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // The genuine XML namespace must serialize with the `xml` prefix and never be
+    // declared (it is implicitly bound).
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el).unwrap().set_attribute(
+        QName::full("xml", "http://www.w3.org/XML/1998/namespace", "lang"),
+        Cow::Borrowed("en"),
+    );
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<r xml:lang="en"/>"#);
+    assert!(uppsala::parse(&out).is_ok());
+}
+
+#[test]
+fn ns_xml_prefixed_attribute_with_foreign_uri_is_reassigned() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el)
+        .unwrap()
+        .set_attribute(QName::full("xml", "urn:custom", "a"), Cow::Borrowed("v"));
+    let out = doc.to_xml();
+    assert!(
+        !out.contains("xml:a="),
+        "reserved xml prefix misused on attribute: {out}"
+    );
+    let re = uppsala::parse(&out).unwrap();
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(root.get_attribute_ns("urn:custom", "a"), Some("v"), "{out}");
+}
+
+#[test]
 fn ns_two_attributes_same_prefix_distinct_uris() {
     use std::borrow::Cow;
     use uppsala::{Document, QName};
