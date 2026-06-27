@@ -846,6 +846,32 @@ fn ns_same_prefix_conflict_does_not_misbind() {
 }
 
 #[test]
+fn ns_stored_default_does_not_capture_no_namespace_element() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // The element is in no namespace but carries a stored default-namespace
+    // declaration (xmlns="urn:x"). Emitting that stored declaration would put the
+    // element in urn:x, so the synthesized `xmlns=""` undeclaration must win and
+    // the stored default must be suppressed.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("Foo"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el)
+        .unwrap()
+        .namespace_declarations
+        .push((Cow::Borrowed(""), Cow::Borrowed("urn:x")));
+
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<Foo xmlns=""/>"#);
+    let re = uppsala::parse(&out).unwrap();
+    let root = re.document_element().unwrap();
+    assert!(
+        re.element(root).unwrap().name.namespace_uri.is_none(),
+        "element wrongly captured by stored default namespace: {out}"
+    );
+}
+
+#[test]
 fn ns_two_attributes_same_prefix_distinct_uris() {
     use std::borrow::Cow;
     use uppsala::{Document, QName};

@@ -1335,7 +1335,7 @@ impl<'a> Document<'a> {
                 // QName and its attributes' QNames resolve under the current
                 // scope (issue #2). For parsed documents the stored declarations
                 // already satisfy every QName, so nothing extra is emitted.
-                let (synthesized, elem_name_override, attr_overrides, child_local) =
+                let (elem_name_override, attr_overrides, child_local) =
                     plan_element_namespaces(elem, scope);
                 let raw_pname = match &elem_name_override {
                     Some(name) => Cow::Borrowed(name.as_str()),
@@ -1346,17 +1346,19 @@ impl<'a> Document<'a> {
                 // Track names already emitted for this start tag so sanitized
                 // programmatic attributes cannot collide into duplicate XML.
                 let mut seen_attrs = Vec::new();
-                // Namespace declarations. Sanitized prefixes can collide (two
-                // distinct invalid prefixes both collapse to `_`), which would
-                // emit duplicate `xmlns:_` attributes and produce not-well-formed
-                // output. Disambiguate the prefix against names already emitted
-                // for this start tag so the result always re-parses.
-                let declarations = elem
-                    .namespace_declarations
-                    .iter()
-                    .map(|(p, u)| (p.as_ref(), u.as_ref()))
-                    .chain(synthesized.iter().map(|(p, u)| (p.as_str(), u.as_str())));
-                for (prefix, uri) in declarations {
+                // Namespace declarations. `child_local` holds every binding this
+                // element introduces (stored + synthesized) in order; emit only
+                // the *last* binding per prefix so a synthesized override — e.g. an
+                // `xmlns=""` undeclaration — wins over a conflicting stored
+                // declaration instead of being dropped as a duplicate.
+                // Sanitized prefixes can also collide (two distinct invalid
+                // prefixes both collapse to `_`), which is disambiguated against
+                // names already emitted for this start tag so output re-parses.
+                for (i, (prefix, uri)) in child_local.iter().enumerate() {
+                    if child_local[i + 1..].iter().any(|(p, _)| p == prefix) {
+                        continue; // shadowed by a later binding for the same prefix
+                    }
+                    let (prefix, uri) = (prefix.as_str(), uri.as_str());
                     if prefix.is_empty() {
                         // A default-namespace declaration has the fixed name
                         // `xmlns`, which cannot be disambiguated; skip a
@@ -1581,14 +1583,9 @@ fn alloc_ns_prefix(scope: &NsScope, child_local: &[NsDecl]) -> String {
 }
 
 /// Return an existing non-empty prefix bound to `uri`, or allocate a fresh one
-/// and record a declaration for it. Used when a prefix is required (namespaced
-/// attribute) or when the desired prefix is unusable.
-fn prefix_for_or_alloc(
-    scope: &NsScope,
-    child_local: &mut Vec<NsDecl>,
-    synthesized: &mut Vec<NsDecl>,
-    uri: &str,
-) -> String {
+/// and record a declaration for it in `child_local`. Used when a prefix is
+/// required (namespaced attribute) or when the desired prefix is unusable.
+fn prefix_for_or_alloc(scope: &NsScope, child_local: &mut Vec<NsDecl>, uri: &str) -> String {
     let reuse = {
         let cur = NsScope {
             parent: Some(scope),
@@ -1601,20 +1598,18 @@ fn prefix_for_or_alloc(
     }
     let p = alloc_ns_prefix(scope, child_local);
     child_local.push((p.clone(), uri.to_string()));
-    synthesized.push((p.clone(), uri.to_string()));
     p
 }
 
 /// Ensure `desired_prefix` (empty string = default namespace) resolves to `uri`
-/// for this element, recording any declaration that must be emitted. Returns
-/// `Some(prefix)` when the QName must be rewritten to use a *different* prefix —
-/// because `desired_prefix` is already declared on this same start tag bound to
-/// another URI and a start tag cannot carry two bindings for one prefix — or
-/// `None` when `desired_prefix` works as-is.
+/// for this element, recording any declaration that must be emitted in
+/// `child_local`. Returns `Some(prefix)` when the QName must be rewritten to use
+/// a *different* prefix — because `desired_prefix` is already declared on this
+/// same start tag bound to another URI and a start tag cannot carry two bindings
+/// for one prefix — or `None` when `desired_prefix` works as-is.
 fn ensure_binding(
     scope: &NsScope,
     child_local: &mut Vec<NsDecl>,
-    synthesized: &mut Vec<NsDecl>,
     desired_prefix: &str,
     uri: &str,
 ) -> Option<String> {
@@ -1632,46 +1627,38 @@ fn ensure_binding(
         // Not declared on this element yet: declare it here, shadowing any
         // ancestor binding. The QName keeps its own prefix.
         child_local.push((desired_prefix.to_string(), uri.to_string()));
-        synthesized.push((desired_prefix.to_string(), uri.to_string()));
         return None;
     }
     // Same-element conflict: `desired_prefix` is already bound here to a different
     // URI and cannot be redeclared, so bind `uri` to a different prefix and
     // rewrite the QName to use it (otherwise the QName would silently resolve to
     // the colliding declaration).
-    Some(prefix_for_or_alloc(scope, child_local, synthesized, uri))
+    Some(prefix_for_or_alloc(scope, child_local, uri))
 }
 
-/// Compute the namespace declarations a serialized element must emit so its own
+/// Compute the namespace bindings a serialized element introduces so its own
 /// QName and its attributes' QNames resolve correctly under the inherited
 /// `scope`. Returns:
-/// - `synthesized` — declarations to emit *in addition to* the element's stored
-///   `namespace_declarations` (which are still emitted verbatim),
 /// - `elem_name_override` — a replacement element tag name, set only when the
 ///   element's own prefix collides with a stored declaration,
 /// - `attr_overrides` — a per-attribute display-name override, set only for a
 ///   namespaced attribute that needs a prefix it does not carry (or whose prefix
 ///   collides), and
 /// - `child_local` — every binding (stored + synthesized) this element
-///   introduces, for building the child scope.
+///   introduces, in order; the serializer emits the last binding per prefix and
+///   uses it as the child scope.
 ///
 /// For a parsed document the stored declarations already satisfy every QName, so
-/// `synthesized` is empty and output is byte-identical to before.
+/// nothing is synthesized and output is byte-identical to before.
 fn plan_element_namespaces(
     elem: &Element,
     scope: &NsScope,
-) -> (
-    Vec<NsDecl>,
-    Option<String>,
-    Vec<Option<String>>,
-    Vec<NsDecl>,
-) {
+) -> (Option<String>, Vec<Option<String>>, Vec<NsDecl>) {
     let mut child_local: Vec<NsDecl> = elem
         .namespace_declarations
         .iter()
         .map(|(p, u)| (p.to_string(), u.to_string()))
         .collect();
-    let mut synthesized: Vec<NsDecl> = Vec::new();
 
     // Element QName.
     let elem_name_override = match (
@@ -1690,16 +1677,15 @@ fn plan_element_namespaces(
                 cur.resolve("").map(|s| s.to_string())
             };
             if matches!(default_ns.as_deref(), Some(d) if !d.is_empty()) {
-                synthesized.push((String::new(), String::new()));
                 child_local.push((String::new(), String::new()));
             }
             None
         }
         (Some(_), None) => None, // prefixed but no URI: leave the name as-is
         (Some("xml"), Some(_)) => None, // the xml prefix is implicitly bound
-        (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, p, u)
+        (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, p, u)
             .map(|q| format!("{}:{}", q, elem.name.local_name)),
-        (None, Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, "", u)
+        (None, Some(u)) => ensure_binding(scope, &mut child_local, "", u)
             .map(|q| format!("{}:{}", q, elem.name.local_name)),
     };
 
@@ -1713,17 +1699,17 @@ fn plan_element_namespaces(
             attr.name.namespace_uri.as_deref(),
         ) {
             (_, None) | (Some("xml"), Some(_)) => None,
-            (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, &mut synthesized, p, u)
+            (Some(p), Some(u)) => ensure_binding(scope, &mut child_local, p, u)
                 .map(|q| format!("{}:{}", q, attr.name.local_name)),
             (None, Some(u)) => {
-                let pfx = prefix_for_or_alloc(scope, &mut child_local, &mut synthesized, u);
+                let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
                 Some(format!("{}:{}", pfx, attr.name.local_name))
             }
         };
         attr_overrides.push(override_name);
     }
 
-    (synthesized, elem_name_override, attr_overrides, child_local)
+    (elem_name_override, attr_overrides, child_local)
 }
 
 impl<'a> Default for Document<'a> {
