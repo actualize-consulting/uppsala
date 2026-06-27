@@ -1207,15 +1207,33 @@ impl<'a> Document<'a> {
     /// Useful for extracting XML fragments without the XML declaration or DOCTYPE.
     pub fn node_to_xml(&self, id: NodeId) -> String {
         let mut output = String::new();
-        self.write_node_to(id, &mut output, &XmlWriteOptions::default(), 0, false)
-            .unwrap();
+        let binds = self.ancestor_ns_bindings(id);
+        let scope = NsScope {
+            parent: None,
+            local: &binds,
+        };
+        self.write_node_to(
+            id,
+            &mut output,
+            &XmlWriteOptions::default(),
+            0,
+            false,
+            &scope,
+        )
+        .unwrap();
         output
     }
 
     /// Serialize a single node (and its subtree) with formatting options.
     pub fn node_to_xml_with_options(&self, id: NodeId, opts: &XmlWriteOptions) -> String {
         let mut output = String::new();
-        self.write_node_to(id, &mut output, opts, 0, false).unwrap();
+        let binds = self.ancestor_ns_bindings(id);
+        let scope = NsScope {
+            parent: None,
+            local: &binds,
+        };
+        self.write_node_to(id, &mut output, opts, 0, false, &scope)
+            .unwrap();
         output
     }
 
@@ -1260,10 +1278,37 @@ impl<'a> Document<'a> {
                 out.write_str(dt)?;
             }
         }
+        let root_scope = NsScope {
+            parent: None,
+            local: &[],
+        };
         for child in self.children(self.root) {
-            self.write_node_to(child, out, opts, 0, opts.indent.is_some())?;
+            self.write_node_to(child, out, opts, 0, opts.indent.is_some(), &root_scope)?;
         }
         Ok(())
+    }
+
+    /// Collect the namespace bindings in scope at `id` from its ancestors (not
+    /// including `id` itself), outermost-first. Used to seed fragment
+    /// serialization so a namespace already declared on an enclosing element is
+    /// treated as in-scope and not redundantly re-declared.
+    fn ancestor_ns_bindings(&self, id: NodeId) -> Vec<NsDecl> {
+        let mut chain = Vec::new();
+        let mut cur = self.parent(id);
+        while let Some(p) = cur {
+            chain.push(p);
+            cur = self.parent(p);
+        }
+        chain.reverse();
+        let mut binds = Vec::new();
+        for nid in chain {
+            if let Some(NodeKind::Element(e)) = self.node_kind(nid) {
+                for (pfx, uri) in &e.namespace_declarations {
+                    binds.push((pfx.to_string(), uri.to_string()));
+                }
+            }
+        }
+        binds
     }
 
     /// Internal: write a single node and its subtree to a `fmt::Write` sink.
@@ -1277,6 +1322,7 @@ impl<'a> Document<'a> {
         opts: &XmlWriteOptions,
         depth: usize,
         indent_self: bool,
+        scope: &NsScope,
     ) -> fmt::Result {
         match self.node_kind(id) {
             Some(NodeKind::Element(elem)) => {
@@ -1290,12 +1336,24 @@ impl<'a> Document<'a> {
                 // Track names already emitted for this start tag so sanitized
                 // programmatic attributes cannot collide into duplicate XML.
                 let mut seen_attrs = Vec::new();
+                // Namespace-aware serialization: alongside the element's stored
+                // declarations, synthesize any declarations needed so its own
+                // QName and its attributes' QNames resolve under the current
+                // scope (issue #2). For parsed documents the stored declarations
+                // already satisfy every QName, so nothing extra is emitted.
+                let (synthesized, attr_overrides, child_local) =
+                    plan_element_namespaces(elem, scope);
                 // Namespace declarations. Sanitized prefixes can collide (two
                 // distinct invalid prefixes both collapse to `_`), which would
                 // emit duplicate `xmlns:_` attributes and produce not-well-formed
                 // output. Disambiguate the prefix against names already emitted
                 // for this start tag so the result always re-parses.
-                for (prefix, uri) in &elem.namespace_declarations {
+                let declarations = elem
+                    .namespace_declarations
+                    .iter()
+                    .map(|(p, u)| (p.as_ref(), u.as_ref()))
+                    .chain(synthesized.iter().map(|(p, u)| (p.as_str(), u.as_str())));
+                for (prefix, uri) in declarations {
                     if prefix.is_empty() {
                         // A default-namespace declaration has the fixed name
                         // `xmlns`, which cannot be disambiguated; skip a
@@ -1324,16 +1382,26 @@ impl<'a> Document<'a> {
                     write_escaped_attr(out, uri)?;
                     out.write_char('"')?;
                 }
-                // Attributes
-                for attr in &elem.attributes {
+                // Attributes. A namespaced attribute without a usable prefix
+                // gets one via `attr_overrides` (see `plan_element_namespaces`).
+                for (attr, override_name) in elem.attributes.iter().zip(attr_overrides.iter()) {
                     out.write_char(' ')?;
-                    let raw_aname = attr.name.prefixed_name();
+                    let raw_aname = match override_name {
+                        Some(name) => Cow::Borrowed(name.as_str()),
+                        None => attr.name.prefixed_name(),
+                    };
                     let aname = crate::writer::unique_safe_xml_qname(&raw_aname, &mut seen_attrs);
                     out.write_str(&aname)?;
                     out.write_str("=\"")?;
                     write_escaped_attr(out, &attr.value)?;
                     out.write_char('"')?;
                 }
+                // Child scope: the inherited scope extended with the bindings this
+                // element introduced (stored + synthesized).
+                let child_scope = NsScope {
+                    parent: Some(scope),
+                    local: &child_local,
+                };
                 let children = self.children(id);
                 if children.is_empty() {
                     if opts.expand_empty_elements {
@@ -1359,7 +1427,14 @@ impl<'a> Document<'a> {
                         out.write_char('\n')?;
                     }
                     for child in &children {
-                        self.write_node_to(*child, out, opts, depth + 1, element_only)?;
+                        self.write_node_to(
+                            *child,
+                            out,
+                            opts,
+                            depth + 1,
+                            element_only,
+                            &child_scope,
+                        )?;
                     }
                     if element_only {
                         write_indent(out, opts, depth)?;
@@ -1419,7 +1494,7 @@ impl<'a> Document<'a> {
             }
             Some(NodeKind::Document) => {
                 for child in self.children(id) {
-                    self.write_node_to(child, out, opts, depth, indent_self)?;
+                    self.write_node_to(child, out, opts, depth, indent_self, scope)?;
                 }
             }
             Some(NodeKind::Attribute(_, _)) => {
@@ -1429,6 +1504,178 @@ impl<'a> Document<'a> {
         }
         Ok(())
     }
+}
+
+/// A `(prefix, namespace_uri)` binding; an empty prefix is the default namespace.
+type NsDecl = (String, String);
+
+/// In-scope namespace bindings during serialization, modeled as a borrowed
+/// linked list of per-element frames so no cloning happens per element. Each
+/// frame's `local` holds the declarations introduced by one element. The `xml`
+/// prefix is always implicitly bound.
+struct NsScope<'a> {
+    parent: Option<&'a NsScope<'a>>,
+    local: &'a [NsDecl],
+}
+
+impl<'a> NsScope<'a> {
+    /// Resolve a prefix to its namespace URI in scope. Returns `Some("")` for an
+    /// explicitly undeclared default namespace, `None` if the prefix is unbound.
+    fn resolve(&self, prefix: &str) -> Option<&str> {
+        if prefix == "xml" {
+            return Some(crate::namespace::XML_NAMESPACE);
+        }
+        let mut cur = Some(self);
+        while let Some(s) = cur {
+            for (p, u) in s.local.iter().rev() {
+                if p == prefix {
+                    return Some(u.as_str());
+                }
+            }
+            cur = s.parent;
+        }
+        None
+    }
+
+    /// Find a non-empty prefix currently bound to `uri`, respecting shadowing
+    /// (the innermost binding for each prefix wins).
+    fn prefix_for(&self, uri: &str) -> Option<String> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cur = Some(self);
+        while let Some(s) = cur {
+            for (p, u) in s.local.iter().rev() {
+                if seen.iter().any(|x| x == p) {
+                    continue;
+                }
+                seen.push(p.clone());
+                if !p.is_empty() && u == uri {
+                    return Some(p.clone());
+                }
+            }
+            cur = s.parent;
+        }
+        None
+    }
+}
+
+/// Compute the namespace declarations a serialized element must emit so its own
+/// QName and its attributes' QNames resolve correctly under the inherited
+/// `scope`. Returns:
+/// - `synthesized` — declarations to emit *in addition to* the element's stored
+///   `namespace_declarations` (which are still emitted verbatim),
+/// - `attr_overrides` — a per-attribute display-name override, set only for a
+///   namespaced attribute that needs a prefix it does not carry, and
+/// - `child_local` — every binding (stored + synthesized) this element
+///   introduces, for building the child scope.
+///
+/// For a parsed document the stored declarations already satisfy every QName, so
+/// `synthesized` is empty and output is byte-identical to before.
+fn plan_element_namespaces(
+    elem: &Element,
+    scope: &NsScope,
+) -> (Vec<NsDecl>, Vec<Option<String>>, Vec<NsDecl>) {
+    let mut child_local: Vec<NsDecl> = elem
+        .namespace_declarations
+        .iter()
+        .map(|(p, u)| (p.to_string(), u.to_string()))
+        .collect();
+    let mut synthesized: Vec<NsDecl> = Vec::new();
+
+    // Resolve `prefix` against the inherited scope plus the bindings collected so
+    // far for this element.
+    let bound = |prefix: &str, local: &[NsDecl]| -> Option<String> {
+        let cur = NsScope {
+            parent: Some(scope),
+            local,
+        };
+        cur.resolve(prefix).map(|s| s.to_string())
+    };
+
+    // Element QName.
+    match (
+        elem.name.prefix.as_deref(),
+        elem.name.namespace_uri.as_deref(),
+    ) {
+        (None, None) => {
+            // Unprefixed element in no namespace: if a non-empty default
+            // namespace is in scope it would otherwise capture this element, so
+            // undeclare it with `xmlns=""`.
+            if matches!(bound("", &child_local).as_deref(), Some(d) if !d.is_empty()) {
+                synthesized.push((String::new(), String::new()));
+                child_local.push((String::new(), String::new()));
+            }
+        }
+        (Some(_), None) => { /* prefixed but no URI: leave the name as-is */ }
+        (Some("xml"), Some(_)) => { /* the xml prefix is implicitly bound */ }
+        (Some(p), Some(u)) => {
+            if bound(p, &child_local).as_deref() != Some(u) {
+                synthesized.push((p.to_string(), u.to_string()));
+                child_local.push((p.to_string(), u.to_string()));
+            }
+        }
+        (None, Some(u)) => {
+            if bound("", &child_local).as_deref() != Some(u) {
+                synthesized.push((String::new(), u.to_string()));
+                child_local.push((String::new(), u.to_string()));
+            }
+        }
+    }
+
+    // Attributes. An empty prefix never works for an attribute (attributes are
+    // not in the default namespace), so a namespaced-but-prefixless attribute is
+    // given a prefix.
+    let mut attr_overrides = Vec::with_capacity(elem.attributes.len());
+    for attr in &elem.attributes {
+        let override_name = match (
+            attr.name.prefix.as_deref(),
+            attr.name.namespace_uri.as_deref(),
+        ) {
+            (_, None) | (Some("xml"), Some(_)) => None,
+            (Some(p), Some(u)) => {
+                if bound(p, &child_local).as_deref() != Some(u) {
+                    synthesized.push((p.to_string(), u.to_string()));
+                    child_local.push((p.to_string(), u.to_string()));
+                }
+                None
+            }
+            (None, Some(u)) => {
+                let existing = {
+                    let cur = NsScope {
+                        parent: Some(scope),
+                        local: &child_local,
+                    };
+                    cur.prefix_for(u)
+                };
+                let pfx = match existing {
+                    Some(p) => p,
+                    None => {
+                        let mut n = 0usize;
+                        let p = loop {
+                            let cand = format!("ns{}", n);
+                            let unbound = {
+                                let cur = NsScope {
+                                    parent: Some(scope),
+                                    local: &child_local,
+                                };
+                                cur.resolve(&cand).is_none()
+                            };
+                            if unbound {
+                                break cand;
+                            }
+                            n += 1;
+                        };
+                        synthesized.push((p.clone(), u.to_string()));
+                        child_local.push((p.clone(), u.to_string()));
+                        p
+                    }
+                };
+                Some(format!("{}:{}", pfx, attr.name.local_name))
+            }
+        };
+        attr_overrides.push(override_name);
+    }
+
+    (synthesized, attr_overrides, child_local)
 }
 
 impl<'a> Default for Document<'a> {

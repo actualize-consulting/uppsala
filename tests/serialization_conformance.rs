@@ -668,3 +668,147 @@ fn write_to_with_pretty_options() {
     let result = String::from_utf8(buf).unwrap();
     assert_eq!(result, "<root>\n  <a/>\n  <b/>\n</root>\n");
 }
+
+// ─── Namespace-aware serialization (issue #2) ────────────────────────────────
+//
+// Programmatically-built elements carry a namespace URI on their QName but no
+// stored `xmlns` declaration. Serialization must synthesize the declarations
+// needed for the output to be namespace-well-formed, while leaving parsed
+// documents byte-identical.
+
+#[test]
+fn ns_prefixless_element_emits_default_declaration() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::with_namespace("urn:example", "Foo"));
+    doc.append_child(doc.root(), el);
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<Foo xmlns="urn:example"/>"#);
+    // Output must re-parse and preserve the namespace.
+    let re = uppsala::parse(&out).unwrap();
+    let root = re.document_element().unwrap();
+    assert!(re
+        .element(root)
+        .unwrap()
+        .matches_name_ns("urn:example", "Foo"));
+}
+
+#[test]
+fn ns_prefixed_element_emits_prefix_declaration() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::full("p", "urn:foo", "Foo"));
+    doc.append_child(doc.root(), el);
+    assert_eq!(doc.to_xml(), r#"<p:Foo xmlns:p="urn:foo"/>"#);
+    assert!(uppsala::parse(&doc.to_xml()).is_ok());
+}
+
+#[test]
+fn ns_child_inherits_without_redeclaring() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let parent = doc.create_element(QName::full("p", "urn:foo", "Parent"));
+    doc.append_child(doc.root(), parent);
+    let child = doc.create_element(QName::full("p", "urn:foo", "Child"));
+    doc.append_child(parent, child);
+    // The child reuses the in-scope binding rather than re-declaring it.
+    assert_eq!(
+        doc.to_xml(),
+        r#"<p:Parent xmlns:p="urn:foo"><p:Child/></p:Parent>"#
+    );
+}
+
+#[test]
+fn ns_nested_distinct_namespaces_each_declared() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let parent = doc.create_element(QName::full("a", "urn:a", "Parent"));
+    doc.append_child(doc.root(), parent);
+    let child = doc.create_element(QName::full("b", "urn:b", "Child"));
+    doc.append_child(parent, child);
+    assert_eq!(
+        doc.to_xml(),
+        r#"<a:Parent xmlns:a="urn:a"><b:Child xmlns:b="urn:b"/></a:Parent>"#
+    );
+}
+
+#[test]
+fn ns_attribute_with_prefix_declared() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("Foo"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el)
+        .unwrap()
+        .set_attribute(QName::full("x", "urn:x", "attr"), Cow::Borrowed("v"));
+    assert_eq!(doc.to_xml(), r#"<Foo xmlns:x="urn:x" x:attr="v"/>"#);
+    assert!(uppsala::parse(&doc.to_xml()).is_ok());
+}
+
+#[test]
+fn ns_attribute_without_prefix_gets_synthetic_prefix() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("Foo"));
+    doc.append_child(doc.root(), el);
+    // A namespaced attribute with no prefix cannot use the default namespace, so
+    // serialization allocates one.
+    doc.element_mut(el)
+        .unwrap()
+        .set_attribute(QName::with_namespace("urn:x", "attr"), Cow::Borrowed("v"));
+    let out = doc.to_xml();
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.document_element().unwrap();
+    assert_eq!(
+        re.element(root).unwrap().get_attribute_ns("urn:x", "attr"),
+        Some("v"),
+        "attribute namespace lost on round-trip: {out}"
+    );
+}
+
+#[test]
+fn ns_no_namespace_child_undeclares_default() {
+    use uppsala::{Document, NodeKind, QName};
+    let mut doc = Document::new();
+    let parent = doc.create_element(QName::with_namespace("urn:p", "Parent"));
+    doc.append_child(doc.root(), parent);
+    let child = doc.create_element(QName::local("Child"));
+    doc.append_child(parent, child);
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<Parent xmlns="urn:p"><Child xmlns=""/></Parent>"#);
+    // The child must round-trip back to no namespace.
+    let re = uppsala::parse(&out).unwrap();
+    let proot = re.document_element().unwrap();
+    let pchild = re
+        .children(proot)
+        .into_iter()
+        .find(|&c| matches!(re.node_kind(c), Some(NodeKind::Element(_))))
+        .unwrap();
+    assert!(
+        re.element(pchild).unwrap().name.namespace_uri.is_none(),
+        "child should be in no namespace: {out}"
+    );
+}
+
+#[test]
+fn ns_fragment_serialization_is_self_contained() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let parent = doc.create_element(QName::full("p", "urn:foo", "Parent"));
+    doc.append_child(doc.root(), parent);
+    let child = doc.create_element(QName::full("p", "urn:foo", "Child"));
+    doc.append_child(parent, child);
+    // Serializing the child on its own declares the namespace it uses.
+    assert_eq!(doc.node_to_xml(child), r#"<p:Child xmlns:p="urn:foo"/>"#);
+}
+
+#[test]
+fn ns_parsed_document_roundtrips_byte_identical() {
+    // The synthesis path must be a no-op for parsed documents: stored
+    // declarations already satisfy every QName.
+    let xml = r#"<p:Foo xmlns:p="urn:foo" xmlns="urn:def"><p:Bar/><Baz/></p:Foo>"#;
+    let doc = uppsala::parse(xml).unwrap();
+    assert_eq!(doc.to_xml(), xml);
+}
