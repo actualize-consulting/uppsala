@@ -1770,14 +1770,25 @@ fn plan_element_namespaces<'e>(
             // are implicitly bound, so `xml:foo` would re-parse into the XML
             // namespace and `xmlns:foo` would be read as a namespace declaration,
             // changing the attribute's effective namespace.
-            (Some("xml"), None) | (Some("xmlns"), None) => Some(attr.name.local_name.to_string()),
+            (None, None) if attr.name.local_name.as_ref() == "xmlns" => Some("xmlns_".to_string()),
+            (Some("xml"), None) | (Some("xmlns"), None) => {
+                Some(if attr.name.local_name.as_ref() == "xmlns" {
+                    "xmlns_".to_string()
+                } else {
+                    attr.name.local_name.to_string()
+                })
+            }
             (_, None) => None,
             (Some("xml"), Some(u)) if u == xml_ns => None,
             (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", attr.name.local_name)),
             // XMLNS namespace: unrepresentable (see the element-name planning
             // above), so drop it and serialize the bare local name rather than
             // emit a forbidden `xmlns:nsN="...2000/xmlns/"` declaration.
-            (_, Some(u)) if u == xmlns_ns => Some(attr.name.local_name.to_string()),
+            (_, Some(u)) if u == xmlns_ns => Some(if attr.name.local_name.as_ref() == "xmlns" {
+                "xmlns_".to_string()
+            } else {
+                attr.name.local_name.to_string()
+            }),
             // Reserved `xml`/`xmlns` prefixes on a representable URI: rebind to a
             // fresh non-reserved prefix so the attribute does not masquerade as a
             // namespace declaration.
