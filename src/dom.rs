@@ -1555,7 +1555,11 @@ impl<'a> NsScope<'a> {
     /// (the innermost binding for each prefix wins). The reserved `xml` and
     /// `xmlns` prefixes are never returned: reusing them for an arbitrary URI
     /// would defeat the "reserved prefixes are never rebound" guarantee and
-    /// produce output that re-parses into the wrong namespace.
+    /// produce output that re-parses into the wrong namespace. Prefixes that are
+    /// not valid XML NCNames are also skipped: reusing an invalid programmatic
+    /// prefix would yield a QName like `bad prefix:Foo` that `safe_xml_qname`
+    /// collapses to `_` (dropping the local name); the caller allocates a fresh
+    /// `nsN` prefix instead.
     fn prefix_for(&self, uri: &str) -> Option<String> {
         // Track seen prefixes by reference (no cloning); the innermost binding
         // for each prefix is its effective one, so a prefix seen earlier shadows
@@ -1568,6 +1572,7 @@ impl<'a> NsScope<'a> {
                     && !p.is_empty()
                     && p.as_ref() != "xml"
                     && p.as_ref() != "xmlns"
+                    && crate::writer::is_valid_xml_ncname(p.as_ref())
                     && u.as_ref() == uri
                 {
                     return Some(p.as_ref().to_string());

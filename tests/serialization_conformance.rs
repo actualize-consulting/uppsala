@@ -1081,6 +1081,36 @@ fn ns_stored_reserved_declarations_are_filtered() {
 }
 
 #[test]
+fn ns_invalid_inscope_prefix_is_not_reused() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    // An in-scope prefix that is not a valid XML NCName must not be reused for a
+    // namespaced-but-prefixless QName: doing so would yield a name like
+    // `bad prefix:attr` that sanitizes to `_` (dropping the local name). A fresh
+    // valid prefix is allocated instead, so the attribute still re-parses into its
+    // namespace.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    {
+        let e = doc.element_mut(el).unwrap();
+        // Stored declaration with an invalid (non-NCName) prefix bound to urn:x.
+        e.namespace_declarations
+            .push((Cow::Borrowed("bad prefix"), Cow::Borrowed("urn:x")));
+        // Prefixless attribute in the same namespace would trigger prefix reuse.
+        e.set_attribute(QName::with_namespace("urn:x", "attr"), Cow::Borrowed("v"));
+    }
+    let out = doc.to_xml();
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(
+        root.get_attribute_ns("urn:x", "attr"),
+        Some("v"),
+        "attribute lost its namespace via invalid prefix reuse: {out}"
+    );
+}
+
+#[test]
 fn ns_reserved_element_prefix_without_uri_is_stripped() {
     use uppsala::{Document, QName};
     // A QName carrying a reserved prefix but no namespace URI must not serialize
