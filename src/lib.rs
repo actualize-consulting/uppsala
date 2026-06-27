@@ -75,6 +75,29 @@
 //!
 //! assert!(w.into_string().contains("<root"));
 //! ```
+//!
+//! # Resource limits
+//!
+//! To fail closed on hostile input, the parser enforces fixed resource caps
+//! by default (see [`parser`] for the associated constants and the
+//! `Parser::with_*` overrides):
+//!
+//! - **Element nesting depth** — capped at
+//!   [`DEFAULT_MAX_DEPTH`](parser::DEFAULT_MAX_DEPTH) (128). Documents nested
+//!   deeper are rejected with an error rather than risking a stack overflow.
+//! - **Entity expansion byte budget** — capped at
+//!   [`DEFAULT_MAX_ENTITY_EXPANSION`](parser::DEFAULT_MAX_ENTITY_EXPANSION)
+//!   (1 MiB). Total bytes produced by entity expansion per parse cannot
+//!   exceed this, defeating billion-laughs / quadratic-blowup amplification.
+//! - **Entity expansion nesting depth** — capped at
+//!   [`DEFAULT_MAX_ENTITY_DEPTH`](parser::DEFAULT_MAX_ENTITY_DEPTH) (256), so
+//!   a deep linear entity chain fails closed instead of overflowing the stack
+//!   even before the byte budget is reached.
+//!
+//! The depth and expansion-byte limits are configurable via builder methods
+//! on [`Parser`] ([`Parser::with_max_depth`] and
+//! [`Parser::with_max_entity_expansion`]) when a workload legitimately needs
+//! a different bound.
 
 /// Arena-based DOM representation of XML documents.
 pub mod dom;
@@ -171,10 +194,19 @@ fn decode_xml_bytes(input: &[u8]) -> XmlResult<String> {
 
 /// Decode UTF-16 little-endian bytes to a String.
 fn decode_utf16_le(bytes: &[u8]) -> XmlResult<String> {
+    // A UTF-16 stream must be an exact sequence of 16-bit code units.
+    // Dropping an orphan trailing byte would silently accept truncated input.
+    if !bytes.len().is_multiple_of(2) {
+        return Err(XmlError::well_formedness(
+            "Invalid UTF-16 LE: odd number of bytes",
+            1,
+            1,
+        ));
+    }
+
     // Pair up bytes as u16 code units (little-endian)
     let code_units: Vec<u16> = bytes
         .chunks(2)
-        .filter(|chunk| chunk.len() == 2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
 
@@ -184,10 +216,19 @@ fn decode_utf16_le(bytes: &[u8]) -> XmlResult<String> {
 
 /// Decode UTF-16 big-endian bytes to a String.
 fn decode_utf16_be(bytes: &[u8]) -> XmlResult<String> {
+    // A UTF-16 stream must be an exact sequence of 16-bit code units.
+    // Dropping an orphan trailing byte would silently accept truncated input.
+    if !bytes.len().is_multiple_of(2) {
+        return Err(XmlError::well_formedness(
+            "Invalid UTF-16 BE: odd number of bytes",
+            1,
+            1,
+        ));
+    }
+
     // Pair up bytes as u16 code units (big-endian)
     let code_units: Vec<u16> = bytes
         .chunks(2)
-        .filter(|chunk| chunk.len() == 2)
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
         .collect();
 

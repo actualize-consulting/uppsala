@@ -3,7 +3,7 @@
 //! Tests cover axes, node tests, predicates, functions, operators,
 //! and the attribute axis implementation.
 
-use uppsala::dom::{NodeId, NodeKind, QName};
+use uppsala::dom::NodeId;
 use uppsala::xpath::XPathValue;
 
 fn parse_and_eval(xml: &str, xpath: &str) -> XPathValue {
@@ -257,6 +257,39 @@ fn preceding_sibling_axis() {
     let eval = uppsala::XPathEvaluator::new();
     let nodes = eval.select_nodes(&doc, c, "preceding-sibling::*").unwrap();
     assert_eq!(nodes.len(), 2);
+}
+
+#[test]
+fn reverse_axis_predicates_use_axis_order() {
+    let xml = "<root><a/><b><c><d/></c></b><e/></root>";
+    let doc = uppsala::parse(xml).unwrap();
+    let root = doc.document_element().unwrap();
+    let children = doc.children(root);
+    let e = children[2];
+    let b = children[1];
+    let c = doc.children(b)[0];
+    let d = doc.children(c)[0];
+    let eval = uppsala::XPathEvaluator::new();
+
+    let nodes = eval
+        .select_nodes(&doc, e, "preceding-sibling::*[1]")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.element(nodes[0]).unwrap().name.local_name, "b");
+
+    let nodes = eval
+        .select_nodes(&doc, e, "preceding-sibling::*[last()]")
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.element(nodes[0]).unwrap().name.local_name, "a");
+
+    let nodes = eval.select_nodes(&doc, d, "ancestor::*[1]").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.element(nodes[0]).unwrap().name.local_name, "c");
+
+    let nodes = eval.select_nodes(&doc, d, "ancestor::*[last()]").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(doc.element(nodes[0]).unwrap().name.local_name, "root");
 }
 
 // ─── Predicates ─────────────────────────────────────────

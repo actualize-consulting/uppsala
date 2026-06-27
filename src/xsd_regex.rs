@@ -480,6 +480,9 @@ fn parse_escape(chars: &[char], pos: &mut usize) -> Result<RegexNode, String> {
                 }
                 let name: String = chars[start..*pos].iter().collect();
                 *pos += 1; // skip '}'
+                if !is_known_property_name(&name) {
+                    return Err(format!("Unknown Unicode property '{}'", name));
+                }
                 Ok(RegexNode::CharClass(CharClass {
                     negated: false,
                     members: vec![ClassMember::Property(UnicodeProperty { negated, name })],
@@ -629,6 +632,9 @@ fn parse_class_atom(chars: &[char], pos: &mut usize) -> Result<ClassMember, Stri
                         }
                         let name: String = chars[start..*pos].iter().collect();
                         *pos += 1;
+                        if !is_known_property_name(&name) {
+                            return Err(format!("Unknown Unicode property '{}'", name));
+                        }
                         Ok(ClassMember::Property(UnicodeProperty { negated, name }))
                     } else {
                         Err("Expected '{' after \\p or \\P in character class".into())
@@ -757,21 +763,12 @@ fn match_repetition(
         current_positions = next;
     }
 
-    // Greedy loop accumulator: a direct-indexed `seen` bitmap (positions
-    // are bounded by `input.len()`) gives O(1) membership test per
-    // candidate. Combined with a parallel `results` Vec that holds only
-    // the unique reachable end-positions, total work is O(N) insertions
-    // plus one O(N log N) final sort — vs the O(N^2) cost a
-    // merge-into-sorted-vec accumulator would incur on linear patterns
-    // like `[a-z]+` over a long string of `a`s.
-    let mut seen: Vec<bool> = vec![false; input.len() + 1];
-    let mut results: Vec<usize> = Vec::new();
-    for &p in &current_positions {
-        if p < seen.len() && !seen[p] {
-            seen[p] = true;
-            results.push(p);
-        }
-    }
+    // `results` accumulates the unique reachable end-positions. The initial
+    // positions are typically already sorted+deduped (from the required-min
+    // loop, or a single start position), so a cheap sort+dedup suffices.
+    let mut results: Vec<usize> = current_positions.clone();
+    results.sort_unstable();
+    results.dedup();
 
     // Defence-in-depth: `parse_brace_quantifier` rejects `{n,m}` with
     // `m < n` at compile time, so reaching the panic-on-underflow path
@@ -785,6 +782,16 @@ fn match_repetition(
         None => input.len().saturating_add(1), // More than enough
     };
 
+    // The `seen` membership bitmap is sized to `input.len()` — an O(N)
+    // allocation. It is materialized LAZILY, only on the first greedy
+    // iteration that actually advances. A repetition that cannot match even
+    // once (the common `a*b*`-over-`aaaa…` shape, where the inner atom fails
+    // immediately) therefore never pays the O(N) allocation. Without this, an
+    // outer repetition that invokes `match_repetition` O(N) times would incur
+    // an O(N) allocation each time — O(N^2) total work that the per-`match_node`
+    // step budget cannot bound, since a single tick covers an O(N) memset.
+    let mut seen: Vec<bool> = Vec::new();
+
     for _ in 0..remaining {
         let mut next = Vec::new();
         for &pos in &current_positions {
@@ -794,6 +801,17 @@ fn match_repetition(
         next.dedup();
         if next.is_empty() {
             break;
+        }
+
+        if seen.is_empty() {
+            // First productive iteration: build the bitmap and seed it with the
+            // end-positions already in `results`.
+            seen = vec![false; input.len() + 1];
+            for &p in &results {
+                if p < seen.len() {
+                    seen[p] = true;
+                }
+            }
         }
 
         let mut added = false;
@@ -1017,7 +1035,11 @@ fn is_extender(ch: char) -> bool {
 
 /// Match Unicode property \p{...} or \P{...}.
 fn property_matches(prop: &UnicodeProperty, ch: char) -> bool {
-    let base_match = match_property_name(&prop.name, ch);
+    // Unknown property names are rejected at compile time (see
+    // `is_known_property_name`), so they cannot reach here. Treat the
+    // impossible unknown case as "matches nothing" (fail-closed) so a
+    // future regression can never make `\P{unknown}` admit every char.
+    let base_match = match_property_name(&prop.name, ch).unwrap_or(false);
     if prop.negated {
         !base_match
     } else {
@@ -1025,9 +1047,26 @@ fn property_matches(prop: &UnicodeProperty, ch: char) -> bool {
     }
 }
 
-/// Match a Unicode general category or block name.
-fn match_property_name(name: &str, ch: char) -> bool {
-    match name {
+/// Returns `true` if `name` is a recognized Unicode general category or block.
+///
+/// Unknown property names must be rejected at compile time: otherwise
+/// `\p{unknown}` matches nothing and `\P{unknown}` matches *every* character,
+/// silently widening a pattern (a validation bypass). The supplied char is
+/// irrelevant to known-ness — a recognized property yields `Some(_)` and an
+/// unrecognized one yields `None`.
+///
+/// The recognized set is the **closed** list XSD 1.0 Part 2 defines: the Unicode
+/// general categories plus the Appendix-F `IsBlock` names (see
+/// [`match_unicode_block`]). A name outside that list is not a valid escape, so
+/// rejecting it is spec-correct rather than an over-restriction.
+fn is_known_property_name(name: &str) -> bool {
+    match_property_name(name, 'a').is_some()
+}
+
+/// Match a Unicode general category or block name. Returns `None` when `name`
+/// is not a recognized property (so callers can fail closed).
+fn match_property_name(name: &str, ch: char) -> Option<bool> {
+    let matched = match name {
         // General categories
         "L" => ch.is_alphabetic(),
         "Lu" => ch.is_uppercase(),
@@ -1066,9 +1105,10 @@ fn match_property_name(name: &str, ch: char) -> bool {
         "Co" => is_private_use(ch),
         "Cn" => !ch.is_alphanumeric() && !is_assigned(ch),
         // Unicode block escapes (Is...)
-        _ if name.starts_with("Is") => match_unicode_block(&name[2..], ch),
-        _ => false,
-    }
+        _ if name.starts_with("Is") => return match_unicode_block(&name[2..], ch),
+        _ => return None,
+    };
+    Some(matched)
 }
 
 // ─── Unicode category helpers ────────────────────────────────────────────────
@@ -1690,9 +1730,19 @@ fn is_assigned(ch: char) -> bool {
 
 // ─── Unicode Block matching ─────────────────────────────────────────────────
 
-fn match_unicode_block(block_name: &str, ch: char) -> bool {
+/// Match a Unicode block name (the part after `Is`). Returns `None` when the
+/// block name is not recognized so callers can fail closed.
+///
+/// The recognized names are the **closed** set of `IsBlock` identifiers defined
+/// by XSD 1.0 Part 2 Appendix F (the Unicode 3.1 block list), plus a few later
+/// blocks. Because XSD defines this as a closed list, a name outside it is not a
+/// valid block escape and is correctly rejected at compile time (`None`) rather
+/// than silently matching nothing — which would let `\P{IsTypo}` match every
+/// character (a validation bypass). Adding a genuinely new block is therefore a
+/// deliberate table edit, not an open-ended fallback.
+fn match_unicode_block(block_name: &str, ch: char) -> Option<bool> {
     let c = ch as u32;
-    match block_name {
+    let matched = match block_name {
         "BasicLatin" => (0x0000..=0x007F).contains(&c),
         "Latin-1Supplement" => (0x0080..=0x00FF).contains(&c),
         "LatinExtended-A" => (0x0100..=0x017F).contains(&c),
@@ -1809,8 +1859,9 @@ fn match_unicode_block(block_name: &str, ch: char) -> bool {
         "CJKUnifiedIdeographsExtensionB" => (0x20000..=0x2A6DF).contains(&c),
         "CJKCompatibilityIdeographsSupplement" => (0x2F800..=0x2FA1F).contains(&c),
         "Tags" => (0xE0000..=0xE007F).contains(&c),
-        _ => false,
-    }
+        _ => return None,
+    };
+    Some(matched)
 }
 
 #[cfg(test)]

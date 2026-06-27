@@ -144,7 +144,12 @@ impl XsdValidator {
                         if let Some(name) = attr_elem.get_attribute("name") {
                             let type_ref = if let Some(type_attr) = attr_elem.get_attribute("type")
                             {
-                                resolve_type_name(type_attr, &validator.target_namespace)
+                                resolve_type_name(
+                                    schema_doc,
+                                    child,
+                                    type_attr,
+                                    &validator.target_namespace,
+                                )?
                             } else {
                                 // Check for inline simpleType child
                                 let mut inline_type = None;
@@ -285,7 +290,12 @@ impl XsdValidator {
                                 let type_ref = if let Some(type_attr) =
                                     attr_elem.get_attribute("type")
                                 {
-                                    resolve_type_name(type_attr, &validator.target_namespace)
+                                    resolve_type_name(
+                                        schema_doc,
+                                        child,
+                                        type_attr,
+                                        &validator.target_namespace,
+                                    )?
                                 } else {
                                     // Check for inline simpleType child
                                     let mut inline_type = None;

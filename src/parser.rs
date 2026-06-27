@@ -37,6 +37,16 @@ pub const DEFAULT_MAX_DEPTH: u32 = 128;
 /// [`Parser::with_max_entity_expansion`].
 pub const DEFAULT_MAX_ENTITY_EXPANSION: usize = 1 << 20;
 
+/// Maximum nesting depth for entity replacement-text expansion.
+///
+/// Entity expansion recurses once per nested reference. The byte budget
+/// ([`DEFAULT_MAX_ENTITY_EXPANSION`]) bounds total output but not recursion
+/// depth: a long *linear* chain of distinct entities (`e0 -> e1 -> … -> eN`)
+/// whose leaf is tiny expands to ~1 byte yet descends N frames, overflowing the
+/// stack (an uncatchable abort). This cap fails such chains closed with a normal
+/// error. The limit is far above any realistic document's entity nesting.
+pub const DEFAULT_MAX_ENTITY_DEPTH: usize = 256;
+
 /// The XML 1.0 parser.
 pub struct Parser {
     /// Whether to resolve namespaces during parsing.
@@ -576,7 +586,7 @@ fn parse_xml_declaration<'a>(cursor: &mut Cursor<'a>) -> XmlResult<XmlDeclaratio
     })
 }
 
-/// Validate an encoding name per XML 1.0 production [81]:
+/// Validate an encoding name per XML 1.0 production `[81]`:
 /// EncName ::= [A-Za-z] ([A-Za-z0-9._] | '-')*
 fn is_valid_encoding_name(name: &str) -> bool {
     if name.is_empty() {
@@ -906,6 +916,19 @@ fn expand_entity_value(
     line: usize,
     col: usize,
 ) -> XmlResult<String> {
+    // `seen.len()` is the current expansion depth (one entry pushed per nested
+    // reference). Cap it so a deep linear entity chain fails closed instead of
+    // overflowing the stack.
+    if seen.len() > DEFAULT_MAX_ENTITY_DEPTH {
+        return Err(XmlError::well_formedness(
+            format!(
+                "Entity expansion nested deeper than {}",
+                DEFAULT_MAX_ENTITY_DEPTH
+            ),
+            line,
+            col,
+        ));
+    }
     let mut result = String::new();
     let mut pos = 0;
     let bytes = value.as_bytes();
@@ -1015,6 +1038,18 @@ fn expand_entity_value_no_builtins(
     line: usize,
     col: usize,
 ) -> XmlResult<String> {
+    // See `expand_entity_value`: bound recursion depth to fail deep linear
+    // entity chains closed rather than overflowing the stack.
+    if seen.len() > DEFAULT_MAX_ENTITY_DEPTH {
+        return Err(XmlError::well_formedness(
+            format!(
+                "Entity expansion nested deeper than {}",
+                DEFAULT_MAX_ENTITY_DEPTH
+            ),
+            line,
+            col,
+        ));
+    }
     let mut result = String::new();
     let mut pos = 0;
     let bytes = value.as_bytes();
@@ -1373,7 +1408,7 @@ fn parse_pubid_literal(cursor: &mut Cursor) -> XmlResult<String> {
     Ok(value)
 }
 
-/// Check if a character is a valid PubidChar (XML 1.0 production [13]).
+/// Check if a character is a valid PubidChar (XML 1.0 production `[13]`).
 fn is_pubid_char(c: char) -> bool {
     matches!(c,
         ' ' | '\r' | '\n' |
@@ -2391,6 +2426,16 @@ fn parse_element<'a>(
         } else {
             QName::local(attr_name)
         };
+        if resolved_attrs.iter().any(|existing: &Attribute<'a>| {
+            existing.name.local_name == a_qname.local_name
+                && existing.name.namespace_uri.as_deref() == a_qname.namespace_uri.as_deref()
+        }) {
+            return Err(XmlError::well_formedness(
+                format!("Duplicate attribute: {}", a_qname),
+                cursor.line(),
+                cursor.column(),
+            ));
+        }
         resolved_attrs.push(Attribute {
             name: a_qname,
             value: attr_value,
