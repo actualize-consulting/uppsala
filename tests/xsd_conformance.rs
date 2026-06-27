@@ -513,3 +513,105 @@ fn xsd_nested_complex_types() {
     let xml = "<order><customer><name>Bob</name></customer><total>99.95</total></order>";
     assert!(validate_xml_against_xsd(xml, xsd).is_ok());
 }
+
+// ─── List-type inheritance (issue #12) ─────────────────────────────
+
+#[test]
+fn xsd_list_inheritance() {
+    // An inline <xs:simpleType> restricting a named list type must inherit
+    // `is_list` from the base, so a `length` facet counts list *items*, not
+    // characters. Regression test for issue #12.
+    let xsd = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="DoubleListSimpleType">
+    <xs:list itemType="xs:double"/>
+  </xs:simpleType>
+  <xs:element name="ThreePoint" nillable="false">
+    <xs:simpleType>
+      <xs:restriction base="DoubleListSimpleType">
+        <xs:length value="3" fixed="true"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    // Exactly three list items — valid regardless of each item's char length.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4 4.5</ThreePoint>", xsd).is_ok());
+    assert!(validate_xml_against_xsd("<ThreePoint>1 2 3</ThreePoint>", xsd).is_ok());
+
+    // Wrong number of items — must fail the length facet.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4</ThreePoint>", xsd).is_err());
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 3.4 3 4</ThreePoint>", xsd).is_err());
+
+    // Item type is still enforced: a non-double item must fail.
+    assert!(validate_xml_against_xsd("<ThreePoint>1.2 abc 4.5</ThreePoint>", xsd).is_err());
+}
+
+#[test]
+fn xsd_derived_list_inherits_item_facets() {
+    // A named list type derived via <restriction> over another list type must
+    // inherit the base list's item-level facets (e.g. a pattern on a
+    // user-defined item type). Otherwise item constraints are silently dropped
+    // and invalid items are accepted (fail-open). Regression for the
+    // differential-review finding on `list_bases` / builder list passes.
+    let xsd = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="HexByte">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9A-Fa-f]{2}"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="HexList">
+    <xs:list itemType="HexByte"/>
+  </xs:simpleType>
+  <xs:simpleType name="ShortHexList">
+    <xs:restriction base="HexList">
+      <xs:maxLength value="3"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:element name="data" type="ShortHexList"/>
+</xs:schema>"#;
+
+    // Valid: two well-formed hex bytes, within maxLength.
+    assert!(validate_xml_against_xsd("<data>AA BB</data>", xsd).is_ok());
+    // Item pattern must still be enforced through the derived list type.
+    assert!(validate_xml_against_xsd("<data>AA ZZ</data>", xsd).is_err());
+    // List-level maxLength (item count) must still be enforced.
+    assert!(validate_xml_against_xsd("<data>AA BB CC DD</data>", xsd).is_err());
+}
+
+#[test]
+fn xsd_inline_restriction_over_derived_list_enforces_item_facets() {
+    // Combines both fixes: an *inline* simpleType restricting a *derived* list
+    // type must inherit both is_list and the ultimate base list's item facets.
+    let xsd = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="HexByte">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9A-Fa-f]{2}"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="HexList">
+    <xs:list itemType="HexByte"/>
+  </xs:simpleType>
+  <xs:simpleType name="ShortHexList">
+    <xs:restriction base="HexList">
+      <xs:maxLength value="4"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:element name="data">
+    <xs:simpleType>
+      <xs:restriction base="ShortHexList">
+        <xs:length value="2"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    // Exactly two well-formed hex bytes.
+    assert!(validate_xml_against_xsd("<data>AA BB</data>", xsd).is_ok());
+    // length=2 counts items, not characters.
+    assert!(validate_xml_against_xsd("<data>AA BB CC</data>", xsd).is_err());
+    // Item pattern enforced transitively through the inline restriction.
+    assert!(validate_xml_against_xsd("<data>AA ZZ</data>", xsd).is_err());
+}

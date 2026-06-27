@@ -12,7 +12,7 @@
 //!   4. List-type resolution passes (base-type propagation, item-type facets,
 //!      inline list-type facets in elements and content-model particles)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::dom::{Document, NodeKind};
@@ -20,7 +20,7 @@ use crate::error::{XmlError, XmlResult};
 
 use super::composition::{process_schema_composition, CompositionState};
 use super::facet_resolution::{
-    resolve_content_model_list_item_facets, resolve_inline_list_item_facets,
+    resolve_content_model_list_item_facets, resolve_inline_list_item_facets, ListBasesMap,
 };
 use super::parser::{
     parse_attribute_group_def, parse_complex_type, parse_element_decl, parse_model_group_def,
@@ -437,6 +437,58 @@ impl XsdValidator {
             }
         }
 
+        // Resolution pass 2b: derived list types (a `<restriction base="SomeList">`)
+        // inherit the item type and item-level facets of the list they restrict.
+        // Pass 1 propagates `is_list`/`item_type` but runs before pass 2 resolves
+        // the base's item facets, so item-level constraints (e.g. a pattern on a
+        // user-defined item type) would otherwise be silently dropped on a derived
+        // list type — accepting items the base would reject. Walk each restriction
+        // chain to the underlying `<list>` declaration (whose item meta pass 2 has
+        // fully resolved) and copy it down.
+        let derived_meta = type_keys2
+            .iter()
+            .filter_map(|key| {
+                // Only derived list types: a list reached via restriction, not
+                // a direct `<list>` declaration (which pass 2 already handles).
+                let is_derived_list = matches!(
+                    validator.types.get(key),
+                    Some(TypeDef::Simple(st))
+                        if st.is_list
+                            && st._base_type_local.is_some()
+                            && st._item_type_local.is_none()
+                );
+                if !is_derived_list {
+                    return None;
+                }
+                // Follow the base chain to the root list; its resolved item
+                // meta is the deepest list reached.
+                let mut cur = key.clone();
+                let mut seen = HashSet::new();
+                let mut meta = None;
+                while seen.insert(cur.clone()) {
+                    match validator.types.get(&cur) {
+                        Some(TypeDef::Simple(st)) if st.is_list => {
+                            meta = Some((st.item_type.clone(), st.item_facets.clone()));
+                            match &st._base_type_local {
+                                Some(base_local) => cur = (cur.0.clone(), base_local.clone()),
+                                None => break,
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                meta.map(|(it, ifac)| (key.clone(), it, ifac))
+            })
+            .collect::<Vec<_>>();
+        for (key, item_type, item_facets) in derived_meta {
+            if let Some(TypeDef::Simple(st)) = validator.types.get_mut(&key) {
+                if item_type.is_some() {
+                    st.item_type = item_type;
+                }
+                st.item_facets = item_facets;
+            }
+        }
+
         // Resolution pass 3: resolve item type facets for inline list types embedded in
         // element declarations (both global elements and particles inside complex types).
         // Collect resolved item types from the types map first.
@@ -453,11 +505,27 @@ impl XsdValidator {
                 })
                 .collect();
 
+        // Named simple types that are list types, so an inline type restricting
+        // one can inherit `is_list`/`item_type`/`item_facets` (issue #12). Built
+        // after the named-type list-resolution passes above, so the entries
+        // already carry resolved item types.
+        let list_bases: ListBasesMap = validator
+            .types
+            .iter()
+            .filter_map(|(k, td)| match td {
+                TypeDef::Simple(st) if st.is_list => {
+                    Some((k.clone(), (st.item_type.clone(), st.item_facets.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+
         // Resolve inline list types in global element declarations
         for elem_decl in validator.elements.values_mut() {
             resolve_inline_list_item_facets(
                 &mut elem_decl.type_ref,
                 &resolved_items,
+                &list_bases,
                 &validator.target_namespace,
             );
         }
@@ -469,6 +537,7 @@ impl XsdValidator {
                 resolve_content_model_list_item_facets(
                     &mut ct.content,
                     &resolved_items,
+                    &list_bases,
                     &validator.target_namespace,
                 );
             }
