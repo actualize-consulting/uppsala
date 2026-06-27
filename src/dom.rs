@@ -1354,8 +1354,15 @@ impl<'a> Document<'a> {
                 // Sanitized prefixes can also collide (two distinct invalid
                 // prefixes both collapse to `_`), which is disambiguated against
                 // names already emitted for this start tag so output re-parses.
+                //
+                // Precompute the last index per prefix so the "last binding wins"
+                // dedup is O(n) rather than O(n^2) in the number of bindings.
+                let mut last_idx: HashMap<&str, usize> = HashMap::with_capacity(child_local.len());
+                for (i, (prefix, _)) in child_local.iter().enumerate() {
+                    last_idx.insert(prefix.as_ref(), i);
+                }
                 for (i, (prefix, uri)) in child_local.iter().enumerate() {
-                    if child_local[i + 1..].iter().any(|(p, _)| p == prefix) {
+                    if last_idx.get(prefix.as_ref()) != Some(&i) {
                         continue; // shadowed by a later binding for the same prefix
                     }
                     let (prefix, uri) = (prefix.as_ref(), uri.as_ref());
@@ -1627,14 +1634,14 @@ fn ensure_binding<'e>(
     desired_prefix: &'e str,
     uri: &'e str,
 ) -> Option<String> {
-    let current = {
+    let already_bound = {
         let cur = NsScope {
             parent: Some(scope),
             local: child_local,
         };
-        cur.resolve(desired_prefix).map(|s| s.to_string())
+        cur.resolve(desired_prefix) == Some(uri)
     };
-    if current.as_deref() == Some(uri) {
+    if already_bound {
         return None; // already correctly bound (here or via an ancestor)
     }
     if !child_local
@@ -1709,14 +1716,15 @@ fn plan_element_namespaces<'e>(
         // is reserved and cannot be rebound.
         (Some("xml"), Some(u)) if u == xml_ns => None,
         (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", elem.name.local_name)),
-        // The `xmlns` prefix and the XMLNS namespace are reserved for namespace
-        // declarations. Emitting `xmlns`/`xmlns:*` as a literal element name
-        // would re-parse as a declaration, and the parser ignores any binding
-        // to the XMLNS namespace, so rebind to a fresh non-reserved prefix.
-        (_, Some(u)) if u == xmlns_ns => {
-            let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
-            Some(format!("{}:{}", pfx, elem.name.local_name))
-        }
+        // The XMLNS namespace cannot be bound to any prefix: the parser ignores
+        // every binding to it, so a synthesized `xmlns:nsN="...2000/xmlns/"`
+        // declaration would not be namespace-well-formed and would not re-parse.
+        // The namespace is unrepresentable, so drop it and serialize the bare
+        // local name (never emitting an `xmlns`/`xmlns:*` name).
+        (_, Some(u)) if u == xmlns_ns => Some(elem.name.local_name.to_string()),
+        // The reserved `xml`/`xmlns` prefixes bound to any *other* (representable)
+        // URI are rebound to a fresh non-reserved prefix; emitting them verbatim
+        // would re-parse as the XML namespace / as a declaration.
         (Some("xml"), Some(u)) | (Some("xmlns"), Some(u)) => {
             let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
             Some(format!("{}:{}", pfx, elem.name.local_name))
@@ -1739,13 +1747,13 @@ fn plan_element_namespaces<'e>(
             (_, None) => None,
             (Some("xml"), Some(u)) if u == xml_ns => None,
             (_, Some(u)) if u == xml_ns => Some(format!("xml:{}", attr.name.local_name)),
-            // Reserved `xmlns` prefix / XMLNS namespace: see the element-name
-            // planning above. Rebind to a fresh non-reserved prefix so the
-            // attribute does not masquerade as a namespace declaration.
-            (_, Some(u)) if u == xmlns_ns => {
-                let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
-                Some(format!("{}:{}", pfx, attr.name.local_name))
-            }
+            // XMLNS namespace: unrepresentable (see the element-name planning
+            // above), so drop it and serialize the bare local name rather than
+            // emit a forbidden `xmlns:nsN="...2000/xmlns/"` declaration.
+            (_, Some(u)) if u == xmlns_ns => Some(attr.name.local_name.to_string()),
+            // Reserved `xml`/`xmlns` prefixes on a representable URI: rebind to a
+            // fresh non-reserved prefix so the attribute does not masquerade as a
+            // namespace declaration.
             (Some("xml"), Some(u)) | (Some("xmlns"), Some(u)) => {
                 let pfx = prefix_for_or_alloc(scope, &mut child_local, u);
                 Some(format!("{}:{}", pfx, attr.name.local_name))

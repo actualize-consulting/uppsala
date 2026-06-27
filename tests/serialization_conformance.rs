@@ -997,17 +997,52 @@ fn ns_xmlns_prefixed_attribute_does_not_masquerade_as_declaration() {
 }
 
 #[test]
-fn ns_xmlns_namespace_uri_is_reassigned_to_nonreserved_prefix() {
+fn ns_xmlns_namespace_uri_is_dropped_on_serialization() {
     use uppsala::{Document, QName};
-    // A QName carrying the reserved XMLNS namespace URI must not serialize with
-    // the `xmlns` prefix (which the parser reads as a declaration). It is rebound
-    // to a fresh, non-reserved prefix.
+    // The XMLNS namespace cannot be bound to any prefix (the parser ignores such
+    // bindings), so a QName carrying it is serialized without a namespace rather
+    // than emitting a forbidden `xmlns:nsN="...2000/xmlns/"` declaration that
+    // would not be namespace-well-formed.
     let mut doc = Document::new();
     let el = doc.create_element(QName::full("p", "http://www.w3.org/2000/xmlns/", "Foo"));
     doc.append_child(doc.root(), el);
     let out = doc.to_xml();
     assert!(
-        !out.contains("<xmlns:") && !out.starts_with("<xmlns"),
+        !out.contains("2000/xmlns"),
+        "forbidden XMLNS binding emitted: {out}"
+    );
+    assert!(
+        !out.contains("xmlns:") && !out.starts_with("<xmlns"),
         "XMLNS namespace serialized as a declaration: {out}"
     );
+    // Output must be well-formed and re-parse with the namespace dropped.
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.document_element().unwrap();
+    assert_eq!(
+        re.element(root).unwrap().name.local_name.as_ref(),
+        "Foo",
+        "{out}"
+    );
+}
+
+#[test]
+fn ns_xmlns_namespace_attribute_is_dropped_on_serialization() {
+    use std::borrow::Cow;
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    doc.element_mut(el).unwrap().set_attribute(
+        QName::full("p", "http://www.w3.org/2000/xmlns/", "a"),
+        Cow::Borrowed("v"),
+    );
+    let out = doc.to_xml();
+    assert!(
+        !out.contains("2000/xmlns") && !out.contains("xmlns:"),
+        "forbidden XMLNS binding emitted on attribute: {out}"
+    );
+    // Well-formed and re-parses; the bare attribute survives without a namespace.
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
 }
