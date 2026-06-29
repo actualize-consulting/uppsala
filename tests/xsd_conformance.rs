@@ -707,3 +707,33 @@ fn kml_style_optional_choice_before_substitution_group() {
         validate_xml_against_xsd(xml, xsd)
     );
 }
+
+#[test]
+fn nullable_choice_via_optional_sequence_alternative() {
+    // A choice alternative can be nullable through its *content*: a sequence
+    // whose sub-particles are all optional matches the empty sequence, so the
+    // enclosing choice is nullable even though the alternative's own minOccurs
+    // is 1. A following element must still be accepted.
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:choice>
+          <xs:sequence>
+            <xs:element name="a" type="xs:string" minOccurs="0"/>
+            <xs:element name="b" type="xs:string" minOccurs="0"/>
+          </xs:sequence>
+        </xs:choice>
+        <xs:element name="c" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        validate_xml_against_xsd("<root><c>x</c></root>", xsd).is_ok(),
+        "{:?}",
+        validate_xml_against_xsd("<root><c>x</c></root>", xsd)
+    );
+    assert!(validate_xml_against_xsd("<root><a>x</a><c>y</c></root>", xsd).is_ok());
+    assert!(validate_xml_against_xsd("<root/>", xsd).is_ok());
+}
