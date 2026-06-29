@@ -352,7 +352,7 @@ fn xsts_nist_datatypes() {
             }
         }
         let mut breakdown: Vec<_> = by_type.into_iter().collect();
-        breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+        breakdown.sort_by_key(|b| std::cmp::Reverse(b.1));
         println!("\nFailure breakdown by type:");
         for (dtype, count) in &breakdown {
             println!("  {:>5} {}", count, dtype);

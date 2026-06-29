@@ -1606,9 +1606,10 @@ impl XsdValidator {
 
         if children.is_empty() {
             if compositor_min > 0 {
-                // Check if any particle allows 0 occurrences
-                let any_optional = particles.iter().any(|p| p.min_occurs == 0);
-                if !any_optional && !particles.is_empty() {
+                // The choice is satisfied with no content when any alternative is
+                // nullable (optional, or nullable through its own content).
+                let nullable = particles.iter().any(Self::particle_is_nullable);
+                if !nullable && !particles.is_empty() {
                     errors.push(ValidationError {
                         message: "Expected one of the choice alternatives".to_string(),
                         line: Some(doc.node_line(parent)),
@@ -1837,8 +1838,17 @@ impl XsdValidator {
             }
 
             if !matched_any {
-                // Current child doesn't match any alternative
-                if choice_reps < compositor_min {
+                // Current child doesn't match any alternative. A choice is
+                // *nullable* when at least one alternative can match the empty
+                // sequence — either an optional particle (minOccurs=0) or one
+                // whose content is itself nullable (e.g. a sequence of all
+                // optional particles). Selecting that alternative and matching it
+                // zero times satisfies the choice, so a non-matching child is not
+                // an error: the choice consumes nothing and an enclosing sequence
+                // continues with its next particle (e.g. KML's optional
+                // `Snippet|snippet` choice preceding the feature list).
+                let nullable = particles.iter().any(Self::particle_is_nullable);
+                if choice_reps < compositor_min && !nullable {
                     errors.push(ValidationError {
                         message: format!(
                             "Element '{}' does not match any choice alternative",
@@ -1855,9 +1865,11 @@ impl XsdValidator {
         }
 
         if choice_reps < compositor_min && child_idx == 0 && errors.is_empty() {
-            // No children matched and no error was emitted yet
-            let any_optional = particles.iter().any(|p| p.min_occurs == 0);
-            if !any_optional && !particles.is_empty() {
+            // No children matched and no error was emitted yet. The choice is
+            // satisfied without consuming anything when any alternative is
+            // nullable (see `particle_is_nullable`).
+            let nullable = particles.iter().any(Self::particle_is_nullable);
+            if !nullable && !particles.is_empty() {
                 errors.push(ValidationError {
                     message: "Expected one of the choice alternatives".to_string(),
                     line: Some(doc.node_line(parent)),
@@ -1867,6 +1879,25 @@ impl XsdValidator {
         }
 
         child_idx
+    }
+
+    /// Whether a particle can match the empty sequence (is *nullable*).
+    ///
+    /// A particle with `minOccurs=0` is always nullable. Otherwise nullability
+    /// depends on the kind:
+    /// - element / wildcard with `minOccurs>=1`: not nullable (must match one),
+    /// - sequence: nullable iff every sub-particle is nullable (an empty
+    ///   sequence is vacuously nullable),
+    /// - choice: nullable iff any sub-particle is nullable.
+    fn particle_is_nullable(particle: &Particle) -> bool {
+        if particle.min_occurs == 0 {
+            return true;
+        }
+        match &particle.kind {
+            ParticleKind::Element(_) | ParticleKind::Any { .. } => false,
+            ParticleKind::Sequence(subs) => subs.iter().all(Self::particle_is_nullable),
+            ParticleKind::Choice(subs) => subs.iter().any(Self::particle_is_nullable),
+        }
     }
 
     /// Validate an `xs:all` content model.

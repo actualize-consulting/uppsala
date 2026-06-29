@@ -1160,3 +1160,51 @@ fn ns_reserved_attribute_prefix_without_uri_is_stripped() {
         assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
     }
 }
+
+#[test]
+fn declare_namespace_emits_prefixed_declaration() {
+    use uppsala::{Document, QName};
+    // declare_namespace records a binding in namespace_declarations, so it
+    // serializes as a real xmlns:p="..." declaration (not an attribute).
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::full("p", "urn:ex", "Foo"));
+    doc.append_child(doc.root(), el);
+    assert!(doc.declare_namespace(el, Some("p"), "urn:ex"));
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<p:Foo xmlns:p="urn:ex"/>"#, "{out}");
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(root.name.namespace_uri.as_deref(), Some("urn:ex"), "{out}");
+}
+
+#[test]
+fn declare_namespace_default_on_element_in_that_namespace() {
+    use uppsala::{Document, QName};
+    // An element in `urn:ex` with a declared default namespace serializes as
+    // xmlns="urn:ex" (the lxml clark+nsmap shape), with the URI preserved.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::with_namespace("urn:ex", "kml"));
+    doc.append_child(doc.root(), el);
+    assert!(doc.declare_namespace(el, None, "urn:ex"));
+    let out = doc.to_xml();
+    assert_eq!(out, r#"<kml xmlns="urn:ex"/>"#, "{out}");
+    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let root = re.element(re.document_element().unwrap()).unwrap();
+    assert_eq!(root.name.namespace_uri.as_deref(), Some("urn:ex"), "{out}");
+}
+
+#[test]
+fn declare_namespace_upserts_existing_prefix() {
+    use uppsala::{Document, QName};
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    doc.declare_namespace(el, Some("p"), "urn:old");
+    doc.declare_namespace(el, Some("p"), "urn:new"); // updates in place
+    let decls = &doc.element(el).unwrap().namespace_declarations;
+    assert_eq!(decls.len(), 1, "prefix p must not be duplicated");
+    assert_eq!(decls[0].1.as_ref(), "urn:new");
+    // Non-element node returns false.
+    let txt = doc.create_text("x");
+    assert!(!doc.declare_namespace(txt, Some("p"), "urn:x"));
+}
