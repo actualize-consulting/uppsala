@@ -1,7 +1,7 @@
 //! # Uppsala
 //!
-//! A **zero-dependency** pure Rust XML library implementing the core XML stack
-//! from parsing through schema validation.
+//! A zero-dependency pure Rust XML library implementing the core XML stack from
+//! parsing through schema validation.
 //!
 //! - **XML 1.0 (Fifth Edition)** parsing and well-formedness checking
 //! - **Namespaces in XML 1.0 (Third Edition)** with prefix resolution and scoping
@@ -107,7 +107,7 @@ pub mod error;
 pub mod namespace;
 /// XML 1.0 (Fifth Edition) recursive-descent parser.
 pub mod parser;
-/// SIMD-accelerated byte scanning for parser hot loops.
+/// Accelerated byte scanning for parser hot loops.
 mod simd;
 /// Imperative [`XmlWriter`] for streaming XML construction.
 pub mod writer;
