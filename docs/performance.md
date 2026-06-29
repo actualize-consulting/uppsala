@@ -8,9 +8,10 @@ documents are dominated by fixed parser overhead.
 
 ## Results
 
-The tables below compare release builds (LTO on) of Uppsala 0.5.2 against a
-local checkout of roxmltree 0.21.1. Results are median parse times from 101
-samples on x86_64 (the SSE2 scanner path). The `Ratio` column is
+The tables below compare release builds (`cargo run --release`, no extra
+profile overrides) of Uppsala 0.5.2 against a local checkout of roxmltree
+0.21.1. Results are median parse times from 101 samples on x86_64 (the SSE2
+scanner path). The `Ratio` column is
 `roxmltree / Uppsala`; values above 1.0 mean Uppsala parsed faster.
 
 ### roxmltree benchmark inputs

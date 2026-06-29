@@ -874,6 +874,17 @@ fn parse_reference_into(
         let end =
             start + crate::simd::find_byte(&bytes[start..], b';').ok_or(XmlError::UnexpectedEof)?;
         let digits = &cursor.input[start..end];
+        if digits.is_empty() {
+            return Err(XmlError::parse(
+                if is_hex {
+                    "Invalid hex character reference: &#x;".to_string()
+                } else {
+                    "Invalid decimal character reference: &#;".to_string()
+                },
+                cursor.line(),
+                cursor.column(),
+            ));
+        }
         let mut code = 0_u32;
         for b in digits.bytes() {
             let digit = if is_hex {
@@ -965,54 +976,45 @@ fn parse_reference_into(
 
         let name = parse_name(cursor)?;
         cursor.expect(";")?;
-        match &*name {
-            _ => {
-                // Check cache first to avoid re-expansion and re-validation.
-                // Charge the cached length against the budget — this is the
-                // F-02 (quadratic blow-up) defence: one large entity
-                // referenced N times becomes N * len bytes.
-                if let Some(cached) = entity_cache.get(&*name) {
-                    charge_entity_budget_at_cursor(budget, cached.len(), cursor)?;
-                    out.push_str(cached);
-                    return Ok(());
-                }
-                if let Some(value) = entities.get(&*name) {
-                    // Fully expand the entity value, resolving nested entity refs.
-                    let expanded = expand_entity_value(
-                        value,
-                        entities,
-                        &mut vec![name.to_string()],
-                        budget,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    // Validate well-formedness of the entity replacement text.
-                    let validation_text = expand_entity_value_no_builtins(
-                        value,
-                        entities,
-                        &mut vec![name.to_string()],
-                        budget,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    validate_entity_as_content(
-                        &validation_text,
-                        entities,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    // Cache the result for subsequent references
-                    entity_cache.insert(name.to_string(), expanded.clone());
-                    out.push_str(&expanded);
-                    Ok(())
-                } else {
-                    Err(XmlError::well_formedness(
-                        format!("Unknown entity reference: &{};", name),
-                        cursor.line(),
-                        cursor.column(),
-                    ))
-                }
-            }
+        // Check cache first to avoid re-expansion and re-validation.
+        // Charge the cached length against the budget — this is the
+        // F-02 (quadratic blow-up) defence: one large entity
+        // referenced N times becomes N * len bytes.
+        if let Some(cached) = entity_cache.get(&*name) {
+            charge_entity_budget_at_cursor(budget, cached.len(), cursor)?;
+            out.push_str(cached);
+            return Ok(());
+        }
+        if let Some(value) = entities.get(&*name) {
+            // Fully expand the entity value, resolving nested entity refs.
+            let expanded = expand_entity_value(
+                value,
+                entities,
+                &mut vec![name.to_string()],
+                budget,
+                cursor.line(),
+                cursor.column(),
+            )?;
+            // Validate well-formedness of the entity replacement text.
+            let validation_text = expand_entity_value_no_builtins(
+                value,
+                entities,
+                &mut vec![name.to_string()],
+                budget,
+                cursor.line(),
+                cursor.column(),
+            )?;
+            validate_entity_as_content(&validation_text, entities, cursor.line(), cursor.column())?;
+            // Cache the result for subsequent references
+            entity_cache.insert(name.to_string(), expanded.clone());
+            out.push_str(&expanded);
+            Ok(())
+        } else {
+            Err(XmlError::well_formedness(
+                format!("Unknown entity reference: &{};", name),
+                cursor.line(),
+                cursor.column(),
+            ))
         }
     }
 }
