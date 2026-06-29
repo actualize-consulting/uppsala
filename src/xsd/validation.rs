@@ -1837,8 +1837,15 @@ impl XsdValidator {
             }
 
             if !matched_any {
-                // Current child doesn't match any alternative
-                if choice_reps < compositor_min {
+                // Current child doesn't match any alternative. A choice whose
+                // alternatives are all optional (every alternative has
+                // minOccurs=0) is *nullable*: it is satisfied by selecting an
+                // alternative and matching it zero times, so a non-matching child
+                // is not an error — the choice consumes nothing and an enclosing
+                // sequence continues with its next particle (e.g. KML's optional
+                // `Snippet|snippet` choice preceding the feature list).
+                let nullable = particles.iter().any(|p| p.min_occurs == 0);
+                if choice_reps < compositor_min && !nullable {
                     errors.push(ValidationError {
                         message: format!(
                             "Element '{}' does not match any choice alternative",

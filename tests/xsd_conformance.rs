@@ -615,3 +615,95 @@ fn xsd_inline_restriction_over_derived_list_enforces_item_facets() {
     // Item pattern enforced transitively through the inline restriction.
     assert!(validate_xml_against_xsd("<data>AA ZZ</data>", xsd).is_err());
 }
+
+// ─── Nullable xs:choice regression (fastkml / KML issue) ────────────────
+//
+// A `<choice>` whose alternatives are all optional (every alternative has
+// minOccurs=0) is nullable: it is satisfied by matching nothing. Such a
+// choice appearing in a sequence must not reject a following element that
+// belongs to a later particle. Regression for the KML AbstractFeatureType
+// pattern, where an optional `Snippet|snippet` choice precedes the
+// substitution-group feature list and previously caused
+// "Element 'Placemark' does not match any choice alternative".
+
+#[test]
+fn nullable_choice_in_sequence_skips_to_next_particle() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:choice>
+          <xs:element name="a" type="xs:string" minOccurs="0"/>
+          <xs:element name="b" type="xs:string" minOccurs="0"/>
+        </xs:choice>
+        <xs:element name="c" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    // `c` follows the all-optional choice; the choice must consume nothing.
+    assert!(validate_xml_against_xsd("<root><c>x</c></root>", xsd).is_ok());
+    // The choice can still be taken.
+    assert!(validate_xml_against_xsd("<root><a>x</a><c>y</c></root>", xsd).is_ok());
+    // Empty is valid too.
+    assert!(validate_xml_against_xsd("<root/>", xsd).is_ok());
+}
+
+#[test]
+fn required_choice_with_no_optional_alternatives_still_errors() {
+    // A choice with no optional alternative is NOT nullable: a non-matching
+    // child must still be rejected (guards against the fix over-relaxing).
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:choice>
+        <xs:element name="a" type="xs:string"/>
+        <xs:element name="b" type="xs:string"/>
+      </xs:choice>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(validate_xml_against_xsd("<root><a>x</a></root>", xsd).is_ok());
+    assert!(validate_xml_against_xsd("<root><c>x</c></root>", xsd).is_err());
+}
+
+#[test]
+fn kml_style_optional_choice_before_substitution_group() {
+    // Faithful reduction of the KML AbstractFeatureType / DocumentType shape:
+    // an optional inline choice inside the (extended) sequence, followed by a
+    // reference to an abstract substitution-group head. A substituting member
+    // (Placemark) as the only child must validate.
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:kml" xmlns:k="urn:kml" elementFormDefault="qualified">
+  <xs:element name="AbstractFeatureGroup" type="k:AbstractFeatureType" abstract="true"/>
+  <xs:complexType name="AbstractFeatureType" abstract="true">
+    <xs:sequence>
+      <xs:element name="name" type="xs:string" minOccurs="0"/>
+      <xs:choice>
+        <xs:element name="Snippet" type="xs:string" minOccurs="0"/>
+        <xs:element name="snippet" type="xs:string" minOccurs="0"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:element name="Placemark" type="k:PlacemarkType" substitutionGroup="k:AbstractFeatureGroup"/>
+  <xs:complexType name="PlacemarkType">
+    <xs:complexContent><xs:extension base="k:AbstractFeatureType"/></xs:complexContent>
+  </xs:complexType>
+  <xs:element name="Document" type="k:DocumentType"/>
+  <xs:complexType name="DocumentType">
+    <xs:complexContent>
+      <xs:extension base="k:AbstractFeatureType">
+        <xs:sequence>
+          <xs:element ref="k:AbstractFeatureGroup" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+</xs:schema>"#;
+    let xml = r#"<Document xmlns="urn:kml"><Placemark/></Document>"#;
+    assert!(
+        validate_xml_against_xsd(xml, xsd).is_ok(),
+        "{:?}",
+        validate_xml_against_xsd(xml, xsd)
+    );
+}

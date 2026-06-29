@@ -531,6 +531,44 @@ impl<'a> Document<'a> {
         )
     }
 
+    /// Declare a namespace binding on an element node.
+    ///
+    /// `prefix` is `None` (or `""`) for the default namespace. If the element
+    /// already declares `prefix`, its URI is updated in place; otherwise a new
+    /// declaration is appended. This writes to [`Element::namespace_declarations`]
+    /// — the proper home for `xmlns`/`xmlns:*` output — rather than adding an
+    /// attribute, so it serializes as a real namespace declaration.
+    ///
+    /// Returns `true` if `node` is an element (and the binding was recorded),
+    /// `false` otherwise. Note that the serializer still filters reserved
+    /// bindings (the `xmlns` prefix, `xml` bound to a non-XML URI, or any prefix
+    /// bound to the XMLNS namespace), so declaring those here is a no-op on output.
+    pub fn declare_namespace(
+        &mut self,
+        node: NodeId,
+        prefix: Option<&str>,
+        uri: impl Into<Cow<'a, str>>,
+    ) -> bool {
+        let prefix = prefix.unwrap_or("");
+        match self.element_mut(node) {
+            Some(el) => {
+                let uri = uri.into();
+                match el
+                    .namespace_declarations
+                    .iter_mut()
+                    .find(|(p, _)| p.as_ref() == prefix)
+                {
+                    Some(slot) => slot.1 = uri,
+                    None => el
+                        .namespace_declarations
+                        .push((Cow::Owned(prefix.to_string()), uri)),
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Create a new text node (not yet attached to the tree).
     pub fn create_text(&mut self, text: impl Into<Cow<'a, str>>) -> NodeId {
         self.alloc_node(NodeKind::Text(text.into()), 0)
