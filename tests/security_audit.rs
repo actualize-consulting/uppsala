@@ -11,7 +11,7 @@
 //!
 use std::time::{Duration, Instant};
 
-use uppsala::{parse, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
+use uppsala::{parse, Parser, XPathEvaluator, XmlWriter, XsdRegex, XsdValidator};
 
 // ─── Finding F-01 — Billion Laughs (entity expansion) ──────────────────
 
@@ -565,4 +565,81 @@ fn xpath_double_slash_blowup() {
         "XPath double-slash regression: query took {:?}",
         start.elapsed()
     );
+}
+
+// ─── Opt-in hardening — forbid_dtd / forbid_entities ───────────────────
+//
+// defusedxml-style switches. Both default off (the free `parse()` is
+// unchanged); when enabled the parser fails closed at the DOCTYPE / entity
+// declaration rather than parsing it.
+
+/// `forbid_dtd` rejects an external-ID DOCTYPE before parsing the DTD.
+#[test]
+fn forbid_dtd_rejects_external_doctype() {
+    let xml = r#"<!DOCTYPE r SYSTEM "r.dtd"><r/>"#;
+    assert!(parse(xml).is_ok(), "precondition: parses with the flag off");
+    let res = Parser::new().with_forbid_dtd(true).parse(xml);
+    assert!(res.is_err(), "forbid_dtd must reject the DOCTYPE");
+    assert!(
+        format!("{:?}", res.err()).contains("forbid_dtd"),
+        "error should mention forbid_dtd"
+    );
+}
+
+/// `forbid_dtd` rejects an internal-subset DOCTYPE (even entity-free).
+#[test]
+fn forbid_dtd_rejects_internal_subset() {
+    let xml = r#"<!DOCTYPE r [ <!ELEMENT r EMPTY> ]><r/>"#;
+    assert!(parse(xml).is_ok(), "precondition: parses with the flag off");
+    assert!(
+        Parser::new().with_forbid_dtd(true).parse(xml).is_err(),
+        "forbid_dtd must reject any DOCTYPE"
+    );
+}
+
+/// `forbid_dtd` leaves DTD-free documents untouched.
+#[test]
+fn forbid_dtd_accepts_dtd_free_document() {
+    assert!(
+        Parser::new().with_forbid_dtd(true).parse("<r/>").is_ok(),
+        "forbid_dtd must not affect documents without a DOCTYPE"
+    );
+}
+
+/// `forbid_entities` rejects general and parameter entity declarations.
+#[test]
+fn forbid_entities_rejects_entity_declarations() {
+    let general = r#"<!DOCTYPE r [ <!ENTITY x "y"> ]><r/>"#;
+    let parameter = r#"<!DOCTYPE r [ <!ENTITY % p "<!ELEMENT r EMPTY>"> ]><r/>"#;
+    for xml in [general, parameter] {
+        assert!(
+            parse(xml).is_ok(),
+            "precondition: parses with flag off: {xml}"
+        );
+        let res = Parser::new().with_forbid_entities(true).parse(xml);
+        assert!(res.is_err(), "forbid_entities must reject: {xml}");
+        assert!(
+            format!("{:?}", res.err()).contains("forbid_entities"),
+            "error should mention forbid_entities: {xml}"
+        );
+    }
+}
+
+/// `forbid_entities` is narrower than `forbid_dtd`: a DTD carrying only
+/// `<!ELEMENT>` / `<!ATTLIST>` is still accepted.
+#[test]
+fn forbid_entities_allows_entity_free_dtd() {
+    let xml = r#"<!DOCTYPE r [ <!ELEMENT r EMPTY> <!ATTLIST r a CDATA #IMPLIED> ]><r/>"#;
+    assert!(
+        Parser::new().with_forbid_entities(true).parse(xml).is_ok(),
+        "forbid_entities must allow an entity-free DTD"
+    );
+}
+
+/// Default parser (both flags off) still parses DOCTYPE + entities.
+#[test]
+fn default_parser_still_parses_dtd_and_entities() {
+    let xml = r#"<!DOCTYPE r [ <!ENTITY x "hi"> ]><r>&x;</r>"#;
+    assert!(parse(xml).is_ok(), "default behavior must be unchanged");
+    assert!(Parser::new().parse(xml).is_ok());
 }
