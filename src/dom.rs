@@ -559,9 +559,14 @@ impl<'a> Document<'a> {
                     .find(|(p, _)| p.as_ref() == prefix)
                 {
                     Some(slot) => slot.1 = uri,
-                    None => el
-                        .namespace_declarations
-                        .push((Cow::Owned(prefix.to_string()), uri)),
+                    None => {
+                        let prefix = if prefix.is_empty() {
+                            Cow::Borrowed("")
+                        } else {
+                            Cow::Owned(prefix.to_string())
+                        };
+                        el.namespace_declarations.push((prefix, uri));
+                    }
                 }
                 true
             }

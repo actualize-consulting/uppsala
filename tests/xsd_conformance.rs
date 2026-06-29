@@ -701,11 +701,8 @@ fn kml_style_optional_choice_before_substitution_group() {
   </xs:complexType>
 </xs:schema>"#;
     let xml = r#"<Document xmlns="urn:kml"><Placemark/></Document>"#;
-    assert!(
-        validate_xml_against_xsd(xml, xsd).is_ok(),
-        "{:?}",
-        validate_xml_against_xsd(xml, xsd)
-    );
+    let result = validate_xml_against_xsd(xml, xsd);
+    assert!(result.is_ok(), "{:?}", result);
 }
 
 #[test]
@@ -729,11 +726,8 @@ fn nullable_choice_via_optional_sequence_alternative() {
     </xs:complexType>
   </xs:element>
 </xs:schema>"#;
-    assert!(
-        validate_xml_against_xsd("<root><c>x</c></root>", xsd).is_ok(),
-        "{:?}",
-        validate_xml_against_xsd("<root><c>x</c></root>", xsd)
-    );
+    let result = validate_xml_against_xsd("<root><c>x</c></root>", xsd);
+    assert!(result.is_ok(), "{:?}", result);
     assert!(validate_xml_against_xsd("<root><a>x</a><c>y</c></root>", xsd).is_ok());
     assert!(validate_xml_against_xsd("<root/>", xsd).is_ok());
 }

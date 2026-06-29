@@ -283,17 +283,15 @@ fn w3c_xmltest_valid_standalone() {
             }
         };
 
-        let result = uppsala::parse_bytes(&bytes);
-        if result.is_ok() {
-            passed += 1;
-        } else {
-            failed += 1;
-            failures.push(format!(
-                "  {} ({}): expected success, got error: {}",
-                test.id,
-                test.uri,
-                result.unwrap_err()
-            ));
+        match uppsala::parse_bytes(&bytes) {
+            Ok(_) => passed += 1,
+            Err(err) => {
+                failed += 1;
+                failures.push(format!(
+                    "  {} ({}): expected success, got error: {}",
+                    test.id, test.uri, err
+                ));
+            }
         }
     }
 
@@ -360,17 +358,15 @@ fn w3c_xmltest_invalid_standalone() {
             }
         };
 
-        let result = uppsala::parse_bytes(&bytes);
-        if result.is_ok() {
-            passed += 1;
-        } else {
-            failed += 1;
-            failures.push(format!(
-                "  {} ({}): expected success (well-formed), got error: {}",
-                test.id,
-                test.uri,
-                result.unwrap_err()
-            ));
+        match uppsala::parse_bytes(&bytes) {
+            Ok(_) => passed += 1,
+            Err(err) => {
+                failed += 1;
+                failures.push(format!(
+                    "  {} ({}): expected success (well-formed), got error: {}",
+                    test.id, test.uri, err
+                ));
+            }
         }
     }
 

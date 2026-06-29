@@ -1998,8 +1998,7 @@ mod tests {
         let root = doc.root();
         let err = eval
             .evaluate(&doc, root, &expr)
-            .err()
-            .expect("deep paren nesting must be rejected");
+            .expect_err("deep paren nesting must be rejected");
         assert!(
             format!("{}", err).contains("maximum depth"),
             "expected depth-cap error, got: {}",
@@ -2024,8 +2023,7 @@ mod tests {
         let root = doc.root();
         let err = eval
             .evaluate(&doc, root, &expr)
-            .err()
-            .expect("deep predicate nesting must be rejected");
+            .expect_err("deep predicate nesting must be rejected");
         assert!(
             format!("{}", err).contains("maximum depth"),
             "expected depth-cap error, got: {}",
@@ -2047,8 +2045,7 @@ mod tests {
         let root = doc.root();
         let err = eval
             .evaluate(&doc, root, &expr)
-            .err()
-            .expect("deep unary-minus chain must be rejected");
+            .expect_err("deep unary-minus chain must be rejected");
         assert!(
             format!("{}", err).contains("maximum depth"),
             "expected depth-cap error, got: {}",
