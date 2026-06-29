@@ -54,35 +54,38 @@ SSE2 on x86_64 and one-pass scalar delimiter scanning elsewhere. Performance
 depends heavily on the document shape: long plain-text spans are favorable,
 while very small documents are dominated by fixed parser overhead.
 
-The table below compares release builds of Uppsala 0.5.0 against a local
+The table below compares release builds of Uppsala 0.5.2 against a local
 checkout of roxmltree 0.21.1 using roxmltree's benchmark input files. Results
-are median parse times from 101 samples on macOS arm64; values above 1.0 mean
-Uppsala parsed faster than roxmltree.
+are median parse times from 101 samples on x86_64 (the SSE2 scanner path);
+values above 1.0 mean Uppsala parsed faster than roxmltree.
 
 | File | Size | Uppsala | roxmltree | Ratio |
 |------|------|---------|-----------|-------|
-| fonts.conf | 429 B | 3.6 us | 3.1 us | 0.85x |
-| medium.svg | 155 KB | 279 us | 178 us | 0.64x |
-| large.plist | 321 KB | 687 us | 730 us | 1.06x |
-| huge.xml | 835 KB | 1.41 ms | 1.49 ms | 1.06x |
-| gigantic.svg | 1.34 MB | 705 us | 861 us | 1.22x |
-| cdata.xml | 102 KB | 83 us | 110 us | 1.33x |
-| text.xml | 129 KB | 306 us | 2.54 ms | 8.32x |
-| attributes.xml | 271 KB | 620 us | 2.30 ms | 3.72x |
+| fonts.conf | 429 B | 2.9 us | 4.0 us | 1.38x |
+| medium.svg | 155 KB | 306 us | 489 us | 1.60x |
+| large.plist | 321 KB | 1.72 ms | 2.39 ms | 1.39x |
+| huge.xml | 835 KB | 3.69 ms | 4.80 ms | 1.30x |
+| gigantic.svg | 1.34 MB | 411 us | 1.94 ms | 4.73x |
+| cdata.xml | 102 KB | 215 us | 252 us | 1.17x |
+| text.xml | 129 KB | 650 us | 5.96 ms | 9.17x |
+| attributes.xml | 271 KB | 1.48 ms | 5.24 ms | 3.55x |
 
 The main production target is SAML: namespace-heavy documents in the 3-30 KB
 range with signed assertions. On generated SAML-shaped inputs, default
-namespace-aware parsing is at parity for medium/large responses and within a few
-microseconds on tiny responses:
+namespace-aware parsing is consistently faster than roxmltree:
 
 | File | Size | Uppsala | roxmltree | Ratio |
 |------|------|---------|-----------|-------|
-| SAML small | 3.5 KB | 4.8 us | 4.5 us | 0.92x |
-| SAML medium | 9.1 KB | 11.1 us | 11.3 us | 1.02x |
-| SAML large | 27.8 KB | 31.3 us | 31.0 us | 0.99x |
+| SAML small | 3.5 KB | 7.7 us | 13.3 us | 1.74x |
+| SAML medium | 9.1 KB | 25.1 us | 29.0 us | 1.16x |
+| SAML large | 27.8 KB | 62.7 us | 92.1 us | 1.47x |
 
-Disabling namespace resolution improves some ordinary XML inputs by roughly
-5-20%, but SAML users should usually keep namespace-aware parsing enabled.
+Disabling namespace resolution improves some ordinary XML inputs further, but
+SAML users should usually keep namespace-aware parsing enabled.
+
+These numbers come from the in-repo `performance-harness`. See
+[`docs/performance.md`](docs/performance.md) for the full results and the exact
+commands used to reproduce them.
 
 ## Usage
 
