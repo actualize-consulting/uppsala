@@ -137,20 +137,20 @@ impl Parser {
         // nodes are included, so larger inputs use a denser estimate to avoid
         // repeated arena growth during parsing.
         //
-        // Use `try_reserve` so a hostile or simply huge input fails closed with
-        // a recoverable parse error instead of aborting the host process via
-        // the global allocation-error handler.
-        let estimate = if input.len() >= 256 * 1024 {
+        // Use `try_reserve` (not `reserve`) so a hostile or simply huge input
+        // cannot trigger an aborting upfront allocation via the global
+        // allocation-error handler. The reservation is only a hint: if the
+        // dense estimate fails on a memory-constrained host, fall back to the
+        // sparser estimate, and if that also fails just proceed — parsing still
+        // succeeds by regrowing the arena on demand.
+        let dense = if input.len() >= 256 * 1024 {
             input.len() / 14
         } else {
             input.len() / 40
         };
-        if doc.nodes.try_reserve(estimate).is_err() {
-            return Err(XmlError::parse(
-                "Failed to allocate parse arena for input",
-                1,
-                1,
-            ));
+        let sparse = input.len() / 40;
+        if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
+            let _ = doc.nodes.try_reserve(sparse);
         }
         let mut ns_resolver = if self.namespace_aware {
             Some(NamespaceResolver::new())
@@ -928,7 +928,11 @@ fn parse_reference_into(
                 .and_then(|n| n.checked_add(digit))
                 .ok_or_else(|| {
                     XmlError::parse(
-                        format!("Invalid character reference: {}", digits),
+                        if is_hex {
+                            format!("Invalid hex character reference: {}", digits)
+                        } else {
+                            format!("Invalid decimal character reference: {}", digits)
+                        },
                         cursor.line(),
                         cursor.column(),
                     )
