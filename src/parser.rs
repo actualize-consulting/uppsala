@@ -139,8 +139,7 @@ impl Parser {
         //
         // Use `try_reserve` so a hostile or simply huge input fails closed with
         // a recoverable parse error instead of aborting the host process via
-        // the global allocation-error handler. The estimate is only a hint;
-        // parsing still works (it just regrows) if the reservation is skipped.
+        // the global allocation-error handler.
         let estimate = if input.len() >= 256 * 1024 {
             input.len() / 14
         } else {
@@ -889,9 +888,9 @@ fn parse_reference_into(
         if digits.is_empty() {
             return Err(XmlError::parse(
                 if is_hex {
-                    "Invalid hex character reference: &#x;".to_string()
+                    "Invalid hex character reference: &#x;"
                 } else {
-                    "Invalid decimal character reference: &#;".to_string()
+                    "Invalid decimal character reference: &#;"
                 },
                 cursor.line(),
                 cursor.column(),
