@@ -136,11 +136,23 @@ impl Parser {
         // plist files can be closer to 14 bytes per node once whitespace text
         // nodes are included, so larger inputs use a denser estimate to avoid
         // repeated arena growth during parsing.
-        doc.nodes.reserve(if input.len() >= 256 * 1024 {
+        //
+        // Use `try_reserve` so a hostile or simply huge input fails closed with
+        // a recoverable parse error instead of aborting the host process via
+        // the global allocation-error handler. The estimate is only a hint;
+        // parsing still works (it just regrows) if the reservation is skipped.
+        let estimate = if input.len() >= 256 * 1024 {
             input.len() / 14
         } else {
             input.len() / 40
-        });
+        };
+        if doc.nodes.try_reserve(estimate).is_err() {
+            return Err(XmlError::parse(
+                "Failed to allocate parse arena for input",
+                1,
+                1,
+            ));
+        }
         let mut ns_resolver = if self.namespace_aware {
             Some(NamespaceResolver::new())
         } else {
