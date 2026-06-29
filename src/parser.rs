@@ -59,6 +59,13 @@ pub struct Parser {
     /// billion-laughs (exponential nesting) and quadratic-blowup (single
     /// large entity referenced many times) attacks.
     max_entity_expansion: usize,
+    /// When `true`, any `<!DOCTYPE` declaration is rejected at parse time
+    /// instead of being parsed. Off by default. See [`Parser::with_forbid_dtd`].
+    forbid_dtd: bool,
+    /// When `true`, `<!ENTITY>` declarations (general and parameter) inside a
+    /// DTD are rejected while the rest of the DTD is still parsed. Off by
+    /// default. See [`Parser::with_forbid_entities`].
+    forbid_entities: bool,
 }
 
 impl Parser {
@@ -69,6 +76,8 @@ impl Parser {
             namespace_aware: true,
             max_depth: DEFAULT_MAX_DEPTH,
             max_entity_expansion: DEFAULT_MAX_ENTITY_EXPANSION,
+            forbid_dtd: false,
+            forbid_entities: false,
         }
     }
 
@@ -79,6 +88,8 @@ impl Parser {
             namespace_aware,
             max_depth: DEFAULT_MAX_DEPTH,
             max_entity_expansion: DEFAULT_MAX_ENTITY_EXPANSION,
+            forbid_dtd: false,
+            forbid_entities: false,
         }
     }
 
@@ -93,6 +104,25 @@ impl Parser {
     /// call. Chains with other builder methods.
     pub fn with_max_entity_expansion(mut self, max_bytes: usize) -> Self {
         self.max_entity_expansion = max_bytes;
+        self
+    }
+
+    /// Reject any `<!DOCTYPE` declaration at parse time instead of parsing the
+    /// DTD internal subset. Off by default. Useful for security-sensitive
+    /// consumers (SAML, XML-DSig) where DTDs are never legitimate. Chains with
+    /// other builder methods.
+    pub fn with_forbid_dtd(mut self, forbid: bool) -> Self {
+        self.forbid_dtd = forbid;
+        self
+    }
+
+    /// Reject `<!ENTITY>` declarations (general and parameter) inside a DTD,
+    /// while still allowing the rest of the internal subset (`<!ELEMENT>`,
+    /// `<!ATTLIST>`, `<!NOTATION>`). Off by default; implied when
+    /// [`with_forbid_dtd`](Self::with_forbid_dtd) rejects the whole DOCTYPE.
+    /// Chains with other builder methods.
+    pub fn with_forbid_entities(mut self, forbid: bool) -> Self {
+        self.forbid_entities = forbid;
         self
     }
 
@@ -140,6 +170,8 @@ impl Parser {
             root_id,
             &mut entities,
             &mut entity_budget,
+            self.forbid_dtd,
+            self.forbid_entities,
         )?;
 
         // Parse document element and trailing misc
@@ -1233,6 +1265,8 @@ fn parse_misc<'a>(
     parent: NodeId,
     entities: &mut EntityMap,
     entity_budget: &mut usize,
+    forbid_dtd: bool,
+    forbid_entities: bool,
 ) -> XmlResult<()> {
     loop {
         cursor.skip_whitespace();
@@ -1252,7 +1286,14 @@ fn parse_misc<'a>(
             doc.set_byte_end_pos(id, cursor.pos);
             doc.append_child_unchecked(parent, id);
         } else if cursor.starts_with("<!DOCTYPE") {
-            parse_doctype(cursor, doc, entities, entity_budget)?;
+            if forbid_dtd {
+                return Err(XmlError::parse(
+                    "DOCTYPE declarations are not allowed (forbid_dtd)",
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
+            parse_doctype(cursor, doc, entities, entity_budget, forbid_entities)?;
         } else {
             break;
         }
@@ -1270,6 +1311,7 @@ fn parse_doctype<'a>(
     doc: &mut Document<'a>,
     entities: &mut EntityMap,
     entity_budget: &mut usize,
+    forbid_entities: bool,
 ) -> XmlResult<()> {
     let start_pos = cursor.pos;
     cursor.expect("<!DOCTYPE")?;
@@ -1327,7 +1369,7 @@ fn parse_doctype<'a>(
     // Optional internal subset
     if cursor.peek() == Some('[') {
         cursor.advance_char();
-        parse_internal_subset(cursor, entities, entity_budget)?;
+        parse_internal_subset(cursor, entities, entity_budget, forbid_entities)?;
         cursor.expect("]")?;
         cursor.skip_whitespace();
     }
@@ -1424,6 +1466,7 @@ fn parse_internal_subset(
     cursor: &mut Cursor,
     entities: &mut EntityMap,
     entity_budget: &mut usize,
+    forbid_entities: bool,
 ) -> XmlResult<()> {
     loop {
         cursor.skip_whitespace();
@@ -1443,6 +1486,13 @@ fn parse_internal_subset(
         } else if cursor.starts_with("<!ATTLIST") {
             parse_attlist_decl(cursor, entities, entity_budget)?;
         } else if cursor.starts_with("<!ENTITY") {
+            if forbid_entities {
+                return Err(XmlError::parse(
+                    "Entity declarations are not allowed (forbid_entities)",
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
             parse_entity_decl(cursor, entities)?;
         } else if cursor.starts_with("<!NOTATION") {
             parse_notation_decl(cursor)?;
