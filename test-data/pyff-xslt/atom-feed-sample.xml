@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Local (non-pyFF) fixture: an EntitiesDescriptor aggregate carrying an
+     atom:entry extension, the shape atom.xsl needs to emit a non-empty Atom
+     feed. atom.xsl matches md:EntitiesDescriptor and copies each
+     EntityDescriptor's md:Extensions/atom:entry into an atom:feed. -->
+<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                       xmlns:atom="http://www.w3.org/2005/Atom"
+                       Name="urn:example:sample-aggregate">
+  <md:EntityDescriptor entityID="https://idp.example.com/saml2/idp/metadata.php">
+    <md:Extensions>
+      <atom:entry>
+        <atom:title>Example University</atom:title>
+        <atom:id>https://idp.example.com/saml2/idp/metadata.php</atom:id>
+        <atom:updated>2020-01-01T00:00:00Z</atom:updated>
+      </atom:entry>
+    </md:Extensions>
+    <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+      <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/saml2/idp/SSOService.php"/>
+    </md:IDPSSODescriptor>
+  </md:EntityDescriptor>
+</md:EntitiesDescriptor>
