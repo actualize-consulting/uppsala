@@ -27,14 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - XSLT transforms of large, wide documents are linear instead of quadratic.
-  Two O(width²) hot spots were removed: the XSLT match-pattern tester no longer
-  materializes every sibling to check membership (it tests the node locally and
-  only falls back to the full set for positional predicates), and
-  `dedup_document_order` sorts same-parent node-sets (the common axis/union case)
-  by local index instead of walking each node to the document root. A per-node
-  template-dispatch pre-filter also skips patterns that cannot match a node's
-  kind/name. Net effect: a 91 MB eduGAIN aggregate that previously did not
-  complete now transforms in a few seconds.
+  Several O(width²) hot spots were removed: the XSLT match-pattern tester no
+  longer materializes every sibling to check membership (it tests the node
+  locally and only falls back to the full set for positional predicates);
+  `prepare_xpath` now precomputes a per-node document-order index so node-set
+  deduplication (`dedup_document_order`) sorts by an O(1) key instead of walking
+  each node to the document root and re-indexing wide ancestor sibling lists on
+  every call (previously quadratic for relative paths like `name/text()`
+  evaluated once per sibling); and a per-node template-dispatch pre-filter skips
+  patterns that cannot match a node's kind/name. Net effect: a 91 MB eduGAIN
+  aggregate that previously did not complete now transforms in a few seconds
+  with every pyFF stylesheet (1–5 s each).
 
 ### Security
 

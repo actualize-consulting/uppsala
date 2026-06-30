@@ -388,6 +388,11 @@ pub struct Document<'a> {
     /// Attribute nodes for each element, keyed by element NodeId.
     /// These are virtual nodes used by XPath attribute axis traversal.
     pub(crate) attribute_nodes: HashMap<NodeId, Vec<NodeId>>,
+    /// Precomputed document-order position per node, indexed by `NodeId`.
+    /// Populated by [`Self::prepare_xpath`]; empty otherwise. Lets node-set
+    /// deduplication sort by an O(1) key instead of walking each node to the root
+    /// (which is quadratic over wide trees). Unreachable nodes get `u32::MAX`.
+    pub(crate) doc_order: Vec<u32>,
     /// Original input for lazy line/column computation from byte positions.
     pub(crate) input: &'a str,
 }
@@ -411,6 +416,7 @@ impl<'a> Document<'a> {
             xml_declaration: None,
             doctype: None,
             attribute_nodes: HashMap::new(),
+            doc_order: Vec::new(),
             input: "",
         }
     }
@@ -423,6 +429,7 @@ impl<'a> Document<'a> {
             xml_declaration: self.xml_declaration.map(|d| d.into_static()),
             doctype: self.doctype.map(|s| Cow::Owned(s.into_owned())),
             attribute_nodes: self.attribute_nodes,
+            doc_order: self.doc_order,
             input: "",
         }
     }
@@ -502,21 +509,70 @@ impl<'a> Document<'a> {
     /// Must be called before XPath evaluation if the document was parsed
     /// without attribute node construction (the default for performance).
     pub fn prepare_xpath(&mut self) {
-        if !self.attribute_nodes.is_empty() {
-            return; // Already prepared
+        if self.attribute_nodes.is_empty() {
+            let element_ids: Vec<NodeId> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| match &n.kind {
+                    NodeKind::Element(e) if !e.attributes.is_empty() => Some(NodeId(i)),
+                    _ => None,
+                })
+                .collect();
+            for elem_id in element_ids {
+                self.build_attribute_nodes(elem_id);
+            }
         }
-        let element_ids: Vec<NodeId> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, n)| match &n.kind {
-                NodeKind::Element(e) if !e.attributes.is_empty() => Some(NodeId(i)),
-                _ => None,
-            })
-            .collect();
-        for elem_id in element_ids {
-            self.build_attribute_nodes(elem_id);
+        if self.doc_order.is_empty() {
+            self.compute_doc_order();
         }
+    }
+
+    /// Assign each node its document-order position into `self.doc_order`, by a
+    /// preorder tree walk: an element, then its attribute nodes (in attribute
+    /// order), then its children (in document order) — matching XPath 1.0
+    /// document order. Must run after attribute nodes are built. Unreachable
+    /// nodes keep `u32::MAX`. O(n); used by node-set dedup to avoid per-call
+    /// ancestor re-indexing (see `dedup_document_order` in `xpath.rs`).
+    fn compute_doc_order(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut order = vec![u32::MAX; self.nodes.len()];
+        let mut counter: u32 = 0;
+        let mut stack: Vec<NodeId> = vec![self.root];
+        while let Some(n) = stack.pop() {
+            order[n.0] = counter;
+            counter = counter.wrapping_add(1);
+            if let Some(attrs) = self.attribute_nodes.get(&n) {
+                for &a in attrs {
+                    if let Some(slot) = order.get_mut(a.0) {
+                        *slot = counter;
+                        counter = counter.wrapping_add(1);
+                    }
+                }
+            }
+            // Push children in reverse document order so they pop in order.
+            let start = stack.len();
+            let mut child = self.nodes[n.0].first_child;
+            while let Some(cid) = child {
+                stack.push(cid);
+                child = self.nodes[cid.0].next_sibling;
+            }
+            stack[start..].reverse();
+        }
+        self.doc_order = order;
+    }
+
+    /// Whether the document-order index has been computed (`prepare_xpath`).
+    pub(crate) fn doc_order_ready(&self) -> bool {
+        !self.doc_order.is_empty()
+    }
+
+    /// The document-order position of `id` (`u32::MAX` if unreachable or out of
+    /// range). Only meaningful when [`Self::doc_order_ready`].
+    pub(crate) fn doc_order_at(&self, id: NodeId) -> u32 {
+        self.doc_order.get(id.0).copied().unwrap_or(u32::MAX)
     }
 
     /// Create a new element node (not yet attached to the tree).

@@ -2498,15 +2498,24 @@ fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeI
         return nodes; // nothing to order or dedup
     }
 
-    // Fast path: when every node shares one parent — overwhelmingly common, e.g.
-    // an axis step's result or a sibling union like `@*|node()` — relative
-    // document order is fully determined by each node's position *within that
-    // parent* (attributes, in attribute order, before children, in child order).
-    // Ordering by a local key avoids `document_order_key`'s walk to the document
-    // root, which re-indexes every ancestor's sibling list on each call. The
-    // latter is O(width) per call, so evaluating such a union once per sibling
-    // (as the XSLT identity transform does) is O(width^2); this keeps it linear
-    // by touching only the shared parent's lists.
+    // Best path: a precomputed document-order index (populated by
+    // `prepare_xpath`, so always present for XSLT). Sorting by its O(1) key
+    // handles every case — same-parent or spanning parents — without walking the
+    // tree. This is what keeps relative paths evaluated per node (e.g. an XSLT
+    // template testing `name/text()` on each of thousands of siblings) linear
+    // rather than O(width^2).
+    if doc.doc_order_ready() {
+        nodes.sort_by_cached_key(|&node| doc.doc_order_at(node));
+        nodes.dedup();
+        return nodes;
+    }
+
+    // Fast path (index not prepared): when every node shares one parent —
+    // overwhelmingly common, e.g. an axis step's result or a sibling union like
+    // `@*|node()` — relative document order is fully determined by each node's
+    // position *within that parent* (attributes, in attribute order, before
+    // children, in child order). Ordering by a local key avoids
+    // `document_order_key`'s walk to the document root.
     if let Some(parent) = doc.parent(nodes[0]) {
         if nodes[1..].iter().all(|&n| doc.parent(n) == Some(parent)) {
             let mut order = SiblingOrderIndex::default();
@@ -2516,10 +2525,10 @@ fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeI
         }
     }
 
-    // General path. A sibling-index memo turns each `position()` lookup from an
-    // O(siblings) scan into an amortized O(1) hash lookup. Without it, sorting a
-    // wide node-set is O(n^2) (each of n nodes re-scans its parent's child list),
-    // which is *uncharged* work that defeats the node-visit budget — a
+    // General fallback. A sibling-index memo turns each `position()` lookup from
+    // an O(siblings) scan into an amortized O(1) hash lookup. Without it, sorting
+    // a wide node-set is O(n^2) (each of n nodes re-scans its parent's child
+    // list), which is *uncharged* work that defeats the node-visit budget — a
     // disjoint `(/r/a) = (/r/b)` comparison would spend minutes inside dedup
     // before the comparison charge ever fires.
     let mut order = SiblingOrderIndex::default();
