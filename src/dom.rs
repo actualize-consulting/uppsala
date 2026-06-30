@@ -509,23 +509,28 @@ impl<'a> Document<'a> {
     /// Must be called before XPath evaluation if the document was parsed
     /// without attribute node construction (the default for performance).
     pub fn prepare_xpath(&mut self) {
-        if self.attribute_nodes.is_empty() {
-            let element_ids: Vec<NodeId> = self
-                .nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, n)| match &n.kind {
-                    NodeKind::Element(e) if !e.attributes.is_empty() => Some(NodeId(i)),
-                    _ => None,
-                })
-                .collect();
-            for elem_id in element_ids {
-                self.build_attribute_nodes(elem_id);
-            }
+        // Rebuild both caches from scratch on every call so a document mutated
+        // after an earlier `prepare_xpath()` can be re-prepared — guarding on
+        // "is the cache empty?" would make re-preparation a silent no-op and
+        // leave a stale document-order index, corrupting node-set ordering/dedup.
+        // Recomputation is O(n) and `prepare_xpath` is called once per document
+        // use, not on the parse hot path. (Re-preparation orphans the previously
+        // built virtual attribute nodes in `nodes`; they become unreachable in
+        // the index and are otherwise unreferenced.)
+        self.attribute_nodes.clear();
+        let element_ids: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| match &n.kind {
+                NodeKind::Element(e) if !e.attributes.is_empty() => Some(NodeId(i)),
+                _ => None,
+            })
+            .collect();
+        for elem_id in element_ids {
+            self.build_attribute_nodes(elem_id);
         }
-        if self.doc_order.is_empty() {
-            self.compute_doc_order();
-        }
+        self.compute_doc_order();
     }
 
     /// Assign each node its document-order position into `self.doc_order`, by a
@@ -2043,5 +2048,35 @@ struct IoWriteAdapter<'w> {
 impl<'w> fmt::Write for IoWriteAdapter<'w> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.inner.write_all(s.as_bytes()).map_err(|_| fmt::Error)
+    }
+}
+
+#[cfg(test)]
+mod dom_tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    /// `prepare_xpath()` rebuilds the document-order index on every call, so a
+    /// node appended after an earlier `prepare_xpath()` gets a valid position
+    /// once re-prepared (the cache is not a one-shot no-op).
+    #[test]
+    fn prepare_xpath_reindexes_after_mutation() {
+        let mut doc = Parser::new().parse("<r><a/></r>").unwrap();
+        doc.prepare_xpath();
+
+        // Append a new element; before re-preparation it has no order entry
+        // (the index Vec predates the node).
+        let r = doc.first_child(doc.root).unwrap();
+        let b = doc.create_element(QName::local("b"));
+        doc.append_child(r, b);
+        assert_eq!(doc.doc_order_at(b), u32::MAX, "new node not yet indexed");
+
+        // Re-preparing must refresh the index so the new node is ordered.
+        doc.prepare_xpath();
+        assert_ne!(
+            doc.doc_order_at(b),
+            u32::MAX,
+            "re-prepare did not reindex the appended node"
+        );
     }
 }

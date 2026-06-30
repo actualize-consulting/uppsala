@@ -1343,7 +1343,7 @@ impl<'a, 'b> Engine<'a, 'b> {
             Instruction::CopyOf { select } => self.execute_copy_of(select, focus, out)?,
             Instruction::Element { name, body } => {
                 let qname = self.eval_avt(name, focus)?;
-                let ns_decls = self.element_ns_decls(&qname);
+                let ns_decls = self.element_ns_decls(&qname)?;
                 let items = self.execute_sequence(body, focus)?;
                 let (attrs, children) = split_items(items);
                 out.push(ResultItem::Node(ResultNode::Element(ResultElement {
@@ -1544,14 +1544,25 @@ impl<'a, 'b> Engine<'a, 'b> {
 
     /// Compute namespace declarations for a result element built by
     /// `xsl:element` with a (possibly prefixed) computed name, resolving the
-    /// prefix against the stylesheet's namespace bindings.
-    fn element_ns_decls(&self, qname: &str) -> Vec<(Option<String>, String)> {
+    /// prefix against the stylesheet's namespace bindings. A prefixed name whose
+    /// prefix is not bound is an error — emitting it would produce output with an
+    /// unbound prefix (not well-formed XML).
+    fn element_ns_decls(&self, qname: &str) -> XmlResult<Vec<(Option<String>, String)>> {
         if let Some((prefix, _local)) = qname.split_once(':') {
-            if let Some(uri) = self.stylesheet.namespaces.get(prefix) {
-                return vec![(Some(prefix.to_string()), uri.clone())];
+            // The `xml` prefix is implicitly bound and is never declared.
+            if prefix == "xml" {
+                return Ok(Vec::new());
+            }
+            match self.stylesheet.namespaces.get(prefix) {
+                Some(uri) => return Ok(vec![(Some(prefix.to_string()), uri.clone())]),
+                None => {
+                    return Err(XmlError::xpath(format!(
+                        "xsl:element: prefix {prefix:?} in computed name {qname:?} is not bound to a namespace"
+                    )));
+                }
             }
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 
     /// Look up the raw (un-coerced) value of a variable in scope.
@@ -2273,6 +2284,18 @@ mod tests {
         let xml = r#"<r/>"#;
         let result = transform(xslt, xml).unwrap();
         assert_eq!(result, r#"<out>abc</out>"#);
+    }
+
+    /// `xsl:element` with a prefixed name whose prefix is not bound in the
+    /// stylesheet is a hard error, not silent unbound-prefix output.
+    #[test]
+    fn element_unbound_prefix_errors() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:template match="/"><xsl:element name="nope:thing"/></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+        assert!(transform(xslt, xml).is_err());
     }
 
     /// A literal result element's explicit namespace declarations (here `ex`,
