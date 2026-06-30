@@ -202,6 +202,36 @@ fn import_resolves_with_directory_base_path() {
     );
 }
 
+/// Regression: a `base_path` directory that does not exist must fail closed,
+/// not silently resolve `schemaLocation` against its (existing) parent.
+///
+/// The effective base directory is computed by reducing only a *known regular
+/// file* to its parent; a missing/unreadable path is kept as the directory so
+/// the canonicalize-or-reject guard fires. A `!is_dir()` test would instead
+/// treat the missing directory as a file and fall back to its parent, which may
+/// canonicalize successfully and re-open the contained-resolution hole.
+#[test]
+fn missing_base_directory_fails_closed() {
+    let parent = mkdir_unique("missing-base-parent");
+    let missing = parent.join("does-not-exist");
+
+    let schema = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:agg" version="1.0">
+  <xs:import namespace="urn:test:inner" schemaLocation="inner.xsd"/>
+</xs:schema>"#;
+
+    let schema_doc = parse(schema).expect("parse schema");
+    let built = XsdValidator::from_schema_with_base_path(&schema_doc, Some(missing.as_path()));
+    fs::remove_dir_all(&parent).ok();
+
+    assert!(
+        built.is_err(),
+        "a missing base directory must fail closed (canonicalize error), not \
+         resolve imports against its parent",
+    );
+}
+
 /// Regression: `<xs:attribute ref="foreign:attr"/>` across an `xs:import`
 /// boundary. Before the fix, the prefix was stripped and the lookup keyed
 /// against the outer schema's targetNamespace, so the imported global
