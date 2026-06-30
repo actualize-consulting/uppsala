@@ -103,6 +103,8 @@
 pub mod dom;
 /// Error types: [`XmlError`], [`XmlResult`], and per-domain error structs.
 pub mod error;
+
+mod exslt;
 /// Namespace prefix resolution with scope stack.
 pub mod namespace;
 /// XML 1.0 (Fifth Edition) recursive-descent parser.
@@ -117,6 +119,8 @@ pub mod xpath;
 pub mod xsd;
 /// XSD regular expression engine for pattern facets.
 pub mod xsd_regex;
+/// XSLT 1.0 transformation engine.
+pub mod xslt;
 
 pub use dom::{
     Attribute, ChildrenIter, Document, Element, NodeId, NodeKind, ProcessingInstruction, QName,
@@ -132,6 +136,7 @@ pub use writer::XmlWriter;
 pub use xpath::{XPathEvaluator, XPathValue};
 pub use xsd::{XsdValidator, XSI_NAMESPACE, XS_NAMESPACE};
 pub use xsd_regex::XsdRegex;
+pub use xslt::{Stylesheet, DEFAULT_MAX_XSLT_DEPTH, XSLT_NAMESPACE};
 
 /// Parse an XML string into a Document.
 pub fn parse(input: &str) -> XmlResult<Document<'_>> {
@@ -152,6 +157,33 @@ pub fn parse_bytes(input: &[u8]) -> XmlResult<Document<'static>> {
     let text = decode_xml_bytes(input)?;
     let doc = Parser::new().parse(&text)?;
     Ok(doc.into_static())
+}
+
+/// Transform an XML document with an XSLT 1.0 stylesheet, returning the
+/// serialized result.
+///
+/// This is the one-shot convenience entry point: it parses both the stylesheet
+/// and the source, prepares the source for XPath evaluation, compiles the
+/// stylesheet, and applies it. To transform many documents with one stylesheet,
+/// compile once with [`Stylesheet::compile`] and reuse it.
+///
+/// # Example
+///
+/// ```
+/// let xslt = r#"<xsl:stylesheet version="1.0"
+///     xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+///   <xsl:output method="xml" omit-xml-declaration="yes"/>
+///   <xsl:template match="/"><out><xsl:value-of select="/a"/></out></xsl:template>
+/// </xsl:stylesheet>"#;
+/// let out = uppsala::transform(xslt, "<a>hi</a>").unwrap();
+/// assert_eq!(out, "<out>hi</out>");
+/// ```
+pub fn transform(xslt: &str, xml: &str) -> XmlResult<String> {
+    let style_doc = Parser::new().parse(xslt)?;
+    let stylesheet = Stylesheet::compile(&style_doc)?;
+    let mut source = Parser::new().parse(xml)?;
+    source.prepare_xpath();
+    stylesheet.transform(&source)
 }
 
 /// Decode raw XML bytes to a String, auto-detecting encoding.

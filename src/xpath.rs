@@ -113,7 +113,7 @@ impl XPathValue {
 }
 
 /// Get the string-value of a node per XPath 1.0 rules.
-fn string_value_of_node(doc: &Document<'_>, id: NodeId) -> String {
+pub(crate) fn string_value_of_node(doc: &Document<'_>, id: NodeId) -> String {
     match doc.node_kind(id) {
         Some(NodeKind::Document) | Some(NodeKind::Element(_)) => doc.text_content_deep(id),
         Some(NodeKind::Text(t)) => t.to_string(),
@@ -124,6 +124,65 @@ fn string_value_of_node(doc: &Document<'_>, id: NodeId) -> String {
         }
         Some(NodeKind::Attribute(_, v)) => v.to_string(),
         None => String::new(),
+    }
+}
+
+/// Resolves XPath variable references (`$name`) to values.
+///
+/// Plain XPath has no variables, so [`XPathEvaluator`] uses a no-op resolver
+/// that leaves every reference undefined. A host language layered on top of the
+/// engine — notably the XSLT transformer (`crate::xslt`) — supplies a real
+/// implementation backed by its variable scope stack.
+pub trait VariableResolver {
+    /// Resolve `$prefix:local` (or `$local` when `prefix` is `None`) to a value,
+    /// or `None` if no such variable is in scope.
+    fn resolve_variable(&self, prefix: Option<&str>, local: &str) -> Option<XPathValue>;
+}
+
+/// Resolves XPath function calls the core engine does not implement itself.
+///
+/// The built-in XPath 1.0 functions are dispatched directly; any other call
+/// (e.g. an EXSLT extension such as `date:date-time()`) falls through to this
+/// hook before erroring. Arguments are evaluated to values before the call.
+pub trait FunctionResolver {
+    /// Resolve `prefix:local(args)` to a value. Return `None` to fall through to
+    /// the standard "unknown function" error.
+    fn resolve_function(
+        &self,
+        prefix: Option<&str>,
+        local: &str,
+        args: &[XPathValue],
+    ) -> Option<XmlResult<XPathValue>>;
+}
+
+/// A [`VariableResolver`] that defines no variables (the plain-XPath default).
+struct NoVariables;
+impl VariableResolver for NoVariables {
+    fn resolve_variable(&self, _prefix: Option<&str>, _local: &str) -> Option<XPathValue> {
+        None
+    }
+}
+
+/// A [`FunctionResolver`] that resolves no extension functions (the plain-XPath
+/// default).
+struct NoFunctions;
+impl FunctionResolver for NoFunctions {
+    fn resolve_function(
+        &self,
+        _prefix: Option<&str>,
+        _local: &str,
+        _args: &[XPathValue],
+    ) -> Option<XmlResult<XPathValue>> {
+        None
+    }
+}
+
+/// Split a (possibly prefixed) QName into `(Some(prefix), local)` or
+/// `(None, local)`. Only the first colon is significant.
+fn split_qname(name: &str) -> (Option<&str>, &str) {
+    match name.split_once(':') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, name),
     }
 }
 
@@ -181,10 +240,13 @@ impl XPathEvaluator {
         let budget = EvalBudget::new(self.max_node_visits);
         let ctx = EvalContext {
             node: context,
+            current: context,
             position: 1,
             size: 1,
             doc,
             namespaces: &self.namespaces,
+            vars: &NoVariables,
+            funcs: &NoFunctions,
             budget: &budget,
         };
         evaluate_expr(&ast, &ctx)
@@ -211,6 +273,507 @@ impl Default for XPathEvaluator {
     }
 }
 
+// ─── Compiled-expression API (for the XSLT layer) ─────────
+
+/// A parsed XPath expression, compiled once and evaluable many times against
+/// different contexts.
+///
+/// The public [`XPathEvaluator::evaluate`] re-tokenizes and re-parses on every
+/// call. The XSLT transformer (`crate::xslt`) evaluates the same `select` /
+/// `test` / pattern / AVT expression once per node, so it compiles via this type
+/// and drives evaluation through [`eval_compiled`] with a per-node context
+/// (current node, position/size, namespaces, variable + function resolvers).
+pub(crate) struct CompiledXPath {
+    ast: Expr,
+}
+
+impl CompiledXPath {
+    /// Tokenize and parse `expr` with the given nesting cap. Errors on a parse
+    /// failure or trailing tokens.
+    pub(crate) fn compile(expr: &str, max_depth: u32) -> XmlResult<Self> {
+        let tokens = tokenize(expr)?;
+        let mut parser = XPathParser::new(&tokens, max_depth);
+        let ast = parser.parse_expr()?;
+        if parser.peek().is_some() {
+            return Err(XmlError::xpath(format!(
+                "Unexpected trailing tokens in XPath expression: {:?}",
+                expr
+            )));
+        }
+        Ok(CompiledXPath { ast })
+    }
+
+    /// If this expression is exactly a bare variable reference (`$name`), return
+    /// its `(prefix, local)`. Used by XSLT `xsl:copy-of` to copy a result-tree
+    /// fragment variable directly rather than coercing it to a string.
+    pub(crate) fn as_variable(&self) -> Option<(Option<&str>, &str)> {
+        match &self.ast {
+            Expr::Variable(prefix, local) => Some((prefix.as_deref(), local.as_str())),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate a [`CompiledXPath`] against a fully-specified context. The entry
+/// point all XSLT expression evaluation flows through.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_compiled(
+    compiled: &CompiledXPath,
+    doc: &Document<'_>,
+    context: NodeId,
+    current: NodeId,
+    position: usize,
+    size: usize,
+    namespaces: &HashMap<String, String>,
+    vars: &dyn VariableResolver,
+    funcs: &dyn FunctionResolver,
+    max_node_visits: usize,
+) -> XmlResult<XPathValue> {
+    let budget = EvalBudget::new(max_node_visits);
+    let ctx = EvalContext {
+        node: context,
+        current,
+        position,
+        size,
+        doc,
+        namespaces,
+        vars,
+        funcs,
+        budget: &budget,
+    };
+    evaluate_expr(&compiled.ast, &ctx)
+}
+
+// ─── XSLT match patterns ──────────────────────────────────
+
+/// A compiled XSLT match pattern: a union of location-path alternatives.
+///
+/// XSLT patterns are a restricted XPath subset, evaluated as a membership test
+/// ("does node N match pattern P?") rather than a forward selection. The match
+/// reuses [`apply_step`] so predicates and `position()`/`last()` behave exactly
+/// as in selection. Each union alternative carries its own default priority
+/// (XSLT 1.0 §5.5), and [`CompiledPattern::matches`] returns the highest
+/// priority among the matching alternatives.
+pub(crate) struct CompiledPattern {
+    alts: Vec<PatternAlt>,
+}
+
+struct PatternAlt {
+    /// True for a pattern rooted at `/` or `//` (anchored at the document root).
+    absolute: bool,
+    /// Location steps, outermost-first. A `//` is represented (as in the XPath
+    /// parser) by an injected `descendant-or-self::node()` step.
+    steps: Vec<Step>,
+    /// XSLT default priority for this alternative.
+    priority: f64,
+}
+
+impl CompiledPattern {
+    /// Compile a pattern string (e.g. `"md:EntityDescriptor"`, `"a/b"`,
+    /// `"@*|text()"`). Reuses the XPath tokenizer/parser, then flattens unions
+    /// into alternatives.
+    pub(crate) fn compile(pattern: &str, max_depth: u32) -> XmlResult<Self> {
+        let tokens = tokenize(pattern)?;
+        let mut parser = XPathParser::new(&tokens, max_depth);
+        let expr = parser.parse_expr()?;
+        if parser.peek().is_some() {
+            return Err(XmlError::xpath(format!(
+                "Unsupported XSLT match pattern: {:?}",
+                pattern
+            )));
+        }
+        let mut alts = Vec::new();
+        flatten_pattern(expr, &mut alts)?;
+        Ok(CompiledPattern { alts })
+    }
+
+    /// Test whether `node` matches the pattern. Returns the default priority of
+    /// the highest-priority matching alternative, or `None` if no alternative
+    /// matches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches(
+        &self,
+        doc: &Document<'_>,
+        node: NodeId,
+        current: NodeId,
+        namespaces: &HashMap<String, String>,
+        vars: &dyn VariableResolver,
+        funcs: &dyn FunctionResolver,
+        max_node_visits: usize,
+    ) -> Option<f64> {
+        let budget = EvalBudget::new(max_node_visits);
+        let ctx = EvalContext {
+            node,
+            current,
+            position: 1,
+            size: 1,
+            doc,
+            namespaces,
+            vars,
+            funcs,
+            budget: &budget,
+        };
+        let mut best: Option<f64> = None;
+        for alt in &self.alts {
+            if alt_matches(alt, node, &ctx).unwrap_or(false) {
+                best = Some(best.map_or(alt.priority, |b| b.max(alt.priority)));
+            }
+        }
+        best
+    }
+
+    /// Precompute a cheap dispatch descriptor: the set of node kinds/names this
+    /// pattern could possibly match. Callers (XSLT template dispatch) use it to
+    /// skip the full [`Self::matches`] for nodes the pattern can never match,
+    /// turning per-node "test every template" into "test only applicable
+    /// templates". Conservative: anything it cannot statically classify falls
+    /// into `any_node` so it is always tested (never a false negative).
+    pub(crate) fn dispatch(&self) -> PatternDispatch {
+        let mut d = PatternDispatch::default();
+        for alt in &self.alts {
+            classify_alt(alt, &mut d);
+        }
+        d
+    }
+}
+
+/// A coarse, precomputed summary of what node kinds/names a [`CompiledPattern`]
+/// can match. See [`CompiledPattern::dispatch`].
+#[derive(Default)]
+pub(crate) struct PatternDispatch {
+    /// Matches any node kind (e.g. a `node()` test or an unclassifiable shape).
+    any_node: bool,
+    /// Matches any element (a `*`/prefix-wildcard child step).
+    any_element: bool,
+    /// Matches any attribute (a `@*` step).
+    any_attribute: bool,
+    text: bool,
+    comment: bool,
+    pi: bool,
+    document: bool,
+    /// Specific element local-names matched by name.
+    elem_names: Vec<String>,
+    /// Specific attribute local-names matched by name.
+    attr_names: Vec<String>,
+}
+
+impl PatternDispatch {
+    /// Could the owning pattern match `node`? A `false` is a guarantee the
+    /// pattern does not match (so the expensive check can be skipped); a `true`
+    /// means "test it properly".
+    pub(crate) fn could_match(&self, doc: &Document<'_>, node: NodeId) -> bool {
+        if self.any_node {
+            return true;
+        }
+        match doc.node_kind(node) {
+            Some(NodeKind::Element(e)) => {
+                self.any_element
+                    || self
+                        .elem_names
+                        .iter()
+                        .any(|n| n.as_str() == e.name.local_name.as_ref())
+            }
+            Some(NodeKind::Attribute(q, _)) => {
+                self.any_attribute
+                    || self
+                        .attr_names
+                        .iter()
+                        .any(|n| n.as_str() == q.local_name.as_ref())
+            }
+            Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => self.text,
+            Some(NodeKind::Comment(_)) => self.comment,
+            Some(NodeKind::ProcessingInstruction(_)) => self.pi,
+            Some(NodeKind::Document) => self.document,
+            None => false,
+        }
+    }
+}
+
+/// Fold one pattern alternative's matchable node kinds/names into `d`.
+fn classify_alt(alt: &PatternAlt, d: &mut PatternDispatch) {
+    let last = match alt.steps.last() {
+        // The `/` pattern (empty steps) matches only the document root.
+        None => {
+            d.document = true;
+            return;
+        }
+        Some(s) => s,
+    };
+    // A trailing injected `descendant-or-self::node()` (pattern ending in `//`)
+    // is not a real node test — be conservative.
+    if matches!(last.axis, Axis::DescendantOrSelf)
+        && matches!(&last.node_test, NodeTest::NodeType(nt) if nt == "node")
+    {
+        d.any_node = true;
+        return;
+    }
+    match last.axis {
+        Axis::Attribute => match &last.node_test {
+            NodeTest::Name(n) => d.attr_names.push(n.clone()),
+            NodeTest::PrefixedName(_, n) => d.attr_names.push(n.clone()),
+            NodeTest::Wildcard | NodeTest::PrefixWildcard(_) => d.any_attribute = true,
+            // text()/comment() on the attribute axis is nonsensical; be safe.
+            NodeTest::NodeType(_) => d.any_node = true,
+        },
+        Axis::Child => match &last.node_test {
+            NodeTest::Name(n) => d.elem_names.push(n.clone()),
+            NodeTest::PrefixedName(_, n) => d.elem_names.push(n.clone()),
+            NodeTest::Wildcard | NodeTest::PrefixWildcard(_) => d.any_element = true,
+            NodeTest::NodeType(nt) => match nt.as_str() {
+                "text" => d.text = true,
+                "comment" => d.comment = true,
+                "processing-instruction" => d.pi = true,
+                _ => d.any_node = true, // "node" or unknown
+            },
+        },
+        // Any other axis in a pattern step is unusual; test it always.
+        _ => d.any_node = true,
+    }
+}
+
+/// Flatten a parsed pattern expression into union alternatives. Only path
+/// expressions (and unions of them) are valid patterns.
+fn flatten_pattern(expr: Expr, alts: &mut Vec<PatternAlt>) -> XmlResult<()> {
+    match expr {
+        Expr::Union(l, r) => {
+            flatten_pattern(*l, alts)?;
+            flatten_pattern(*r, alts)?;
+            Ok(())
+        }
+        Expr::Path(steps) => {
+            let priority = pattern_priority(&steps);
+            alts.push(PatternAlt {
+                absolute: false,
+                steps,
+                priority,
+            });
+            Ok(())
+        }
+        Expr::AbsolutePath(steps) => {
+            let priority = if steps.is_empty() {
+                0.5 // the "/" pattern
+            } else {
+                pattern_priority(&steps)
+            };
+            alts.push(PatternAlt {
+                absolute: true,
+                steps,
+                priority,
+            });
+            Ok(())
+        }
+        _ => Err(XmlError::xpath("Unsupported XSLT match pattern shape")),
+    }
+}
+
+/// XSLT 1.0 default priority (§5.5) for one pattern alternative, computed from
+/// its last (and only significant) step.
+fn pattern_priority(steps: &[Step]) -> f64 {
+    // Count "real" steps (a `//` injects a descendant-or-self::node() step that
+    // does not count toward multi-step complexity for priority purposes).
+    let real: Vec<&Step> = steps
+        .iter()
+        .filter(|s| {
+            !(matches!(s.axis, Axis::DescendantOrSelf)
+                && matches!(&s.node_test, NodeTest::NodeType(nt) if nt == "node"))
+        })
+        .collect();
+    let last = match real.last() {
+        Some(s) => *s,
+        None => return 0.5,
+    };
+    // Multiple steps, or any predicate, → 0.5.
+    if real.len() > 1 || !last.predicates.is_empty() {
+        return 0.5;
+    }
+    match &last.node_test {
+        NodeTest::Name(_) | NodeTest::PrefixedName(_, _) => 0.0,
+        NodeTest::PrefixWildcard(_) => -0.25,
+        NodeTest::Wildcard => -0.5,
+        NodeTest::NodeType(_) => -0.5,
+    }
+}
+
+/// Does `node` match a single pattern alternative?
+fn alt_matches(alt: &PatternAlt, node: NodeId, ctx: &EvalContext) -> XmlResult<bool> {
+    if alt.steps.is_empty() {
+        // The "/" pattern matches only the document root.
+        return Ok(alt.absolute && matches!(ctx.doc.node_kind(node), Some(NodeKind::Document)));
+    }
+    matches_steps(&alt.steps, node, alt.absolute, ctx)
+}
+
+/// Match `node` against `steps` (outermost-first) from the right, walking up the
+/// tree. `absolute` requires the outermost step to select from the document
+/// root.
+fn matches_steps(
+    steps: &[Step],
+    node: NodeId,
+    absolute: bool,
+    ctx: &EvalContext,
+) -> XmlResult<bool> {
+    let (last, prefix) = match steps.split_last() {
+        Some(v) => v,
+        None => return Ok(true),
+    };
+
+    // A `//` connector: the injected descendant-or-self::node() step. The prefix
+    // must match `node` itself or any ancestor.
+    if matches!(last.axis, Axis::DescendantOrSelf)
+        && matches!(&last.node_test, NodeTest::NodeType(nt) if nt == "node")
+    {
+        if prefix.is_empty() {
+            // Leading `//` — anchored at the root, matches anything in the tree.
+            return Ok(true);
+        }
+        let mut cur = Some(node);
+        while let Some(c) = cur {
+            if matches_steps(prefix, c, absolute, ctx)? {
+                return Ok(true);
+            }
+            cur = ctx.doc.parent(c);
+        }
+        return Ok(false);
+    }
+
+    // A normal child/attribute step: `node` must be selected by `last` from its
+    // parent.
+    let parent = match ctx.doc.parent(node) {
+        Some(p) => p,
+        None => return Ok(false), // no parent to select `node` from
+    };
+    // Membership in `apply_step(last, [parent])` requires `node` to (a) be on the
+    // step's axis, (b) pass the node-test, and (c) survive the predicates. (a)
+    // and (b) are *local* properties of `node` — `parent == doc.parent(node)`
+    // guarantees `node` is a child (non-attribute) or attribute of `parent`, so
+    // we can check them directly. Doing so first avoids materializing all of
+    // `parent`'s children just to discover `node` is the wrong kind: the naive
+    // `apply_step` + `contains` is O(siblings) per call, making
+    // `best_matching_template` O(width^2) over a wide sibling list (e.g. the
+    // thousands of `EntityDescriptor`s in a SAML aggregate, each tested against
+    // every template). For the child/attribute axes we therefore short-circuit
+    // on the local checks and only fall back to the sibling-materializing path
+    // when the node-test passed *and* predicates remain (which may be positional
+    // and so need the full set for `position()`/`last()`).
+    if matches!(last.axis, Axis::Child | Axis::Attribute) {
+        let is_attr = matches!(ctx.doc.node_kind(node), Some(NodeKind::Attribute(_, _)));
+        let on_axis = match last.axis {
+            Axis::Attribute => is_attr,
+            _ => !is_attr, // Axis::Child
+        };
+        if !on_axis || !matches_node_test(&last.node_test, node, ctx.doc, ctx.namespaces) {
+            return Ok(false);
+        }
+        if !last.predicates.is_empty() {
+            if last.predicates.iter().all(predicate_is_per_node) {
+                // Every predicate is a position-independent boolean, so a node's
+                // membership depends only on itself: evaluate each on `node`
+                // alone (position 1, size 1) instead of materializing every
+                // sibling. This keeps predicate patterns like
+                // `text()[normalize-space(.)='']` linear even under wide mixed
+                // content (e.g. the whitespace text nodes between thousands of
+                // top-level elements in a SAML aggregate).
+                let pred_ctx = EvalContext {
+                    node,
+                    current: ctx.current,
+                    position: 1,
+                    size: 1,
+                    doc: ctx.doc,
+                    namespaces: ctx.namespaces,
+                    vars: ctx.vars,
+                    funcs: ctx.funcs,
+                    budget: ctx.budget,
+                };
+                for pred in &last.predicates {
+                    ctx.budget.charge(1)?;
+                    if !evaluate_expr(pred, &pred_ctx)?.to_boolean() {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                // A positional predicate (`[2]`, `position()`, `last()`) needs the
+                // full sibling set for correct numbering.
+                let selected = apply_step(last, &[parent], ctx)?;
+                if !selected.contains(&node) {
+                    return Ok(false);
+                }
+            }
+        }
+    } else {
+        // Unusual axis in a pattern step: fall back to the general selection.
+        let selected = apply_step(last, &[parent], ctx)?;
+        if !selected.contains(&node) {
+            return Ok(false);
+        }
+    }
+
+    if prefix.is_empty() {
+        // Outermost step matched. For an absolute pattern, the node it was
+        // selected from must be the document root.
+        return Ok(if absolute {
+            matches!(ctx.doc.node_kind(parent), Some(NodeKind::Document))
+        } else {
+            true
+        });
+    }
+    matches_steps(prefix, parent, absolute, ctx)
+}
+
+/// Whether a pattern-step predicate can be evaluated independently per node
+/// (singleton context), i.e. it is a position-independent boolean. Conservative:
+/// returns `true` only for expressions whose result is *definitely* boolean
+/// (comparisons, `and`/`or`, and boolean-returning core functions) and that
+/// contain no `position()`/`last()` call. Numeric predicates (`[2]`) and anything
+/// uncertain fall back to the full-context selection path.
+fn predicate_is_per_node(expr: &Expr) -> bool {
+    let boolean_typed = match expr {
+        Expr::Eq(..)
+        | Expr::NotEq(..)
+        | Expr::Lt(..)
+        | Expr::Gt(..)
+        | Expr::LtEq(..)
+        | Expr::GtEq(..)
+        | Expr::And(..)
+        | Expr::Or(..) => true,
+        Expr::FunctionCall(name, _) => matches!(
+            name.as_str(),
+            "not" | "true" | "false" | "boolean" | "contains" | "starts-with" | "lang"
+        ),
+        _ => false,
+    };
+    boolean_typed && !expr_uses_position_or_last(expr)
+}
+
+/// Recursively test whether an expression references `position()` or `last()`
+/// anywhere (including nested paths/predicates). Used conservatively: a match
+/// here forces the full-context predicate path.
+fn expr_uses_position_or_last(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            name == "position" || name == "last" || args.iter().any(expr_uses_position_or_last)
+        }
+        Expr::Path(steps) | Expr::AbsolutePath(steps) => steps
+            .iter()
+            .any(|s| s.predicates.iter().any(expr_uses_position_or_last)),
+        Expr::Union(a, b)
+        | Expr::Or(a, b)
+        | Expr::And(a, b)
+        | Expr::Eq(a, b)
+        | Expr::NotEq(a, b)
+        | Expr::Lt(a, b)
+        | Expr::Gt(a, b)
+        | Expr::LtEq(a, b)
+        | Expr::GtEq(a, b)
+        | Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::Div(a, b)
+        | Expr::Mod(a, b) => expr_uses_position_or_last(a) || expr_uses_position_or_last(b),
+        Expr::Negate(a) => expr_uses_position_or_last(a),
+        Expr::StringLiteral(_) | Expr::NumberLiteral(_) | Expr::Variable(..) => false,
+    }
+}
+
 // ─── XPath Tokenizer ──────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +788,8 @@ enum Token {
     // Literals
     StringLiteral(String),
     Number(f64),
+    // Variable reference: ($prefix, local). `None` prefix for unprefixed names.
+    Variable(Option<String>, String),
     // Operators
     Slash,
     DoubleSlash,
@@ -298,6 +863,34 @@ fn tokenize(expr: &str) -> XmlResult<Vec<Token>> {
             '@' => {
                 tokens.push(Token::At);
                 i += 1;
+            }
+            '$' => {
+                // Variable reference: `$name` or `$prefix:local`.
+                i += 1;
+                if i >= chars.len() || !is_xpath_name_start(chars[i]) {
+                    return Err(XmlError::xpath("Expected variable name after '$'"));
+                }
+                let start = i;
+                while i < chars.len() && is_xpath_name_char(chars[i]) {
+                    i += 1;
+                }
+                let first: String = chars[start..i].iter().collect();
+                // Optional `:local` (a single colon, not the `::` axis separator).
+                if i + 1 < chars.len()
+                    && chars[i] == ':'
+                    && chars[i + 1] != ':'
+                    && is_xpath_name_start(chars[i + 1])
+                {
+                    i += 1; // consume ':'
+                    let local_start = i;
+                    while i < chars.len() && is_xpath_name_char(chars[i]) {
+                        i += 1;
+                    }
+                    let local: String = chars[local_start..i].iter().collect();
+                    tokens.push(Token::Variable(Some(first), local));
+                } else {
+                    tokens.push(Token::Variable(None, first));
+                }
             }
             '*' => {
                 tokens.push(Token::Star);
@@ -436,7 +1029,19 @@ fn tokenize(expr: &str) -> XmlResult<Vec<Token>> {
                             i += 1;
                         }
                         let local: String = chars[local_start..i].iter().collect();
-                        tokens.push(Token::PrefixedName(prefix, local));
+                        // A prefixed name immediately followed by `(` is a
+                        // function call (e.g. an extension function like
+                        // `date:date-time()`), not a node test. Carry the full
+                        // qualified name so the resolver can split it.
+                        let mut k = i;
+                        while k < chars.len() && chars[k].is_whitespace() {
+                            k += 1;
+                        }
+                        if k < chars.len() && chars[k] == '(' {
+                            tokens.push(Token::FunctionName(format!("{}:{}", prefix, local)));
+                        } else {
+                            tokens.push(Token::PrefixedName(prefix, local));
+                        }
                     }
                 } else {
                     // Check for keyword operators
@@ -497,6 +1102,8 @@ enum Expr {
     // Literals
     StringLiteral(String),
     NumberLiteral(f64),
+    // Variable reference: (prefix, local). `None` prefix for unprefixed names.
+    Variable(Option<String>, String),
     // Function call
     FunctionCall(String, Vec<Expr>),
 }
@@ -828,6 +1435,12 @@ impl<'a> XPathParser<'a> {
                 self.advance();
                 Ok(Expr::StringLiteral(s))
             }
+            Some(Token::Variable(prefix, local)) => {
+                let prefix = prefix.clone();
+                let local = local.clone();
+                self.advance();
+                Ok(Expr::Variable(prefix, local))
+            }
             Some(Token::FunctionName(_)) => self.parse_function_call(),
             Some(Token::LParen) => {
                 self.advance();
@@ -1002,10 +1615,18 @@ fn parse_axis_name(name: &str) -> XmlResult<Axis> {
 
 struct EvalContext<'a, 'b> {
     node: NodeId,
+    /// The XSLT "current node" (the node `current()` returns). For plain XPath
+    /// this equals `node`; inside a predicate it stays fixed at the node the
+    /// step is being evaluated against while `node` walks the candidate list.
+    current: NodeId,
     position: usize,
     size: usize,
     doc: &'a Document<'b>,
     namespaces: &'a HashMap<String, String>,
+    /// Resolver for `$variable` references (XSLT scope; no-op for plain XPath).
+    vars: &'a dyn VariableResolver,
+    /// Resolver for non-core function calls (XSLT/EXSLT; no-op for plain XPath).
+    funcs: &'a dyn FunctionResolver,
     budget: &'a EvalBudget,
 }
 
@@ -1149,6 +1770,18 @@ fn evaluate_expr(expr: &Expr, ctx: &EvalContext) -> XmlResult<XPathValue> {
         }
         Expr::StringLiteral(s) => Ok(XPathValue::String(s.clone())),
         Expr::NumberLiteral(n) => Ok(XPathValue::Number(*n)),
+        Expr::Variable(prefix, local) => {
+            match ctx.vars.resolve_variable(prefix.as_deref(), local) {
+                Some(v) => Ok(v),
+                None => {
+                    let name = match prefix {
+                        Some(p) => format!("{}:{}", p, local),
+                        None => local.clone(),
+                    };
+                    Err(XmlError::xpath(format!("Undefined variable: ${}", name)))
+                }
+            }
+        }
         Expr::FunctionCall(name, args) => evaluate_function(name, args, ctx),
     }
 }
@@ -1266,10 +1899,13 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
     for (i, &node) in nodes.iter().enumerate() {
         let pred_ctx = EvalContext {
             node,
+            current: ctx.current,
             position: i + 1,
             size,
             doc: ctx.doc,
             namespaces: ctx.namespaces,
+            vars: ctx.vars,
+            funcs: ctx.funcs,
             budget: ctx.budget,
         };
         let val = evaluate_expr(pred, &pred_ctx)?;
@@ -1503,6 +2139,24 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
     match name {
         "last" => Ok(XPathValue::Number(ctx.size as f64)),
         "position" => Ok(XPathValue::Number(ctx.position as f64)),
+        // XSLT `current()` — the node the outermost expression is being
+        // evaluated against (distinct from the predicate context node). For
+        // plain XPath this equals the context node.
+        "current" => {
+            if !args.is_empty() {
+                return Err(XmlError::xpath("current() takes no arguments"));
+            }
+            Ok(XPathValue::NodeSet(vec![ctx.current]))
+        }
+        "lang" => {
+            if args.len() != 1 {
+                return Err(XmlError::xpath("lang() takes exactly 1 argument"));
+            }
+            let target = evaluate_expr(&args[0], ctx)?.to_string_value(ctx.doc);
+            Ok(XPathValue::Boolean(node_lang_matches(
+                ctx.doc, ctx.node, &target,
+            )))
+        }
         "count" => {
             if args.len() != 1 {
                 return Err(XmlError::xpath("count() takes exactly 1 argument"));
@@ -1767,8 +2421,45 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
             collect_elements_with_id(ctx.doc, ctx.doc.root(), &ids, &mut result, ctx.budget)?;
             Ok(XPathValue::NodeSet(result))
         }
-        _ => Err(XmlError::xpath(format!("Unknown function: {}()", name))),
+        _ => {
+            // Not a core XPath 1.0 function. Evaluate the arguments and consult
+            // the injected resolver (XSLT/EXSLT extension functions); fall back
+            // to an error if it declines.
+            let (prefix, local) = split_qname(name);
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(evaluate_expr(a, ctx)?);
+            }
+            match ctx.funcs.resolve_function(prefix, local, &arg_vals) {
+                Some(result) => result,
+                None => Err(XmlError::xpath(format!("Unknown function: {}()", name))),
+            }
+        }
     }
+}
+
+/// Implements XPath `lang(string)`: true if the language of the context node
+/// (per the nearest `xml:lang` in scope) is `target` or a sub-language of it.
+fn node_lang_matches(doc: &Document<'_>, node: NodeId, target: &str) -> bool {
+    // Walk ancestor-or-self looking for an `xml:lang` attribute.
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let Some(NodeKind::Element(e)) = doc.node_kind(n) {
+            for attr in &e.attributes {
+                let is_xml_lang = attr.name.local_name.as_ref() == "lang"
+                    && attr.name.prefix.as_deref() == Some("xml");
+                if is_xml_lang {
+                    let lang = attr.value.as_ref();
+                    let t = target.to_ascii_lowercase();
+                    let l = lang.to_ascii_lowercase();
+                    // Match the full tag or a `lang-...` subtag prefix.
+                    return l == t || l.strip_prefix(&t).is_some_and(|r| r.starts_with('-'));
+                }
+            }
+        }
+        cur = doc.parent(n);
+    }
+    false
 }
 
 fn collect_elements_with_id(
@@ -1803,9 +2494,31 @@ fn collect_elements_with_id(
 
 /// Remove duplicate NodeIds and return them in the document's current tree order.
 fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeId> {
-    // A sibling-index memo turns each `position()` lookup from an O(siblings)
-    // scan into an amortized O(1) hash lookup. Without it, sorting a wide
-    // node-set is O(n^2) (each of n nodes re-scans its parent's child list),
+    if nodes.len() <= 1 {
+        return nodes; // nothing to order or dedup
+    }
+
+    // Fast path: when every node shares one parent — overwhelmingly common, e.g.
+    // an axis step's result or a sibling union like `@*|node()` — relative
+    // document order is fully determined by each node's position *within that
+    // parent* (attributes, in attribute order, before children, in child order).
+    // Ordering by a local key avoids `document_order_key`'s walk to the document
+    // root, which re-indexes every ancestor's sibling list on each call. The
+    // latter is O(width) per call, so evaluating such a union once per sibling
+    // (as the XSLT identity transform does) is O(width^2); this keeps it linear
+    // by touching only the shared parent's lists.
+    if let Some(parent) = doc.parent(nodes[0]) {
+        if nodes[1..].iter().all(|&n| doc.parent(n) == Some(parent)) {
+            let mut order = SiblingOrderIndex::default();
+            nodes.sort_by_cached_key(|&n| local_order_key(doc, parent, n, &mut order));
+            nodes.dedup();
+            return nodes;
+        }
+    }
+
+    // General path. A sibling-index memo turns each `position()` lookup from an
+    // O(siblings) scan into an amortized O(1) hash lookup. Without it, sorting a
+    // wide node-set is O(n^2) (each of n nodes re-scans its parent's child list),
     // which is *uncharged* work that defeats the node-visit budget — a
     // disjoint `(/r/a) = (/r/b)` comparison would spend minutes inside dedup
     // before the comparison charge ever fires.
@@ -1813,6 +2526,22 @@ fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeI
     nodes.sort_by_cached_key(|&node| document_order_key(doc, node, &mut order));
     nodes.dedup();
     nodes
+}
+
+/// Document-order sort key for a node *known to share `parent` with all others
+/// being sorted*: attributes (tuple tag 0) precede children (tag 1), each ordered
+/// by position within its respective list. Indexes only `parent`'s lists.
+fn local_order_key(
+    doc: &Document<'_>,
+    parent: NodeId,
+    node: NodeId,
+    order: &mut SiblingOrderIndex,
+) -> (u8, usize) {
+    if matches!(doc.node_kind(node), Some(NodeKind::Attribute(_, _))) {
+        (0, order.attr_pos(doc, parent, node).unwrap_or(usize::MAX))
+    } else {
+        (1, order.child_pos(doc, parent, node).unwrap_or(usize::MAX))
+    }
 }
 
 /// Memoizes the position of each node within its parent's child / attribute
@@ -2105,5 +2834,266 @@ mod tests {
             XPathValue::Number(n) => assert_eq!(n, 1.0),
             _ => panic!("expected number"),
         }
+    }
+
+    // ── M0: variable + function-resolution seam ──
+
+    /// A test resolver binding a fixed set of `$name` → value pairs.
+    struct MapVars(HashMap<String, XPathValue>);
+    impl VariableResolver for MapVars {
+        fn resolve_variable(&self, prefix: Option<&str>, local: &str) -> Option<XPathValue> {
+            let key = match prefix {
+                Some(p) => format!("{}:{}", p, local),
+                None => local.to_string(),
+            };
+            self.0.get(&key).cloned()
+        }
+    }
+
+    /// A test resolver implementing `t:double(n)` → 2n and `t:hi()` → "hi".
+    struct TestFns;
+    impl FunctionResolver for TestFns {
+        fn resolve_function(
+            &self,
+            prefix: Option<&str>,
+            local: &str,
+            args: &[XPathValue],
+        ) -> Option<XmlResult<XPathValue>> {
+            match (prefix, local) {
+                (Some("t"), "double") => {
+                    let n = args.first().map(|v| v.to_number_isolated()).unwrap_or(0.0);
+                    Some(Ok(XPathValue::Number(n * 2.0)))
+                }
+                (Some("t"), "hi") => Some(Ok(XPathValue::String("hi".to_string()))),
+                _ => None,
+            }
+        }
+    }
+
+    impl XPathValue {
+        /// Number coercion not needing a document (test helper for scalar values).
+        fn to_number_isolated(&self) -> f64 {
+            match self {
+                XPathValue::Number(n) => *n,
+                XPathValue::String(s) => s.trim().parse().unwrap_or(f64::NAN),
+                XPathValue::Boolean(b) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                XPathValue::NodeSet(_) => f64::NAN,
+            }
+        }
+    }
+
+    fn eval_with(
+        xml: &str,
+        xpath: &str,
+        vars: &dyn VariableResolver,
+        funcs: &dyn FunctionResolver,
+        ns: &HashMap<String, String>,
+    ) -> XmlResult<XPathValue> {
+        let doc = Parser::new().parse(xml).unwrap();
+        let root = doc.document_element().unwrap();
+        let compiled = CompiledXPath::compile(xpath, DEFAULT_MAX_XPATH_DEPTH)?;
+        eval_compiled(
+            &compiled,
+            &doc,
+            root,
+            root,
+            1,
+            1,
+            ns,
+            vars,
+            funcs,
+            DEFAULT_MAX_XPATH_NODE_VISITS,
+        )
+    }
+
+    /// A `$variable` reference resolves through the injected resolver and
+    /// participates in arithmetic: `$x + 1` with `$x = 41` yields `42`.
+    #[test]
+    fn test_variable_reference() {
+        let mut m = HashMap::new();
+        m.insert("x".to_string(), XPathValue::Number(41.0));
+        let vars = MapVars(m);
+        let val = eval_with("<r/>", "$x + 1", &vars, &NoFunctions, &HashMap::new()).unwrap();
+        match val {
+            XPathValue::Number(n) => assert_eq!(n, 42.0),
+            _ => panic!("expected number, got {:?}", val),
+        }
+    }
+
+    /// A string-valued variable flows into a core function (`concat`),
+    /// confirming variables compose with the rest of the expression grammar.
+    #[test]
+    fn test_variable_in_string_context() {
+        let mut m = HashMap::new();
+        m.insert(
+            "greeting".to_string(),
+            XPathValue::String("hello".to_string()),
+        );
+        let vars = MapVars(m);
+        let val = eval_with(
+            "<r/>",
+            "concat($greeting, ' world')",
+            &vars,
+            &NoFunctions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            val.to_string_value(&Parser::new().parse("<r/>").unwrap()),
+            "hello world"
+        );
+    }
+
+    /// An unresolved variable is an error (not an empty value): the default
+    /// `NoVariables` resolver returns `None`, which `evaluate_expr` turns into
+    /// an "undefined variable" error.
+    #[test]
+    fn test_undefined_variable_errors() {
+        let err = eval_with(
+            "<r/>",
+            "$missing",
+            &NoVariables,
+            &NoFunctions,
+            &HashMap::new(),
+        );
+        assert!(err.is_err(), "undefined variable must error");
+    }
+
+    /// The function-resolution seam: calls the core engine doesn't know
+    /// (`t:double`, `t:hi`) fall through to the injected `FunctionResolver`,
+    /// which receives the evaluated arguments and returns a value.
+    #[test]
+    fn test_extension_function() {
+        let val = eval_with(
+            "<r/>",
+            "t:double(21)",
+            &NoVariables,
+            &TestFns,
+            &HashMap::new(),
+        )
+        .unwrap();
+        match val {
+            XPathValue::Number(n) => assert_eq!(n, 42.0),
+            _ => panic!("expected number, got {:?}", val),
+        }
+        let val = eval_with("<r/>", "t:hi()", &NoVariables, &TestFns, &HashMap::new()).unwrap();
+        match val {
+            XPathValue::String(s) => assert_eq!(s, "hi"),
+            _ => panic!("expected string"),
+        }
+    }
+
+    /// Even with a resolver installed, a function neither the core nor the
+    /// resolver recognizes (`t:nope`) is still an error — the seam declines by
+    /// returning `None` and the engine reports the unknown function.
+    #[test]
+    fn test_unknown_function_still_errors() {
+        let err = eval_with("<r/>", "t:nope()", &NoVariables, &TestFns, &HashMap::new());
+        assert!(err.is_err(), "unresolved extension function must error");
+    }
+
+    /// Regression for the lexer fix: a prefixed name immediately followed by
+    /// `(` (e.g. `t:double(...)`, the shape EXSLT's `date:date-time()` takes)
+    /// must lex as a function call, not as a `prefix:local` node test.
+    #[test]
+    fn test_prefixed_function_lexing() {
+        let compiled = CompiledXPath::compile("t:double(2)", DEFAULT_MAX_XPATH_DEPTH);
+        assert!(compiled.is_ok(), "prefixed function name must parse");
+    }
+
+    /// A prefixed name test (`x:b`) resolves its prefix against the *per-call*
+    /// namespace map passed to `eval_compiled` — the mechanism XSLT uses to give
+    /// each expression the namespace context of the stylesheet element it came
+    /// from, rather than a single evaluator-global map.
+    #[test]
+    fn test_namespaced_name_test_via_injected_ns() {
+        let mut ns = HashMap::new();
+        ns.insert("x".to_string(), "urn:ex".to_string());
+        let val = eval_with(
+            r#"<r xmlns:x="urn:ex"><x:b>hi</x:b></r>"#,
+            "x:b",
+            &NoVariables,
+            &NoFunctions,
+            &ns,
+        )
+        .unwrap();
+        assert_eq!(val.as_node_set().len(), 1);
+    }
+
+    /// `lang('en')` walks ancestor-or-self for the nearest `xml:lang` and
+    /// matches case-insensitively (and on subtag prefixes); `lang('fr')` does
+    /// not match an `en`-tagged subtree. The context node is `<p>`, whose
+    /// language is inherited from the `<r xml:lang="en">` ancestor.
+    #[test]
+    fn test_lang_function() {
+        let doc = Parser::new()
+            .parse(r#"<r xml:lang="en"><p>x</p></r>"#)
+            .unwrap();
+        let p = doc
+            .document_element()
+            .and_then(|r| {
+                doc.children(r)
+                    .into_iter()
+                    .find(|&c| matches!(doc.node_kind(c), Some(NodeKind::Element(_))))
+            })
+            .unwrap();
+        let compiled = CompiledXPath::compile("lang('en')", DEFAULT_MAX_XPATH_DEPTH).unwrap();
+        let ns = HashMap::new();
+        let val = eval_compiled(
+            &compiled,
+            &doc,
+            p,
+            p,
+            1,
+            1,
+            &ns,
+            &NoVariables,
+            &NoFunctions,
+            DEFAULT_MAX_XPATH_NODE_VISITS,
+        )
+        .unwrap();
+        assert!(
+            val.to_boolean(),
+            "lang('en') should match xml:lang=\"en\" ancestor"
+        );
+
+        let compiled2 = CompiledXPath::compile("lang('fr')", DEFAULT_MAX_XPATH_DEPTH).unwrap();
+        let val2 = eval_compiled(
+            &compiled2,
+            &doc,
+            p,
+            p,
+            1,
+            1,
+            &ns,
+            &NoVariables,
+            &NoFunctions,
+            DEFAULT_MAX_XPATH_NODE_VISITS,
+        )
+        .unwrap();
+        assert!(!val2.to_boolean(), "lang('fr') should not match");
+    }
+
+    /// `current()` returns the context node when invoked through plain XPath
+    /// (current == context). XSLT later distinguishes the two by passing a
+    /// separate `current` node into `eval_compiled`; here they coincide, so the
+    /// call yields a one-node set.
+    #[test]
+    fn test_current_equals_context_in_plain_xpath() {
+        let val = eval_with(
+            "<r><a/></r>",
+            "current()",
+            &NoVariables,
+            &NoFunctions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(val.as_node_set().len(), 1);
     }
 }

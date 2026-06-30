@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## 0.6.0 [2026-06-30]
+### Added
+
+- XSLT 1.0 transform engine (`uppsala::transform`, plus `Stylesheet::compile` /
+  `Stylesheet::transform`), layered on the existing XPath 1.0 evaluator with no
+  second XPath implementation. Implements the "Tier A" subset that pyFF's
+  stylesheets use (see ADR 0010 and the crate docs). Adds the XPath
+  `$variable`/extension-function resolution seams, a compiled-expression entry
+  point, XSLT match patterns, and the `lang()`/`current()` core functions.
+- Opt-in EXSLT extension-function library (`src/exslt.rs`): `math:` (abs, sqrt,
+  power, log, exp, sin, cos, tan, constant, min, max, highest, lowest), `str:`
+  (concat, padding, align), `set:` (distinct, difference, intersection,
+  has-same-node), and `exsl:object-type`. Enabled per stylesheet via
+  `Stylesheet::with_exslt(true)`; matched by the conventional EXSLT prefix.
+  `date:date-time()` remains available unconditionally.
+- `Stylesheet::set_max_depth` and `DEFAULT_MAX_XSLT_DEPTH` (default 500): a bound
+  on XSLT template-activation recursion.
+
+### Changed
+
+- XSLT transforms of large, wide documents are linear instead of quadratic.
+  Two O(width²) hot spots were removed: the XSLT match-pattern tester no longer
+  materializes every sibling to check membership (it tests the node locally and
+  only falls back to the full set for positional predicates), and
+  `dedup_document_order` sorts same-parent node-sets (the common axis/union case)
+  by local index instead of walking each node to the document root. A per-node
+  template-dispatch pre-filter also skips patterns that cannot match a node's
+  kind/name. Net effect: a 91 MB eduGAIN aggregate that previously did not
+  complete now transforms in a few seconds.
+
+### Security
+
+- XSLT recursion is now bounded by `DEFAULT_MAX_XSLT_DEPTH` (default 500,
+  overridable via `Stylesheet::set_max_depth`). A self-recursive
+  `xsl:call-template`, mutually-recursive named templates, or an
+  `xsl:apply-templates select="."` cycle previously recursed unbounded and
+  aborted the process with an uncatchable stack-overflow `SIGABRT`; they now
+  return a graceful `XmlError`.
+
+## [0.6.0] - 2026-06-30
 
 ### Added
 
