@@ -233,6 +233,9 @@ pub struct Stylesheet {
 struct GlobalVar {
     name: String,
     value: ValueSource,
+    /// `true` for a top-level `xsl:param` (whose value may be supplied externally
+    /// via [`Stylesheet::with_param`]), `false` for an `xsl:variable`.
+    is_param: bool,
 }
 
 struct Template {
@@ -471,7 +474,7 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
             continue; // top-level non-XSLT (e.g. extension) elements are ignored
         }
         match el.name.local_name.as_ref() {
-            "output" => parse_output(doc, child, &mut output),
+            "output" => parse_output(doc, child, &mut output)?,
             "template" => templates.push(compile_template(doc, child, &namespaces)?),
             "variable" | "param" => {
                 let name = el
@@ -479,7 +482,12 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
                     .ok_or_else(|| XmlError::xpath("top-level variable/param requires name"))?
                     .to_string();
                 let value = compile_value_source(doc, child, el, &namespaces)?;
-                globals.push(GlobalVar { name, value });
+                let is_param = el.name.local_name.as_ref() == "param";
+                globals.push(GlobalVar {
+                    name,
+                    value,
+                    is_param,
+                });
             }
             "strip-space" if el.get_attribute("elements") == Some("*") => {
                 strip_space_all = true;
@@ -501,9 +509,21 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
     })
 }
 
-fn parse_output(doc: &Document<'_>, node: NodeId, output: &mut OutputOptions) {
+fn parse_output(doc: &Document<'_>, node: NodeId, output: &mut OutputOptions) -> XmlResult<()> {
     if let Some(m) = doc.get_attribute(node, "method") {
-        output.method_text = m == "text";
+        // Only "xml" and "text" are implemented. Fail fast on any other method
+        // (e.g. "html") rather than silently serializing as XML, which would
+        // mask an incompatible stylesheet. (A prefixed/custom method name is
+        // likewise unsupported.)
+        match m {
+            "xml" => output.method_text = false,
+            "text" => output.method_text = true,
+            other => {
+                return Err(XmlError::xpath(format!(
+                    "xsl:output method {other:?} is not supported (only \"xml\" and \"text\")"
+                )));
+            }
+        }
     }
     if let Some(i) = doc.get_attribute(node, "indent") {
         output.indent = i == "yes";
@@ -520,6 +540,7 @@ fn parse_output(doc: &Document<'_>, node: NodeId, output: &mut OutputOptions) {
     if let Some(o) = doc.get_attribute(node, "omit-xml-declaration") {
         output.omit_xml_declaration = o == "yes";
     }
+    Ok(())
 }
 
 fn compile_template(
