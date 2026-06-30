@@ -128,6 +128,18 @@ impl<'a> fmt::Display for QName<'a> {
     }
 }
 
+/// Clone a borrowed [`QName`] into an owned (`'static`) one. Used when importing
+/// a subtree from another document, where every string must be owned so the
+/// result does not borrow from the source. The `'static` result coerces to any
+/// `QName<'a>` via the type's covariance in its lifetime.
+fn own_qname(q: &QName<'_>) -> QName<'static> {
+    QName {
+        namespace_uri: q.namespace_uri.as_ref().map(|s| Cow::Owned(s.to_string())),
+        prefix: q.prefix.as_ref().map(|s| Cow::Owned(s.to_string())),
+        local_name: Cow::Owned(q.local_name.to_string()),
+    }
+}
+
 /// An iterator over the children of a node.
 ///
 /// This is a zero-allocation alternative to [`Document::children()`] which
@@ -1249,6 +1261,87 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// Deep-copy a node and its entire subtree from another document into this
+    /// one, returning the new (detached) root node id.
+    ///
+    /// `NodeId`s are scoped to a single document's arena, so an element cannot be
+    /// reparented across documents directly; moving a subtree between documents
+    /// requires cloning it. This is the native equivalent of the per-node Python
+    /// clone the etree layer used to do for cross-tree `append`/`deepcopy`, which
+    /// dominated pyFF's aggregation step (see pyFF/performance.md): it recreates
+    /// the whole subtree in one native pass instead of one FFI call per node.
+    ///
+    /// All copied strings (names, namespace declarations, attribute values, text)
+    /// are taken by value as owned data, so the result is independent of `src`'s
+    /// lifetime. The element's own namespace declarations are copied; namespaces
+    /// inherited from ancestors *outside* the subtree are the caller's
+    /// responsibility (mirroring the previous behaviour). Document and virtual
+    /// attribute nodes cannot be imported and yield `None`.
+    pub fn import_subtree<'b>(&mut self, src: &Document<'b>, src_id: NodeId) -> Option<NodeId> {
+        // Only invalidate the XPath caches when the import actually mutates this
+        // document. A rejected root (invalid `src_id`, or a `Document`/`Attribute`
+        // node) returns `None` from `import_node_rec` before creating any node, so
+        // a no-op import must not force an unnecessary `prepare_xpath()` rebuild.
+        let new_id = self.import_node_rec(src, src_id)?;
+        self.invalidate_xpath_caches();
+        Some(new_id)
+    }
+
+    /// Recursive worker for [`import_subtree`](Self::import_subtree). Creates the
+    /// node for `src_id` in this document, then imports each child and appends it.
+    fn import_node_rec<'b>(&mut self, src: &Document<'b>, src_id: NodeId) -> Option<NodeId> {
+        let new_id = match src.node_kind(src_id)? {
+            NodeKind::Element(e) => {
+                let new_id = self.create_element(own_qname(&e.name));
+                // Copy attributes and the element's own namespace declarations.
+                // Building owned (`'static`) data that coerces into this
+                // document's lifetime `'a`.
+                let attributes: Vec<Attribute<'a>> = e
+                    .attributes
+                    .iter()
+                    .map(|a| Attribute {
+                        name: own_qname(&a.name),
+                        value: Cow::Owned(a.value.to_string()),
+                    })
+                    .collect();
+                let ns_decls: Vec<(Cow<'a, str>, Cow<'a, str>)> = e
+                    .namespace_declarations
+                    .iter()
+                    .map(|(p, u)| (Cow::Owned(p.to_string()), Cow::Owned(u.to_string())))
+                    .collect();
+                // `create_element` always allocates an element node, so this is
+                // an invariant rather than a recoverable case: a non-element here
+                // would mean a silently partially-copied subtree. Fail loudly.
+                let el = self
+                    .element_mut(new_id)
+                    .expect("create_element must allocate an element node");
+                el.attributes = attributes;
+                el.namespace_declarations = ns_decls;
+                new_id
+            }
+            NodeKind::Text(t) => self.create_text(Cow::Owned(t.to_string())),
+            NodeKind::CData(t) => self.create_cdata(Cow::Owned(t.to_string())),
+            NodeKind::Comment(t) => self.create_comment(Cow::Owned(t.to_string())),
+            NodeKind::ProcessingInstruction(pi) => self.create_processing_instruction(
+                Cow::Owned(pi.target.to_string()),
+                pi.data.as_ref().map(|d| Cow::Owned(d.to_string())),
+            ),
+            // The document root and virtual XPath attribute nodes are not part of
+            // a movable subtree.
+            NodeKind::Document | NodeKind::Attribute(_, _) => return None,
+        };
+        // Import children in order. `children_iter` walks `src`'s sibling links
+        // without allocating a `Vec` per recursion level; iterating `src` while
+        // mutating `self` is sound because they are distinct arenas (the iterator
+        // borrows `src`, never `self`).
+        for child in src.children_iter(src_id) {
+            if let Some(child_new) = self.import_node_rec(src, child) {
+                self.append_child_unchecked(new_id, child_new);
+            }
+        }
+        Some(new_id)
+    }
+
     fn valid_node_id(&self, id: NodeId) -> bool {
         id.0 < self.nodes.len()
     }
@@ -2112,6 +2205,48 @@ mod dom_tests {
             doc.doc_order_at(b),
             u32::MAX,
             "re-prepare did not reindex the appended node"
+        );
+    }
+
+    /// `import_subtree` deep-copies an element subtree (name, namespace
+    /// declarations, attributes, nested text/children) from one document into
+    /// another, producing an independent, attachable node.
+    #[test]
+    fn import_subtree_deep_copies_across_documents() {
+        let src = Parser::new()
+            .parse(r#"<m:Root xmlns:m="urn:m"><m:Child a="1">hi<m:Leaf/></m:Child></m:Root>"#)
+            .unwrap();
+        let src_root = src.document_element().unwrap();
+        let src_child = src.first_child(src_root).unwrap();
+
+        let mut dst = Parser::new().parse("<dst/>").unwrap();
+        let dst_root = dst.document_element().unwrap();
+
+        let imported = dst
+            .import_subtree(&src, src_child)
+            .expect("element subtree should import");
+        dst.append_child(dst_root, imported);
+
+        // The cloned subtree serializes with its name, namespace, attribute and
+        // descendants intact under the destination root.
+        let out = dst.to_xml();
+        assert!(
+            out.contains(r#"<m:Child"#)
+                && out.contains(r#"a="1""#)
+                && out.contains("hi")
+                && out.contains("<m:Leaf"),
+            "unexpected import output: {out}"
+        );
+
+        // The copy is independent: mutating the destination subtree must not be
+        // visible through the source document.
+        if let Some(NodeKind::Element(e)) = dst.node_kind_mut(imported) {
+            e.set_attribute(QName::local("a"), Cow::Borrowed("2"));
+        }
+        assert_eq!(
+            src.get_attribute(src_child, "a"),
+            Some("1"),
+            "source must be untouched by destination mutation"
         );
     }
 
