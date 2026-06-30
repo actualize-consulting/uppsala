@@ -575,33 +575,92 @@ fn is_ncname_char(c: char) -> bool {
 
 // ─── Internal escaping helpers (write directly to String, no allocation) ───
 
+/// Run-based XML escaping core, shared by the text and attribute writers.
+///
+/// Instead of matching and pushing one character at a time (the bulk of a large
+/// document is unescaped text, so that pays a per-character `push` capacity
+/// check and UTF-8 re-encode over and over), this scans for the next byte that
+/// actually needs escaping or sanitizing and copies the whole preceding "safe"
+/// run in one `push_str` (which lowers to a SIMD `memcpy`). On ASCII-heavy
+/// payloads like SAML metadata this is the common case, so most bytes are
+/// copied in bulk and only the rare special byte is handled individually.
+///
+/// Semantics are identical to the previous per-character version: `&<>` and
+/// `\r` are always escaped; in attribute context `"`, `\t` and `\n` are escaped
+/// too; control characters that are not valid XML 1.0 characters are replaced
+/// with U+FFFD (via the same rule as [`sanitized_xml_char`]); everything else,
+/// including valid multi-byte characters, is copied verbatim.
+#[inline]
+fn write_escaped_run_based(buf: &mut String, s: &str, is_attr: bool) {
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Decide whether byte `b` needs individual handling. ASCII bytes take a
+        // cheap branch; any byte >= 0x80 starts a multi-byte char and is decoded
+        // on the slow path (rare in this workload).
+        let special = if b >= 0x80 {
+            true
+        } else {
+            match b {
+                b'&' | b'<' | b'>' | b'\r' => true,
+                b'"' if is_attr => true,
+                b'\t' | b'\n' if is_attr => true,
+                // Control characters other than XML-valid \t, \n (and \r, which
+                // is handled above) must be sanitized.
+                0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => true,
+                _ => false,
+            }
+        };
+        if !special {
+            i += 1;
+            continue;
+        }
+        // Flush the accumulated safe run in one bulk copy.
+        if start < i {
+            buf.push_str(&s[start..i]);
+        }
+        if b >= 0x80 {
+            // Multi-byte UTF-8 character: copy it verbatim when it is a valid
+            // XML character, otherwise emit the replacement character.
+            let ch = s[i..].chars().next().unwrap();
+            let n = ch.len_utf8();
+            if is_xml_char(ch) {
+                buf.push_str(&s[i..i + n]);
+            } else {
+                buf.push('\u{FFFD}');
+            }
+            i += n;
+        } else {
+            match b {
+                b'&' => buf.push_str("&amp;"),
+                b'<' => buf.push_str("&lt;"),
+                b'>' => buf.push_str("&gt;"),
+                b'\r' => buf.push_str("&#xD;"),
+                b'"' if is_attr => buf.push_str("&quot;"),
+                b'\t' if is_attr => buf.push_str("&#x9;"),
+                b'\n' if is_attr => buf.push_str("&#xA;"),
+                // Remaining ASCII control characters are all invalid XML chars.
+                _ => buf.push(sanitized_xml_char(b as char)),
+            }
+            i += 1;
+        }
+        start = i;
+    }
+    if start < bytes.len() {
+        buf.push_str(&s[start..]);
+    }
+}
+
 /// Write text content with XML escaping directly to a String.
 fn write_escaped_text_to_string(buf: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => buf.push_str("&amp;"),
-            '<' => buf.push_str("&lt;"),
-            '>' => buf.push_str("&gt;"),
-            '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(sanitized_xml_char(c)),
-        }
-    }
+    write_escaped_run_based(buf, s, false);
 }
 
 /// Write attribute value with XML escaping directly to a String.
 fn write_escaped_attr_to_string(buf: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => buf.push_str("&amp;"),
-            '<' => buf.push_str("&lt;"),
-            '>' => buf.push_str("&gt;"),
-            '"' => buf.push_str("&quot;"),
-            '\t' => buf.push_str("&#x9;"),
-            '\n' => buf.push_str("&#xA;"),
-            '\r' => buf.push_str("&#xD;"),
-            _ => buf.push(sanitized_xml_char(c)),
-        }
-    }
+    write_escaped_run_based(buf, s, true);
 }
 
 /// Write one attribute after structural-name sanitization and per-element
