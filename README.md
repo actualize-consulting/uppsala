@@ -3,9 +3,8 @@
 A **zero-dependency** pure Rust XML library.
 
 Uppsala implements the core XML stack from parsing through schema validation,
-with no external crates -- not even in dev-dependencies. Everything is built
-from scratch: the parser, the DOM, the XPath engine, the XSD validator, and
-even the regex engine used for XSD pattern facets.
+with no external crates. The parser, DOM, XPath engine, XSD validator, and XSD
+regex engine are built from scratch.
 
 ## Features
 
@@ -15,7 +14,8 @@ even the regex engine used for XSD pattern facets.
 - **XPath 1.0** evaluation (all axes, functions, predicates, operators)
 - **XSD 1.1 validation** (structures + datatypes, 40+ built-in types)
 - **XSD regex engine** (custom NFA matcher for pattern facets)
-- **SIMD-accelerated parsing** (SSE2 on x86_64, scalar fallback elsewhere)
+- **Accelerated parsing** (SSE2 on x86_64, one-pass scalar delimiter scanning
+  elsewhere)
 - **Serialization** with round-trip fidelity, pretty-printing, and streaming output
 - **XmlWriter** for imperative XML construction without a DOM
 - **UTF-16 auto-detection** (LE/BE with or without BOM)
@@ -49,27 +49,43 @@ cargo test --test w3c_xsts -- --nocapture
 
 ## Performance
 
-We need someone to do a full benchmark in a proper environment. The following is
-in an Ubuntu 24.04 VM.
+Uppsala uses accelerated byte scanning for text content and attribute values:
+SSE2 on x86_64 and one-pass scalar delimiter scanning elsewhere. Performance
+depends heavily on the document shape: long plain-text spans are favorable,
+while very small documents are dominated by fixed parser overhead.
 
-Uppsala uses SSE2 SIMD intrinsics on x86_64 to scan text content and attribute
-values 16 bytes at a time, with a scalar fallback for other architectures.
-Combined with lookup-table optimizations and zero-copy parsing, this makes it
-faster than roxmltree across all document sizes:
+The table below compares release builds (`cargo run --release`) of Uppsala
+0.5.2 against a local checkout of roxmltree 0.21.1 using roxmltree's benchmark
+input files. Results are median parse times from 101 samples on x86_64 (the
+SSE2 scanner path); values above 1.0 mean Uppsala parsed faster than roxmltree.
 
-| File | Size | vs roxmltree |
-|------|------|-------------|
-| gigantic.svg | 1.3 MB | **5.3x faster** |
-| text.xml | 126 KB | **9.3x faster** |
-| attributes.xml | 265 KB | **2.0x faster** |
-| medium.svg | 152 KB | **1.4x faster** |
-| huge.xml | 815 KB | **1.2x faster** |
-| SAML files | 3-11 KB | **1.5-1.8x faster** |
+| File | Size | Uppsala | roxmltree | Ratio |
+|------|------|---------|-----------|-------|
+| fonts.conf | 429 B | 2.9 us | 4.0 us | 1.38x |
+| medium.svg | 155 KB | 306 us | 489 us | 1.60x |
+| large.plist | 321 KB | 1.72 ms | 2.39 ms | 1.39x |
+| huge.xml | 835 KB | 3.69 ms | 4.80 ms | 1.30x |
+| gigantic.svg | 1.34 MB | 411 us | 1.94 ms | 4.73x |
+| cdata.xml | 102 KB | 215 us | 252 us | 1.17x |
+| text.xml | 129 KB | 650 us | 5.96 ms | 9.17x |
+| attributes.xml | 271 KB | 1.48 ms | 5.24 ms | 3.55x |
 
-Text-heavy documents benefit most from SIMD -- long runs of plain text between
-markup are scanned with minimal per-byte overhead.
+The main production target is SAML: namespace-heavy documents in the 3-30 KB
+range with signed assertions. On generated SAML-shaped inputs, default
+namespace-aware parsing is consistently faster than roxmltree:
 
-Is this really fast? Maybe, maybe not. But it is good enough for my use cases right now.
+| File | Size | Uppsala | roxmltree | Ratio |
+|------|------|---------|-----------|-------|
+| SAML small | 3.5 KB | 7.7 us | 13.3 us | 1.74x |
+| SAML medium | 9.1 KB | 25.1 us | 29.0 us | 1.16x |
+| SAML large | 27.8 KB | 62.7 us | 92.1 us | 1.47x |
+
+Disabling namespace resolution improves some ordinary XML inputs further, but
+SAML users should usually keep namespace-aware parsing enabled.
+
+These numbers come from the in-repo `performance-harness`. See
+[`docs/performance.md`](docs/performance.md) for the full results and the exact
+commands used to reproduce them.
 
 ## Usage
 

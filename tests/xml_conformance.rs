@@ -172,6 +172,20 @@ fn unicode_character_reference() {
     assert_eq!(doc.text_content_deep(root), "\u{2603}");
 }
 
+#[test]
+fn empty_decimal_character_reference_is_rejected() {
+    // `&#;` has no digits: must be an invalid-syntax error, not a
+    // misleading "U+0000 is not a valid XML character" report.
+    let err = uppsala::parse("<r>&#;</r>").unwrap_err();
+    assert!(err.to_string().contains("decimal character reference"));
+}
+
+#[test]
+fn empty_hex_character_reference_is_rejected() {
+    let err = uppsala::parse("<r>&#x;</r>").unwrap_err();
+    assert!(err.to_string().contains("hex character reference"));
+}
+
 // ─── CDATA sections ─────────────────────────────────────
 
 #[test]

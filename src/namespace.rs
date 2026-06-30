@@ -40,6 +40,8 @@ impl<'a> NamespaceScope<'a> {
 #[derive(Debug, Clone)]
 pub struct NamespaceResolver<'a> {
     scopes: Vec<NamespaceScope<'a>>,
+    default_namespace: Option<Cow<'a, str>>,
+    default_namespace_stack: Vec<Option<Cow<'a, str>>>,
 }
 
 impl<'a> NamespaceResolver<'a> {
@@ -54,18 +56,23 @@ impl<'a> NamespaceResolver<'a> {
             .push((Cow::Borrowed("xmlns"), Cow::Borrowed(XMLNS_NAMESPACE)));
         NamespaceResolver {
             scopes: vec![root_scope],
+            default_namespace: None,
+            default_namespace_stack: vec![None],
         }
     }
 
     /// Push a new (empty) namespace scope. Call this when entering an element.
     pub fn push_scope(&mut self) {
         self.scopes.push(NamespaceScope::new());
+        self.default_namespace_stack
+            .push(self.default_namespace.clone());
     }
 
     /// Pop the current namespace scope. Call this when leaving an element.
     pub fn pop_scope(&mut self) {
         if self.scopes.len() > 1 {
             self.scopes.pop();
+            self.default_namespace = self.default_namespace_stack.pop().unwrap_or(None);
         }
     }
 
@@ -93,6 +100,13 @@ impl<'a> NamespaceResolver<'a> {
         if &*uri == XMLNS_NAMESPACE {
             return;
         }
+        if prefix.is_empty() {
+            self.default_namespace = if uri.is_empty() {
+                None
+            } else {
+                Some(uri.clone())
+            };
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.bindings.push((prefix, uri));
         }
@@ -115,17 +129,7 @@ impl<'a> NamespaceResolver<'a> {
 
     /// Resolve the default namespace (empty prefix).
     pub fn resolve_default(&self) -> Option<&Cow<'a, str>> {
-        for scope in self.scopes.iter().rev() {
-            for (p, uri) in scope.bindings.iter().rev() {
-                if p.is_empty() {
-                    if uri.is_empty() {
-                        return None; // xmlns="" undeclares the default namespace
-                    }
-                    return Some(uri);
-                }
-            }
-        }
-        None
+        self.default_namespace.as_ref()
     }
 
     /// Return all in-scope namespace bindings (prefix -> URI).

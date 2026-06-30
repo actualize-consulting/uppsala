@@ -1,8 +1,9 @@
-//! SIMD-accelerated byte scanning for parser hot loops.
+//! Accelerated byte scanning for parser hot loops.
 //!
 //! On x86_64 (where SSE2 is guaranteed), text content and attribute values are
-//! scanned 16 bytes at a time instead of 1. Other architectures use a scalar
-//! fallback with inline byte comparisons.
+//! scanned 16 bytes at a time instead of 1. Other architectures use a one-pass
+//! scalar scanner because XML-character validation must happen while searching
+//! for delimiters.
 
 /// Scan `data` for content delimiter bytes (`<`, `&`, `\r`, `]`).
 ///
@@ -35,6 +36,12 @@ pub(crate) fn scan_attr_delimiters(data: &[u8], quote: u8) -> (usize, bool) {
     {
         scan_attr_scalar(data, quote)
     }
+}
+
+/// Find a single byte without adding a dependency.
+#[inline]
+pub(crate) fn find_byte(data: &[u8], byte: u8) -> Option<usize> {
+    data.iter().position(|&b| b == byte)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +163,7 @@ unsafe fn scan_attr_sse2(data: &[u8], quote: u8) -> (usize, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Scalar fallback (used on non-x86_64 and for SIMD tail bytes)
+// Scalar fallback (used for SIMD tail bytes and non-x86_64 delimiter scans)
 // ---------------------------------------------------------------------------
 
 fn scan_content_scalar(data: &[u8]) -> (usize, bool) {

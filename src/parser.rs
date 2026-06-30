@@ -132,8 +132,26 @@ impl Parser {
         let mut doc = Document::new();
         doc.input = input;
 
-        // Pre-allocate based on input size heuristic (avg ~40 bytes per element)
-        doc.nodes.reserve(input.len() / 40);
+        // Pre-allocate based on input size. Markup-heavy documents such as
+        // plist files can be closer to 14 bytes per node once whitespace text
+        // nodes are included, so larger inputs use a denser estimate to avoid
+        // repeated arena growth during parsing.
+        //
+        // Use `try_reserve` (not `reserve`) so a hostile or simply huge input
+        // cannot trigger an aborting upfront allocation via the global
+        // allocation-error handler. The reservation is only a hint: if the
+        // dense estimate fails on a memory-constrained host, fall back to the
+        // sparser estimate, and if that also fails just proceed — parsing still
+        // succeeds by regrowing the arena on demand.
+        let dense = if input.len() >= 256 * 1024 {
+            input.len() / 14
+        } else {
+            input.len() / 40
+        };
+        let sparse = input.len() / 40;
+        if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
+            let _ = doc.nodes.try_reserve(sparse);
+        }
         let mut ns_resolver = if self.namespace_aware {
             Some(NamespaceResolver::new())
         } else {
@@ -679,6 +697,27 @@ fn charge_entity_budget(budget: &mut usize, n: usize, line: usize, col: usize) -
     }
 }
 
+#[inline]
+fn charge_entity_budget_at_cursor(
+    budget: &mut usize,
+    n: usize,
+    cursor: &Cursor<'_>,
+) -> XmlResult<()> {
+    if let Some(remaining) = budget.checked_sub(n) {
+        *budget = remaining;
+        Ok(())
+    } else {
+        Err(XmlError::parse(
+            format!(
+                "Entity expansion exceeds configured limit ({} bytes remaining)",
+                *budget
+            ),
+            cursor.line(),
+            cursor.column(),
+        ))
+    }
+}
+
 /// Parse a quoted attribute value (handles both `"` and `'`).
 /// Uses lazy allocation: returns Borrowed if no entities/special chars found.
 fn parse_quoted_value<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
@@ -745,32 +784,32 @@ fn parse_quoted_value_with_entities<'a>(
         return Ok(Cow::Borrowed(text));
     }
 
-    // Slow path: copy what we have so far, then use bulk scanning between specials
-    let mut value = String::from(&cursor.input[start..fast_end]);
+    // Slow path: copy what we have so far, then keep using bulk scans between
+    // references. Attribute-heavy documents spend most of their time here.
+    let mut value = String::with_capacity((fast_end - start).saturating_add(32));
+    value.push_str(&cursor.input[start..fast_end]);
     cursor.advance(fast_end - cursor.pos);
 
     loop {
-        // Bulk scan for next special character in the slow path
         let bytes = cursor.input.as_bytes();
         let scan_start = cursor.pos;
-        let mut scan_pos = scan_start;
-        while scan_pos < bytes.len() {
-            let b = bytes[scan_pos];
-            if b == qb || b == b'&' || b == b'<' {
-                break;
-            }
-            scan_pos += 1;
+        let (advance, has_non_ascii_or_control) =
+            crate::simd::scan_attr_delimiters(&bytes[scan_start..], qb);
+        let scan_pos = scan_start + advance;
+        if scan_pos >= bytes.len() {
+            return Err(XmlError::UnexpectedEof);
         }
         if scan_pos > scan_start {
-            // Validate and copy clean characters in bulk
             let chunk = &cursor.input[scan_start..scan_pos];
-            for c in chunk.chars() {
-                if !is_xml_char(c) {
-                    return Err(XmlError::well_formedness(
-                        format!("Invalid XML character U+{:04X}", c as u32),
-                        cursor.line(),
-                        cursor.column(),
-                    ));
+            if has_non_ascii_or_control {
+                for c in chunk.chars() {
+                    if !is_xml_char(c) {
+                        return Err(XmlError::well_formedness(
+                            format!("Invalid XML character U+{:04X}", c as u32),
+                            cursor.line(),
+                            cursor.column(),
+                        ));
+                    }
                 }
             }
             value.push_str(chunk);
@@ -784,9 +823,7 @@ fn parse_quoted_value_with_entities<'a>(
                 break;
             }
             Some(b'&') => {
-                let resolved =
-                    parse_reference_with_entities(cursor, entities, entity_cache, budget)?;
-                value.push_str(&resolved);
+                parse_reference_into(cursor, entities, entity_cache, budget, &mut value)?;
             }
             Some(b'<') => {
                 return Err(XmlError::well_formedness(
@@ -819,6 +856,21 @@ fn parse_reference_with_entities(
     entity_cache: &mut EntityCache,
     budget: &mut usize,
 ) -> XmlResult<String> {
+    let mut result = String::new();
+    parse_reference_into(cursor, entities, entity_cache, budget, &mut result)?;
+    Ok(result)
+}
+
+/// Parse a character or entity reference and append its replacement text into
+/// an existing buffer. This avoids per-reference `String` allocations on the
+/// hot predefined-entity and numeric-character-reference paths.
+fn parse_reference_into(
+    cursor: &mut Cursor,
+    entities: &EntityMap,
+    entity_cache: &mut EntityCache,
+    budget: &mut usize,
+    out: &mut String,
+) -> XmlResult<()> {
     cursor.expect("&")?;
     let after_amp = cursor.peek_byte();
     if after_amp == Some(b'#') {
@@ -827,36 +879,67 @@ fn parse_reference_with_entities(
         if is_hex {
             cursor.advance_no_newlines(1); // skip 'x'
         }
-        // Scan digits until ';' using byte scanning
+        // Scan digits until ';' using the configured byte-search backend.
         let start = cursor.pos;
         let bytes = cursor.input.as_bytes();
-        let mut end = start;
-        while end < bytes.len() && bytes[end] != b';' {
-            end += 1;
-        }
-        if end >= bytes.len() {
-            return Err(XmlError::UnexpectedEof);
-        }
+        let end =
+            start + crate::simd::find_byte(&bytes[start..], b';').ok_or(XmlError::UnexpectedEof)?;
         let digits = &cursor.input[start..end];
+        if digits.is_empty() {
+            return Err(XmlError::parse(
+                if is_hex {
+                    "Invalid hex character reference: &#x;"
+                } else {
+                    "Invalid decimal character reference: &#;"
+                },
+                cursor.line(),
+                cursor.column(),
+            ));
+        }
+        let mut code = 0_u32;
+        for b in digits.bytes() {
+            let digit = if is_hex {
+                match b {
+                    b'0'..=b'9' => (b - b'0') as u32,
+                    b'a'..=b'f' => (b - b'a' + 10) as u32,
+                    b'A'..=b'F' => (b - b'A' + 10) as u32,
+                    _ => {
+                        return Err(XmlError::parse(
+                            format!("Invalid hex character reference: {}", digits),
+                            cursor.line(),
+                            cursor.column(),
+                        ));
+                    }
+                }
+            } else {
+                match b {
+                    b'0'..=b'9' => (b - b'0') as u32,
+                    _ => {
+                        return Err(XmlError::parse(
+                            format!("Invalid decimal character reference: {}", digits),
+                            cursor.line(),
+                            cursor.column(),
+                        ));
+                    }
+                }
+            };
+            code = code
+                .checked_mul(if is_hex { 16 } else { 10 })
+                .and_then(|n| n.checked_add(digit))
+                .ok_or_else(|| {
+                    XmlError::parse(
+                        if is_hex {
+                            format!("Invalid hex character reference: {}", digits)
+                        } else {
+                            format!("Invalid decimal character reference: {}", digits)
+                        },
+                        cursor.line(),
+                        cursor.column(),
+                    )
+                })?;
+        }
         cursor.advance_no_newlines(end - start + 1); // +1 for ';'
 
-        let code = if is_hex {
-            u32::from_str_radix(digits, 16).map_err(|_| {
-                XmlError::parse(
-                    format!("Invalid hex character reference: {}", digits),
-                    cursor.line(),
-                    cursor.column(),
-                )
-            })?
-        } else {
-            digits.parse::<u32>().map_err(|_| {
-                XmlError::parse(
-                    format!("Invalid decimal character reference: {}", digits),
-                    cursor.line(),
-                    cursor.column(),
-                )
-            })?
-        };
         let c = char::from_u32(code).ok_or_else(|| {
             XmlError::parse(
                 format!("Invalid character reference: U+{:04X}", code),
@@ -874,62 +957,79 @@ fn parse_reference_with_entities(
                 cursor.column(),
             ));
         }
-        Ok(c.to_string())
+        out.push(c);
+        Ok(())
     } else {
-        // Named entity reference
+        match after_amp {
+            Some(b'l') if cursor.remaining().starts_with("lt;") => {
+                cursor.advance_no_newlines(3);
+                out.push('<');
+                return Ok(());
+            }
+            Some(b'g') if cursor.remaining().starts_with("gt;") => {
+                cursor.advance_no_newlines(3);
+                out.push('>');
+                return Ok(());
+            }
+            Some(b'a') if cursor.remaining().starts_with("amp;") => {
+                cursor.advance_no_newlines(4);
+                out.push('&');
+                return Ok(());
+            }
+            Some(b'a') if cursor.remaining().starts_with("apos;") => {
+                cursor.advance_no_newlines(5);
+                out.push('\'');
+                return Ok(());
+            }
+            Some(b'q') if cursor.remaining().starts_with("quot;") => {
+                cursor.advance_no_newlines(5);
+                out.push('"');
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let name = parse_name(cursor)?;
         cursor.expect(";")?;
-        match &*name {
-            "lt" => Ok("<".to_string()),
-            "gt" => Ok(">".to_string()),
-            "amp" => Ok("&".to_string()),
-            "apos" => Ok("'".to_string()),
-            "quot" => Ok("\"".to_string()),
-            _ => {
-                // Check cache first to avoid re-expansion and re-validation.
-                // Charge the cached length against the budget — this is the
-                // F-02 (quadratic blow-up) defence: one large entity
-                // referenced N times becomes N * len bytes.
-                if let Some(cached) = entity_cache.get(&*name) {
-                    charge_entity_budget(budget, cached.len(), cursor.line(), cursor.column())?;
-                    return Ok(cached.clone());
-                }
-                if let Some(value) = entities.get(&*name) {
-                    // Fully expand the entity value, resolving nested entity refs.
-                    let expanded = expand_entity_value(
-                        value,
-                        entities,
-                        &mut vec![name.to_string()],
-                        budget,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    // Validate well-formedness of the entity replacement text.
-                    let validation_text = expand_entity_value_no_builtins(
-                        value,
-                        entities,
-                        &mut vec![name.to_string()],
-                        budget,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    validate_entity_as_content(
-                        &validation_text,
-                        entities,
-                        cursor.line(),
-                        cursor.column(),
-                    )?;
-                    // Cache the result for subsequent references
-                    entity_cache.insert(name.to_string(), expanded.clone());
-                    Ok(expanded)
-                } else {
-                    Err(XmlError::well_formedness(
-                        format!("Unknown entity reference: &{};", name),
-                        cursor.line(),
-                        cursor.column(),
-                    ))
-                }
-            }
+        // Check cache first to avoid re-expansion and re-validation.
+        // Charge the cached length against the budget — this is the
+        // F-02 (quadratic blow-up) defence: one large entity
+        // referenced N times becomes N * len bytes.
+        if let Some(cached) = entity_cache.get(&*name) {
+            charge_entity_budget_at_cursor(budget, cached.len(), cursor)?;
+            out.push_str(cached);
+            return Ok(());
+        }
+        if let Some(value) = entities.get(&*name) {
+            // Fully expand the entity value, resolving nested entity refs.
+            let expanded = expand_entity_value(
+                value,
+                entities,
+                &mut vec![name.to_string()],
+                budget,
+                cursor.line(),
+                cursor.column(),
+            )?;
+            // Validate well-formedness of the entity replacement text.
+            let validation_text = expand_entity_value_no_builtins(
+                value,
+                entities,
+                &mut vec![name.to_string()],
+                budget,
+                cursor.line(),
+                cursor.column(),
+            )?;
+            validate_entity_as_content(&validation_text, entities, cursor.line(), cursor.column())?;
+            // Cache the result for subsequent references
+            entity_cache.insert(name.to_string(), expanded.clone());
+            out.push_str(&expanded);
+            Ok(())
+        } else {
+            Err(XmlError::well_formedness(
+                format!("Unknown entity reference: &{};", name),
+                cursor.line(),
+                cursor.column(),
+            ))
         }
     }
 }
@@ -2418,11 +2518,15 @@ fn parse_element<'a>(
         }
     }
 
-    // Push namespace scope
+    // Push a namespace scope only when this element declares bindings. Empty
+    // scopes do not affect resolution and are common in ordinary XML.
+    let pushed_ns_scope = ns_resolver.is_some() && !ns_decls.is_empty();
     if let Some(resolver) = ns_resolver.as_mut() {
-        resolver.push_scope();
-        for (prefix, uri) in &ns_decls {
-            resolver.declare(prefix.clone(), uri.clone());
+        if pushed_ns_scope {
+            resolver.push_scope();
+            for (prefix, uri) in &ns_decls {
+                resolver.declare(prefix.clone(), uri.clone());
+            }
         }
     }
 
@@ -2505,7 +2609,8 @@ fn parse_element<'a>(
     if cursor.peek_byte() == Some(b'/') {
         cursor.expect("/>")?;
         doc.set_byte_end_pos(elem_id, cursor.pos);
-        if let Some(resolver) = ns_resolver.as_mut() {
+        if pushed_ns_scope {
+            let resolver = ns_resolver.as_mut().expect("namespace resolver exists");
             resolver.pop_scope();
         }
         return Ok(elem_id);
@@ -2544,7 +2649,8 @@ fn parse_element<'a>(
         ));
     }
 
-    if let Some(resolver) = ns_resolver.as_mut() {
+    if pushed_ns_scope {
+        let resolver = ns_resolver.as_mut().expect("namespace resolver exists");
         resolver.pop_scope();
     }
 

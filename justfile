@@ -6,6 +6,13 @@ default:
 test:
     cargo test
 
+# Run focused parser/scanner/namespace tests
+test-core:
+    cargo check
+    cargo test --lib simd::tests
+    cargo test --lib parser::tests
+    cargo test --test namespace_conformance
+
 # Run unit tests only
 unit:
     cargo test --lib
@@ -67,6 +74,22 @@ check:
 # Build in release mode
 build:
     cargo build --release
+
+# Build the performance comparison harness
+build-perf:
+    cargo build --release --manifest-path performance-harness/Cargo.toml
+
+# Run generated SAML-shaped parser comparison inputs
+perf-saml samples="101":
+    cargo run --release --manifest-path performance-harness/Cargo.toml -- saml {{samples}}
+
+# Run roxmltree's benchmark input suite; expects ../roxmltree by default
+perf-suite dir="../roxmltree/benches" samples="101":
+    cargo run --release --manifest-path performance-harness/Cargo.toml -- suite {{dir}} {{samples}}
+
+# Run one XML file through the performance comparison harness
+perf-file file samples="101":
+    cargo run --release --manifest-path performance-harness/Cargo.toml -- file {{file}} {{samples}}
 
 # Run clippy lints
 clippy:
