@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Composite entry schema importing both, so an instance can use xsi:type to
+     substitute the cross-import Derived type for the base element. -->
+<schema targetNamespace="urn:list-agg" xmlns="http://www.w3.org/2001/XMLSchema">
+  <import namespace="urn:list-ext" schemaLocation="list-ext.xsd"/>
+  <import namespace="urn:list-base" schemaLocation="list-base.xsd"/>
+</schema>

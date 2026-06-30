@@ -837,3 +837,47 @@ fn lenient_mode_keeps_other_datatype_checks() {
     assert!(validate_lenient("<n>not-an-int</n>", xsd, true).is_err());
     assert!(validate_lenient("<n>42</n>", xsd, true).is_ok());
 }
+
+/// A list-typed attribute inherited through a CROSS-IMPORT `xsi:type` extension
+/// chain is validated per item, not collapsed to its item type and applied to
+/// the whole value. This pins the behaviour investigated for the pyFF SAML
+/// metadata corpus: `protocolSupportEnumeration` (a list of `anyURI`) on a
+/// `RoleDescriptor` substituted via `xsi:type` to a WS-Fed type validates
+/// correctly. Fixtures: `test-data/xsd-import/list-*` (base declares the
+/// list attribute; ext, in another namespace, extends it; composite imports
+/// both). Excluded from the published crate, so absent fixtures skip+pass.
+#[test]
+fn cross_import_xsi_type_list_attribute_validates_per_item() {
+    use std::path::Path;
+
+    let composite = Path::new("test-data/xsd-import/list-composite.xsd");
+    if !composite.exists() {
+        eprintln!("skipping cross-import list regression: fixtures absent");
+        return;
+    }
+    let schema_src = std::fs::read_to_string(composite).expect("read list-composite.xsd");
+    let schema_doc = uppsala::parse(&schema_src).expect("parse list-composite.xsd");
+    let validator = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(composite))
+        .expect("composite schema builds");
+
+    // Valid: every list item is a valid int — must pass. (If the list type were
+    // collapsed to a single `int`, "1 2 3" would be rejected as one value.)
+    let ok = std::fs::read_to_string("test-data/xsd-import/list-ok.xml").expect("read list-ok.xml");
+    let ok_doc = uppsala::parse(&ok).expect("parse list-ok.xml");
+    let ok_errors = validator.validate(&ok_doc);
+    assert!(
+        ok_errors.is_empty(),
+        "valid list-of-int via cross-import xsi:type should pass, got: {ok_errors:?}"
+    );
+
+    // Invalid: one bad item — must be reported per item ("abc"), proving the
+    // value is split and each item validated against the list's item type.
+    let bad =
+        std::fs::read_to_string("test-data/xsd-import/list-bad.xml").expect("read list-bad.xml");
+    let bad_doc = uppsala::parse(&bad).expect("parse list-bad.xml");
+    let bad_errors = validator.validate(&bad_doc);
+    assert!(
+        bad_errors.iter().any(|e| e.message.contains("'abc'")),
+        "invalid list item should be reported per item, got: {bad_errors:?}"
+    );
+}
