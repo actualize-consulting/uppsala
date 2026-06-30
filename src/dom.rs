@@ -393,6 +393,13 @@ pub struct Document<'a> {
     /// deduplication sort by an O(1) key instead of walking each node to the root
     /// (which is quadratic over wide trees). Unreachable nodes get `u32::MAX`.
     pub(crate) doc_order: Vec<u32>,
+    /// Set when a tree/attribute mutation has invalidated the XPath caches
+    /// (`attribute_nodes` + `doc_order`), so the next [`Self::prepare_xpath`]
+    /// rebuilds them. `true` initially (caches unbuilt); cleared once built and
+    /// re-set by every mutator. Keeps `prepare_xpath` a build-once cost on the
+    /// common parse -> prepare -> query path while still allowing a mutated
+    /// document to be re-prepared.
+    pub(crate) xpath_dirty: bool,
     /// Original input for lazy line/column computation from byte positions.
     pub(crate) input: &'a str,
 }
@@ -417,6 +424,7 @@ impl<'a> Document<'a> {
             doctype: None,
             attribute_nodes: HashMap::new(),
             doc_order: Vec::new(),
+            xpath_dirty: true,
             input: "",
         }
     }
@@ -430,6 +438,7 @@ impl<'a> Document<'a> {
             doctype: self.doctype.map(|s| Cow::Owned(s.into_owned())),
             attribute_nodes: self.attribute_nodes,
             doc_order: self.doc_order,
+            xpath_dirty: self.xpath_dirty,
             input: "",
         }
     }
@@ -509,14 +518,19 @@ impl<'a> Document<'a> {
     /// Must be called before XPath evaluation if the document was parsed
     /// without attribute node construction (the default for performance).
     pub fn prepare_xpath(&mut self) {
-        // Rebuild both caches from scratch on every call so a document mutated
-        // after an earlier `prepare_xpath()` can be re-prepared — guarding on
-        // "is the cache empty?" would make re-preparation a silent no-op and
-        // leave a stale document-order index, corrupting node-set ordering/dedup.
-        // Recomputation is O(n) and `prepare_xpath` is called once per document
-        // use, not on the parse hot path. (Re-preparation orphans the previously
-        // built virtual attribute nodes in `nodes`; they become unreachable in
-        // the index and are otherwise unreferenced.)
+        // Build-once on the common parse -> prepare -> query path: skip the work
+        // when no mutation has invalidated the caches since the last prepare.
+        // A mutation sets `xpath_dirty`, so a document edited after an earlier
+        // prepare still refreshes here (guarding on "is the cache empty?" instead
+        // would make re-preparation a silent no-op and leave a stale
+        // document-order index, corrupting node-set ordering/dedup). Rebuilding
+        // is O(n) and runs only on the first prepare or after an edit, never per
+        // node. (Re-preparation orphans the previously built virtual attribute
+        // nodes in `nodes`; they become unreachable in the index and are
+        // otherwise unreferenced.)
+        if !self.xpath_dirty {
+            return;
+        }
         self.attribute_nodes.clear();
         let element_ids: Vec<NodeId> = self
             .nodes
@@ -531,6 +545,16 @@ impl<'a> Document<'a> {
             self.build_attribute_nodes(elem_id);
         }
         self.compute_doc_order();
+        self.xpath_dirty = false;
+    }
+
+    /// Mark the XPath caches (virtual attribute nodes + document-order index)
+    /// stale so the next [`Self::prepare_xpath`] rebuilds them. Called by every
+    /// tree/attribute mutation; setting a bool is cheap enough to never matter on
+    /// a hot path, and it cannot be forgotten the way an external invalidation
+    /// call could.
+    fn invalidate_xpath_caches(&mut self) {
+        self.xpath_dirty = true;
     }
 
     /// Assign each node its document-order position into `self.doc_order`, by a
@@ -674,6 +698,10 @@ impl<'a> Document<'a> {
 
     /// Get a mutable reference to a node's kind.
     pub fn node_kind_mut(&mut self, id: NodeId) -> Option<&mut NodeKind<'a>> {
+        // Conservatively invalidate: the caller may rename, re-kind, or edit the
+        // attributes of the node through this `&mut` (also covers `element_mut`,
+        // which delegates here).
+        self.invalidate_xpath_caches();
         self.nodes.get_mut(id.0).map(|n| &mut n.kind)
     }
 
@@ -1046,6 +1074,7 @@ impl<'a> Document<'a> {
     /// The child must have no parent, no siblings. Used during parsing for speed.
     #[inline]
     pub(crate) fn append_child_unchecked(&mut self, parent: NodeId, child: NodeId) {
+        self.invalidate_xpath_caches();
         debug_assert!(self.valid_node_id(parent));
         debug_assert!(self.valid_node_id(child));
         debug_assert!(!self.is_ancestor_of(child, parent));
@@ -1073,6 +1102,7 @@ impl<'a> Document<'a> {
         {
             return;
         }
+        self.invalidate_xpath_caches();
         self.detach(new_child);
         if let Some(node) = self.nodes.get_mut(new_child.0) {
             node.parent = Some(parent);
@@ -1106,6 +1136,7 @@ impl<'a> Document<'a> {
         {
             return;
         }
+        self.invalidate_xpath_caches();
         self.detach(new_child);
         if let Some(node) = self.nodes.get_mut(new_child.0) {
             node.parent = Some(parent);
@@ -1146,6 +1177,7 @@ impl<'a> Document<'a> {
         {
             return;
         }
+        self.invalidate_xpath_caches();
         self.detach(new_child);
         let prev = self.nodes.get(old_child.0).and_then(|n| n.prev_sibling);
         let next = self.nodes.get(old_child.0).and_then(|n| n.next_sibling);
@@ -1189,6 +1221,9 @@ impl<'a> Document<'a> {
             None => return,
         };
         if let Some(parent_id) = parent_id {
+            // Only an attached node changes the tree shape; a parentless node is
+            // a no-op and leaves the caches valid.
+            self.invalidate_xpath_caches();
             // Update prev sibling or parent's first_child
             if let Some(prev_id) = prev {
                 if let Some(p) = self.nodes.get_mut(prev_id.0) {
@@ -2056,9 +2091,9 @@ mod dom_tests {
     use super::*;
     use crate::parser::Parser;
 
-    /// `prepare_xpath()` rebuilds the document-order index on every call, so a
-    /// node appended after an earlier `prepare_xpath()` gets a valid position
-    /// once re-prepared (the cache is not a one-shot no-op).
+    /// `prepare_xpath()` refreshes the document-order index after a mutation, so
+    /// a node appended following an earlier `prepare_xpath()` gets a valid
+    /// position once re-prepared (the cache is not a one-shot no-op).
     #[test]
     fn prepare_xpath_reindexes_after_mutation() {
         let mut doc = Parser::new().parse("<r><a/></r>").unwrap();
@@ -2077,6 +2112,24 @@ mod dom_tests {
             doc.doc_order_at(b),
             u32::MAX,
             "re-prepare did not reindex the appended node"
+        );
+    }
+
+    /// Without a mutation, a second `prepare_xpath()` is a no-op: it does not
+    /// rebuild the caches (no extra virtual attribute nodes are allocated),
+    /// preserving the build-once cost of the document-order index.
+    #[test]
+    fn prepare_xpath_is_idempotent_without_mutation() {
+        let mut doc = Parser::new().parse(r#"<r x="1"><a y="2"/></r>"#).unwrap();
+        doc.prepare_xpath();
+        let nodes_after_first = doc.nodes.len();
+
+        // No mutation in between -> the second call must short-circuit.
+        doc.prepare_xpath();
+        assert_eq!(
+            doc.nodes.len(),
+            nodes_after_first,
+            "redundant prepare_xpath rebuilt the caches (allocated more attribute nodes)"
         );
     }
 }
