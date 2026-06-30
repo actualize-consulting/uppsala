@@ -447,11 +447,11 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::AnyURI => {
-            // `anyURI`'s lexical space is, per RFC 3987/XSD, effectively any
-            // string except one containing a space. libxml2 is more permissive
-            // and accepts spaces too; in lenient mode we match it (this is also
-            // what makes whitespace-separated values that should have been list
-            // items, but reached here as a single anyURI, validate). Strict mode
+            // `anyURI` validation here is intentionally minimal: after XSD whitespace normalization,
+            // strict mode rejects values containing a space (and thus any collapsed whitespace).
+            // libxml2 is more permissive and accepts spaces too; in lenient mode we match it
+            // (this also allows whitespace-separated tokens that reach here as a single anyURI
+            // value to validate). Strict mode
             // keeps the space check.
             let v = text.trim();
             if !lenient && v.contains(' ') {

@@ -915,9 +915,8 @@ fn lenient_mode_keeps_other_datatype_checks() {
 /// chain is validated per item, not collapsed to its item type and applied to
 /// the whole value. This pins the behaviour investigated for cross-import
 /// `xsi:type` extension chains: list items must be split and validated
-/// individually (modeled here with a list-of-`int`).
-/// correctly. Fixtures (base declares the list attribute; ext, in another
-/// namespace, extends it; composite imports both) are written to a tempdir so
+/// individually (modeled here with a list-of-`int`). Fixtures (base declares the list attribute;
+/// ext, in another namespace, extends it; composite imports both) are written to a tempdir so
 /// the test always runs (no `test-data/` reliance).
 #[test]
 fn cross_import_xsi_type_list_attribute_validates_per_item() {
