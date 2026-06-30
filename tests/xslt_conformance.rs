@@ -105,12 +105,14 @@ fn pyff_stylesheets_transform() {
     }
     let single = std::fs::read_to_string(&sample).expect("read sample metadata");
 
-    // `atom.xsl` emits an Atom feed only from an `md:EntitiesDescriptor` aggregate
-    // whose entities carry `md:Extensions/atom:entry`; run against the single
-    // `EntityDescriptor` sample it would yield an empty result tree (no root
-    // element). The sample fixtures are ours (not vendored from pyFF), so we keep
-    // the original single-entity `sample-metadata.xml` untouched and add a small
-    // aggregate fixture for the atom case here.
+    // `atom.xsl` and `pubinfo.xsl` are keyed to an `md:EntitiesDescriptor`
+    // aggregate root: `atom.xsl` emits an Atom feed only from entities carrying
+    // `md:Extensions/atom:entry` (the single-entity sample yields an empty result
+    // tree), and `pubinfo.xsl`'s `md:EntitiesDescriptor` templates only fire at an
+    // aggregate root (against the single entity it would exercise just the identity
+    // template). The sample fixtures are ours (not vendored from pyFF), so we keep
+    // the original single-entity `sample-metadata.xml` untouched and run those two
+    // stylesheets against the aggregate fixture here.
     let aggregate_path = dir.join("atom-feed-sample.xml");
     assert!(
         aggregate_path.exists(),
@@ -131,8 +133,9 @@ fn pyff_stylesheets_transform() {
         );
         let xslt = std::fs::read_to_string(&path).expect("read stylesheet");
 
-        // atom.xsl needs the aggregate input; the rest use the single-entity sample.
-        let input = if *name == "atom.xsl" {
+        // atom.xsl and pubinfo.xsl need the aggregate input; the rest use the
+        // single-entity sample.
+        let input = if matches!(*name, "atom.xsl" | "pubinfo.xsl") {
             &aggregate
         } else {
             &single
