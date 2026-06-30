@@ -53,9 +53,10 @@ impl XsdValidator {
     /// match it. Currently this affects:
     ///
     /// - **`anyURI`**: a value containing a space is accepted (strict mode
-    ///   rejects it per RFC 3987). This also lets a whitespace-separated value
-    ///   that a schema declares as a list-of-`anyURI` validate even where the
-    ///   list typing is not applied, matching libxml2's observable result.
+    ///   rejects it per RFC 3987). Real-world metadata sometimes places a space
+    ///   inside a single `anyURI` value (e.g. a malformed `Location`), which
+    ///   libxml2 also accepts. (List-of-`anyURI` typing is unaffected and
+    ///   already validates per item — see ADR 0012.)
     ///
     /// Enable this when validating documents against schemas authored for
     /// libxml2/Xerces (e.g. SAML metadata) where strict mode reports spurious

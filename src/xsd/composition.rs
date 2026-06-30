@@ -370,7 +370,8 @@ pub(super) fn process_schema_composition(
                     // skipped (an unresolvable hint never reaches this point).
                     let ext_doc = crate::parse(&ext_str).map_err(|e| {
                         XmlError::validation(format!(
-                            "imported schema '{schema_location}' is not well-formed: {e}"
+                            "imported schema '{schema_location}' (resolved to {}) is not well-formed: {e}",
+                            resolved_schema.path.display()
                         ))
                     })?;
 
