@@ -1278,8 +1278,13 @@ impl<'a> Document<'a> {
     /// responsibility (mirroring the previous behaviour). Document and virtual
     /// attribute nodes cannot be imported and yield `None`.
     pub fn import_subtree<'b>(&mut self, src: &Document<'b>, src_id: NodeId) -> Option<NodeId> {
+        // Only invalidate the XPath caches when the import actually mutates this
+        // document. A rejected root (invalid `src_id`, or a `Document`/`Attribute`
+        // node) returns `None` from `import_node_rec` before creating any node, so
+        // a no-op import must not force an unnecessary `prepare_xpath()` rebuild.
+        let new_id = self.import_node_rec(src, src_id)?;
         self.invalidate_xpath_caches();
-        self.import_node_rec(src, src_id)
+        Some(new_id)
     }
 
     /// Recursive worker for [`import_subtree`](Self::import_subtree). Creates the
@@ -1321,9 +1326,11 @@ impl<'a> Document<'a> {
             // a movable subtree.
             NodeKind::Document | NodeKind::Attribute(_, _) => return None,
         };
-        // Import children in order. `src.children` snapshots the ids up front, so
-        // mutating `self` while iterating is sound (different arenas).
-        for child in src.children(src_id) {
+        // Import children in order. `children_iter` walks `src`'s sibling links
+        // without allocating a `Vec` per recursion level; iterating `src` while
+        // mutating `self` is sound because they are distinct arenas (the iterator
+        // borrows `src`, never `self`).
+        for child in src.children_iter(src_id) {
             if let Some(child_new) = self.import_node_rec(src, child) {
                 self.append_child_unchecked(new_id, child_new);
             }
