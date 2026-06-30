@@ -728,7 +728,7 @@ impl XsdValidator {
                             return;
                         }
                         let text = doc.text_content_deep(node);
-                        validate_builtin_value(&text, &bt, doc, node, errors);
+                        validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
                     }
                     return;
                 }
@@ -858,7 +858,7 @@ impl XsdValidator {
                             });
                             }
                             let text = doc.text_content_deep(node);
-                            validate_builtin_value(&text, bt, doc, node, errors);
+                            validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
                         }
                     },
                     TypeRef::Named(ns, name) => {
@@ -1287,7 +1287,7 @@ impl XsdValidator {
                 match type_ref.as_ref() {
                     TypeRef::BuiltIn(bt) => {
                         let text = doc.text_content_deep(node);
-                        validate_builtin_value(&text, bt, doc, node, errors);
+                        validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
                     }
                     TypeRef::Named(ns, local_name) => {
                         let key = (ns.clone(), local_name.clone());
@@ -2055,7 +2055,7 @@ impl XsdValidator {
             // Validate each item against the item type
             if let Some(ref item_bt) = st.item_type {
                 for item in &items {
-                    validate_builtin_value(item, item_bt, doc, node, errors);
+                    validate_builtin_value(item, item_bt, doc, node, errors, self.lenient);
                     // Also validate item-level facets (from user-defined item types)
                     for facet in &st.item_facets {
                         validate_facet(
@@ -2076,7 +2076,7 @@ impl XsdValidator {
                 validate_list_facet(&items, facet, &text, doc, node, errors);
             }
         } else {
-            validate_builtin_value(&text, &st.base, doc, node, errors);
+            validate_builtin_value(&text, &st.base, doc, node, errors, self.lenient);
 
             // Validate facets
             for facet in &st.facets {
@@ -2109,7 +2109,7 @@ impl XsdValidator {
     ) {
         match type_ref {
             TypeRef::BuiltIn(bt) => {
-                validate_builtin_value(value, bt, doc, node, errors);
+                validate_builtin_value(value, bt, doc, node, errors, self.lenient);
             }
             TypeRef::Inline(td) => {
                 match td.as_ref() {
@@ -2118,7 +2118,14 @@ impl XsdValidator {
                             let items: Vec<&str> = value.split_whitespace().collect();
                             if let Some(ref item_bt) = st.item_type {
                                 for item in &items {
-                                    validate_builtin_value(item, item_bt, doc, node, errors);
+                                    validate_builtin_value(
+                                        item,
+                                        item_bt,
+                                        doc,
+                                        node,
+                                        errors,
+                                        self.lenient,
+                                    );
                                     for facet in &st.item_facets {
                                         validate_facet(
                                             item,
@@ -2136,7 +2143,14 @@ impl XsdValidator {
                                 validate_list_facet(&items, facet, value, doc, node, errors);
                             }
                         } else {
-                            validate_builtin_value(value, &st.base, doc, node, errors);
+                            validate_builtin_value(
+                                value,
+                                &st.base,
+                                doc,
+                                node,
+                                errors,
+                                self.lenient,
+                            );
                             for facet in &st.facets {
                                 validate_facet(
                                     value,
@@ -2169,7 +2183,14 @@ impl XsdValidator {
                         let items: Vec<&str> = value.split_whitespace().collect();
                         if let Some(ref item_bt) = st.item_type {
                             for item in &items {
-                                validate_builtin_value(item, item_bt, doc, node, errors);
+                                validate_builtin_value(
+                                    item,
+                                    item_bt,
+                                    doc,
+                                    node,
+                                    errors,
+                                    self.lenient,
+                                );
                                 for facet in &st.item_facets {
                                     validate_facet(
                                         item,
@@ -2187,7 +2208,7 @@ impl XsdValidator {
                             validate_list_facet(&items, facet, value, doc, node, errors);
                         }
                     } else {
-                        validate_builtin_value(value, &st.base, doc, node, errors);
+                        validate_builtin_value(value, &st.base, doc, node, errors, self.lenient);
                         for facet in &st.facets {
                             validate_facet(
                                 value,
@@ -2203,7 +2224,7 @@ impl XsdValidator {
                 } else if ns.as_deref() == Some(XS_NAMESPACE) {
                     // It's a built-in XSD type
                     if let Some(bt) = parse_builtin_type(name) {
-                        validate_builtin_value(value, &bt, doc, node, errors);
+                        validate_builtin_value(value, &bt, doc, node, errors, self.lenient);
                     }
                 }
             }

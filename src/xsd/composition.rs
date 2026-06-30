@@ -329,30 +329,57 @@ pub(super) fn process_schema_composition(
                         None => continue, // No schemaLocation, skip (namespace-only import)
                     };
 
-                    // Same resolve-then-read sequence as include/redefine.
+                    // `xs:import/@schemaLocation` is only a *hint* (XSD 1.0 Part 1
+                    // §4.2.3): a processor may ignore it and is not obliged to
+                    // resolve it. Unlike `xs:include`/`xs:redefine` (which still treat
+                    // absolute-URI schemes and base-directory escapes as hard errors),
+                    // an import whose location cannot be resolved — unsupported schemes,
+                    // a missing file, or a path outside the base directory — is skipped
+                    // rather than aborting the whole build. This matches
+                    // libxml2/Xerces and is what lets composite schemas (e.g.
+                    // pyFF's `schema.xsd`) build: their imported schemas carry
+                    // redundant absolute/classpath import hints for namespaces
+                    // already supplied by a sibling, resolvable import.
+                    //
+                    // Only an *unresolvable* location is skipped. Once the hint
+                    // resolves to a real, readable file the imported schema is
+                    // genuinely present, so a malformed (non-well-formed) or
+                    // semantically broken target is a real error and is surfaced,
+                    // not silently dropped.
                     let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir,
                         canonical_base.as_deref(),
                         state,
                         "import",
-                    )? {
-                        Some(p) => p,
-                        None => continue,
+                    ) {
+                        Ok(Some(p)) => p,
+                        Ok(None) | Err(_) => continue,
                     };
 
-                    // Load and parse the external schema, verifying after open
-                    // that the handle still matches the resolved file identity
-                    // where the platform exposes one through std.
+                    // Load the external schema, verifying after open that the
+                    // handle still matches the resolved file identity where the
+                    // platform exposes one through std. A post-resolution open or
+                    // read failure (`Ok(None)` — the file vanished or became
+                    // unreadable after resolving) is treated as the hint failing
+                    // to resolve and is skipped, consistent with the hint
+                    // semantics above; only a file-identity mismatch is surfaced
+                    // (the `?`), since that signals a TOCTOU swap rather than an
+                    // absent hint.
                     let ext_str =
                         match read_resolved_schema(&resolved_schema, schema_location, "import")? {
                             Some(s) => s,
                             None => continue,
                         };
-                    let ext_doc = match crate::parse(&ext_str) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
+                    // The file resolved and its bytes were read: a parse failure
+                    // is a real broken-schema error, surfaced with context rather
+                    // than skipped.
+                    let ext_doc = crate::parse(&ext_str).map_err(|e| {
+                        XmlError::validation(format!(
+                            "imported schema '{schema_location}' (resolved to {}) is not well-formed: {e}",
+                            resolved_schema.path.display()
+                        ))
+                    })?;
 
                     // Build a sub-validator from the external schema.
                     // Same balanced-decrement pattern as the include /

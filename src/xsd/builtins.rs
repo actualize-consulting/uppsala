@@ -137,6 +137,7 @@ pub(crate) fn validate_builtin_value(
     doc: &Document,
     node: NodeId,
     errors: &mut Vec<ValidationError>,
+    lenient: bool,
 ) {
     // Apply XSD whiteSpace normalization before any validation.
     // Per XSD Part 2, whiteSpace is a pre-processing step applied to the
@@ -446,8 +447,14 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::AnyURI => {
+            // `anyURI` validation here is intentionally minimal: after XSD whitespace normalization,
+            // strict mode rejects values containing a space (and thus any collapsed whitespace).
+            // libxml2 is more permissive and accepts spaces too; in lenient mode we match it
+            // (this also allows whitespace-separated tokens that reach here as a single anyURI
+            // value to validate). Strict mode
+            // keeps the space check.
             let v = text.trim();
-            if v.contains(' ') {
+            if !lenient && v.contains(' ') {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid anyURI", text),
                     line: Some(doc.node_line(node)),

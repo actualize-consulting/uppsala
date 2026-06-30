@@ -44,6 +44,27 @@ impl XsdValidator {
         self.enforce_qname_length_facets = enforce;
     }
 
+    /// Enable libxml2-compatible *lenient* datatype validation. Default is
+    /// `false` (strict, spec-faithful).
+    ///
+    /// libxml2 — the de-facto reference for many real-world toolchains (lxml,
+    /// pyFF, …) — validates some lexical spaces more permissively than the XSD
+    /// specification. When `lenient` is `true`, uppsala relaxes those checks to
+    /// match it. Currently this affects:
+    ///
+    /// - **`anyURI`**: a value containing a space is accepted (strict mode
+    ///   rejects it per RFC 3987). Real-world metadata sometimes places a space
+    ///   inside a single `anyURI` value (e.g. a malformed `Location`), which
+    ///   libxml2 also accepts. (List-of-`anyURI` typing is unaffected and
+    ///   already validates per item — see ADR 0012.)
+    ///
+    /// Enable this when validating documents against schemas authored for
+    /// libxml2/Xerces (e.g. SAML metadata) where strict mode reports spurious
+    /// datatype errors that those processors accept.
+    pub fn set_lenient(&mut self, lenient: bool) {
+        self.lenient = lenient;
+    }
+
     /// Build a validator from a parsed XSD schema document, with a base path
     /// for resolving `schemaLocation` attributes in `xs:include` and `xs:redefine`.
     ///
@@ -88,6 +109,7 @@ impl XsdValidator {
             block_default_restriction: false,
             enforce_qname_length_facets: true,
             substitution_groups: HashMap::new(),
+            lenient: false,
         };
 
         let schema_elem = schema_doc
