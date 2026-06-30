@@ -228,6 +228,11 @@ pub struct Stylesheet {
     /// `exsl:`); see [`Stylesheet::with_exslt`]. `date:date-time()` is available
     /// regardless. Default `false`.
     exslt_enabled: bool,
+    /// External top-level `xsl:param` values supplied via
+    /// [`Stylesheet::with_param`], as `(name, string value)`. At transform time
+    /// an override replaces the param's default; names that are not declared
+    /// params (or name an `xsl:variable`) are ignored.
+    param_overrides: Vec<(String, String)>,
 }
 
 struct GlobalVar {
@@ -381,6 +386,18 @@ impl Stylesheet {
         self
     }
 
+    /// Supply an external value for a top-level `xsl:param`, overriding its
+    /// default. The value is bound as a string (the common case for external
+    /// parameters, e.g. `pubinfo.xsl`'s `$publisher`). Returns `self` for
+    /// chaining; call once per parameter. A name that does not match a declared
+    /// top-level `xsl:param` (including one that names an `xsl:variable`) is
+    /// ignored, matching XSLT's treatment of unused supplied parameters. The last
+    /// value supplied for a given name wins.
+    pub fn with_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.param_overrides.push((name.into(), value.into()));
+        self
+    }
+
     /// Transform `source` and return the serialized result.
     ///
     /// The source document must be ready for XPath evaluation — call
@@ -506,6 +523,7 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
         namespaces,
         max_depth: DEFAULT_MAX_XSLT_DEPTH,
         exslt_enabled: false,
+        param_overrides: Vec::new(),
     })
 }
 
@@ -1058,7 +1076,23 @@ impl<'a, 'b> Engine<'a, 'b> {
             size: 1,
         };
         for g in &stylesheet.globals {
-            let val = self.eval_value_source(&g.value, focus)?;
+            // A top-level xsl:param may be overridden externally (last value for
+            // the name wins); xsl:variable and un-overridden params evaluate their
+            // default. Overrides bind as a string value.
+            let override_val = if g.is_param {
+                stylesheet
+                    .param_overrides
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| *n == g.name)
+                    .map(|(_, v)| v.clone())
+            } else {
+                None
+            };
+            let val = match override_val {
+                Some(v) => VarValue::Value(XPathValue::String(v)),
+                None => self.eval_value_source(&g.value, focus)?,
+            };
             self.globals.push((g.name.clone(), val));
         }
         Ok(())
@@ -2305,6 +2339,48 @@ mod tests {
         let xml = r#"<r/>"#;
         let result = transform(xslt, xml).unwrap();
         assert_eq!(result, r#"<out>abc</out>"#);
+    }
+
+    /// An unsupported `xsl:output/@method` (e.g. `html`) is rejected at compile
+    /// time rather than silently serialized as XML.
+    #[test]
+    fn output_method_html_errors() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="html"/>
+            <xsl:template match="/"><out/></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+        assert!(transform(xslt, xml).is_err());
+    }
+
+    /// A top-level `xsl:param` can be supplied externally via `with_param`,
+    /// overriding its default; the value is visible to the templates.
+    #[test]
+    fn with_param_overrides_top_level_param() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:param name="publisher">default</xsl:param>
+            <xsl:template match="/"><out><xsl:value-of select="$publisher"/></out></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+
+        // Default (no override) uses the param's body value.
+        let style_doc = crate::Parser::new().parse(xslt).unwrap();
+        let mut src = crate::Parser::new().parse(xml).unwrap();
+        src.prepare_xpath();
+        let default_out = Stylesheet::compile(&style_doc)
+            .unwrap()
+            .transform(&src)
+            .unwrap();
+        assert_eq!(default_out, r#"<out>default</out>"#);
+
+        // Override replaces it.
+        let overridden = Stylesheet::compile(&style_doc)
+            .unwrap()
+            .with_param("publisher", "ACME")
+            .transform(&src)
+            .unwrap();
+        assert_eq!(overridden, r#"<out>ACME</out>"#);
     }
 
     /// `xsl:element` with a prefixed name whose prefix is not bound in the
