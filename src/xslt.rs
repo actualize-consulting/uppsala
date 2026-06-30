@@ -372,7 +372,7 @@ impl Stylesheet {
     /// bind the conventional EXSLT prefixes (e.g. `xmlns:str="http://exslt.org/
     /// strings"`); functions are matched by prefix. `date:date-time()` is
     /// available regardless of this flag. Returns `self` for chaining. See the
-    /// [`crate::exslt`] module for the supported set.
+    /// crate-level documentation for the supported EXSLT function set.
     pub fn with_exslt(mut self, enabled: bool) -> Self {
         self.exslt_enabled = enabled;
         self
@@ -1138,7 +1138,7 @@ impl<'a, 'b> Engine<'a, 'b> {
         // their own params. Swap in a fresh local frame.
         let saved = std::mem::take(&mut self.locals);
         for p in &tmpl.params {
-            let val = match params.iter().find(|(n, _)| *n == p.name) {
+            let val = match params.iter().find(|(n, _)| n == &p.name) {
                 Some((_, v)) => v.clone(),
                 // Defaults are evaluated in the callee context and can reference
                 // params declared earlier (already pushed onto self.locals).
