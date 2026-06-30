@@ -357,17 +357,23 @@ pub(super) fn process_schema_composition(
                         Ok(None) | Err(_) => continue,
                     };
 
-                    // Load and parse the external schema, verifying after open
-                    // that the handle still matches the resolved file identity
-                    // where the platform exposes one through std.
+                    // Load the external schema, verifying after open that the
+                    // handle still matches the resolved file identity where the
+                    // platform exposes one through std. A post-resolution open or
+                    // read failure (`Ok(None)` — the file vanished or became
+                    // unreadable after resolving) is treated as the hint failing
+                    // to resolve and is skipped, consistent with the hint
+                    // semantics above; only a file-identity mismatch is surfaced
+                    // (the `?`), since that signals a TOCTOU swap rather than an
+                    // absent hint.
                     let ext_str =
                         match read_resolved_schema(&resolved_schema, schema_location, "import")? {
                             Some(s) => s,
                             None => continue,
                         };
-                    // The file resolved and was read: a parse failure is a real
-                    // broken-schema error, surfaced with context rather than
-                    // skipped (an unresolvable hint never reaches this point).
+                    // The file resolved and its bytes were read: a parse failure
+                    // is a real broken-schema error, surfaced with context rather
+                    // than skipped.
                     let ext_doc = crate::parse(&ext_str).map_err(|e| {
                         XmlError::validation(format!(
                             "imported schema '{schema_location}' (resolved to {}) is not well-formed: {e}",
