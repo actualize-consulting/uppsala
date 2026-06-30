@@ -76,12 +76,16 @@ error.
 - A redundant import that names a namespace *not* otherwise supplied is silently
   absent; references into it then fail later as ordinary "type/element not found"
   errors, which is the correct XSD outcome for an unavailable import.
-- Regression coverage: `tests/xsd_conformance.rs::
-  import_with_unresolvable_hint_is_skipped_and_root_resolves`, with a minimal
-  self-contained fixture under `test-data/xsd-import/` (a resolvable `inner.xsd`
-  declaring the root element, plus a `classpath:` import hint that must be
-  skipped). The fixture is excluded from the published crate, so clean checkouts
-  print a notice and pass.
+- Only an *unresolvable* location is skipped. Once a hint resolves to a real,
+  readable file the imported schema is genuinely present, so a malformed (not
+  well-formed) or semantically broken target is surfaced as an error, not
+  silently dropped.
+- Regression coverage in `tests/xsd_conformance.rs`:
+  `import_with_unresolvable_hint_is_skipped_and_root_resolves` (a resolvable
+  `inner.xsd` declaring the root element plus a `classpath:` import hint that must
+  be skipped) and `import_of_resolvable_malformed_schema_errors` (a resolvable but
+  non-well-formed import must surface). Both write their fixtures to a tempdir, so
+  they always run regardless of the published-crate `test-data/` exclusion.
 - ADR 0003 is unaffected: `xs:include` of an unresolvable URI still fails by
   design.
 

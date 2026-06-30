@@ -734,6 +734,22 @@ fn nullable_choice_via_optional_sequence_alternative() {
 
 // ─── xs:import schemaLocation hint semantics ────────────────
 
+/// Create a unique tempdir so a test can write sibling schema files and resolve
+/// `schemaLocation` against them — no dependency on excluded `test-data/`.
+fn import_test_dir(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "uppsala-xsdimport-{}-{}-{}",
+        label,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).expect("create tempdir");
+    dir
+}
+
 /// Regression for the composite-schema import bug (see ADR 0011 and
 /// `xsd_bug.md`): an `xs:import` whose `schemaLocation` cannot be resolved
 /// (here a `classpath:` URI) must be skipped — the location is only a hint per
@@ -741,34 +757,68 @@ fn nullable_choice_via_optional_sequence_alternative() {
 /// the fix the build failed with "absolute URI not supported", so the root
 /// element declared in a *sibling, resolvable* import (`urn:inner` `Thing`)
 /// could never be found ("No element declaration found for 'Thing'"). Fixtures
-/// live under `test-data/xsd-import/` (excluded from the published crate, so a
-/// clean checkout without them prints a notice and passes).
+/// are written to a tempdir so the test always runs (no `test-data/` reliance).
 #[test]
 fn import_with_unresolvable_hint_is_skipped_and_root_resolves() {
-    use std::path::Path;
+    let dir = import_test_dir("hint");
 
-    let composite = Path::new("test-data/xsd-import/composite.xsd");
-    if !composite.exists() {
-        eprintln!(
-            "skipping xs:import hint regression: {} not present",
-            composite.display()
-        );
-        return;
-    }
+    std::fs::write(
+        dir.join("inner.xsd"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:inner" xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:i="urn:inner" elementFormDefault="qualified">
+  <element name="Thing" type="i:ThingType"/>
+  <complexType name="ThingType"><attribute name="id" type="string"/></complexType>
+</schema>"#,
+    )
+    .unwrap();
 
-    let schema_src = std::fs::read_to_string(composite).expect("read composite.xsd");
-    let schema_doc = uppsala::parse(&schema_src).expect("parse composite.xsd");
+    let composite_src = r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:aggregate" xmlns="http://www.w3.org/2001/XMLSchema" version="1.0">
+  <import namespace="urn:unresolvable" schemaLocation="classpath:/schema/does-not-exist.xsd"/>
+  <import namespace="urn:inner" schemaLocation="inner.xsd"/>
+</schema>"#;
+    let composite_path = dir.join("composite.xsd");
+    std::fs::write(&composite_path, composite_src).unwrap();
+
+    let schema_doc = uppsala::parse(composite_src).expect("parse composite.xsd");
     // Build must succeed despite the unresolvable `classpath:` import hint.
-    let validator = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(composite))
-        .expect("composite schema must build despite an unresolvable import hint");
+    let validator =
+        uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path))
+            .expect("composite schema must build despite an unresolvable import hint");
 
     // The root element comes only from the resolvable `inner.xsd` import.
-    let xml = std::fs::read_to_string("test-data/xsd-import/thing.xml").expect("read thing.xml");
-    let doc = uppsala::parse(&xml).expect("parse thing.xml");
+    let doc = uppsala::parse(r#"<i:Thing xmlns:i="urn:inner" id="x"/>"#).expect("parse instance");
     let errors = validator.validate(&doc);
     assert!(
         errors.is_empty(),
         "expected <i:Thing> to validate against the imported declaration, got: {errors:?}"
+    );
+}
+
+/// Counterpart to the hint-skip rule: an `xs:import` whose `schemaLocation`
+/// *resolves* to a real, readable file that is **not** well-formed is a genuine
+/// error and must surface (only an *unresolvable* location is skipped).
+#[test]
+fn import_of_resolvable_malformed_schema_errors() {
+    let dir = import_test_dir("malformed");
+
+    // Resolvable sibling file, but not well-formed XML.
+    std::fs::write(dir.join("broken.xsd"), "<schema><not-closed>").unwrap();
+
+    let composite_src = r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:aggregate" xmlns="http://www.w3.org/2001/XMLSchema">
+  <import namespace="urn:broken" schemaLocation="broken.xsd"/>
+</schema>"#;
+    let composite_path = dir.join("composite.xsd");
+    std::fs::write(&composite_path, composite_src).unwrap();
+
+    let schema_doc = uppsala::parse(composite_src).expect("parse composite.xsd");
+    let result =
+        uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path));
+    assert!(
+        result.is_err(),
+        "a resolvable-but-malformed imported schema must surface an error, not be skipped"
     );
 }
 
@@ -843,27 +893,59 @@ fn lenient_mode_keeps_other_datatype_checks() {
 /// the whole value. This pins the behaviour investigated for the pyFF SAML
 /// metadata corpus: `protocolSupportEnumeration` (a list of `anyURI`) on a
 /// `RoleDescriptor` substituted via `xsi:type` to a WS-Fed type validates
-/// correctly. Fixtures: `test-data/xsd-import/list-*` (base declares the
-/// list attribute; ext, in another namespace, extends it; composite imports
-/// both). Excluded from the published crate, so absent fixtures skip+pass.
+/// correctly. Fixtures (base declares the list attribute; ext, in another
+/// namespace, extends it; composite imports both) are written to a tempdir so
+/// the test always runs (no `test-data/` reliance).
 #[test]
 fn cross_import_xsi_type_list_attribute_validates_per_item() {
-    use std::path::Path;
+    let dir = import_test_dir("list");
 
-    let composite = Path::new("test-data/xsd-import/list-composite.xsd");
-    if !composite.exists() {
-        eprintln!("skipping cross-import list regression: fixtures absent");
-        return;
-    }
-    let schema_src = std::fs::read_to_string(composite).expect("read list-composite.xsd");
-    let schema_doc = uppsala::parse(&schema_src).expect("parse list-composite.xsd");
-    let validator = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(composite))
-        .expect("composite schema builds");
+    std::fs::write(
+        dir.join("list-base.xsd"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:list-base" xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:b="urn:list-base" elementFormDefault="unqualified">
+  <element name="e" type="b:Base"/>
+  <complexType name="Base"><attribute name="nums" type="b:intList"/></complexType>
+  <simpleType name="intList"><list itemType="int"/></simpleType>
+</schema>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("list-ext.xsd"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:list-ext" xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:x="urn:list-ext" xmlns:b="urn:list-base">
+  <import namespace="urn:list-base" schemaLocation="list-base.xsd"/>
+  <complexType name="Derived">
+    <complexContent>
+      <extension base="b:Base"><attribute name="z" type="string"/></extension>
+    </complexContent>
+  </complexType>
+</schema>"#,
+    )
+    .unwrap();
+    let composite_src = r#"<?xml version="1.0" encoding="UTF-8"?>
+<schema targetNamespace="urn:list-agg" xmlns="http://www.w3.org/2001/XMLSchema">
+  <import namespace="urn:list-ext" schemaLocation="list-ext.xsd"/>
+  <import namespace="urn:list-base" schemaLocation="list-base.xsd"/>
+</schema>"#;
+    let composite_path = dir.join("list-composite.xsd");
+    std::fs::write(&composite_path, composite_src).unwrap();
+
+    let schema_doc = uppsala::parse(composite_src).expect("parse list-composite.xsd");
+    let validator =
+        uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path))
+            .expect("composite schema builds");
 
     // Valid: every list item is a valid int — must pass. (If the list type were
     // collapsed to a single `int`, "1 2 3" would be rejected as one value.)
-    let ok = std::fs::read_to_string("test-data/xsd-import/list-ok.xml").expect("read list-ok.xml");
-    let ok_doc = uppsala::parse(&ok).expect("parse list-ok.xml");
+    let ok_doc = uppsala::parse(
+        r#"<b:e xmlns:b="urn:list-base" xmlns:x="urn:list-ext"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:type="x:Derived" nums="1 2 3" z="hi"/>"#,
+    )
+    .expect("parse ok instance");
     let ok_errors = validator.validate(&ok_doc);
     assert!(
         ok_errors.is_empty(),
@@ -872,9 +954,12 @@ fn cross_import_xsi_type_list_attribute_validates_per_item() {
 
     // Invalid: one bad item — must be reported per item ("abc"), proving the
     // value is split and each item validated against the list's item type.
-    let bad =
-        std::fs::read_to_string("test-data/xsd-import/list-bad.xml").expect("read list-bad.xml");
-    let bad_doc = uppsala::parse(&bad).expect("parse list-bad.xml");
+    let bad_doc = uppsala::parse(
+        r#"<b:e xmlns:b="urn:list-base" xmlns:x="urn:list-ext"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:type="x:Derived" nums="1 abc 3" z="hi"/>"#,
+    )
+    .expect("parse bad instance");
     let bad_errors = validator.validate(&bad_doc);
     assert!(
         bad_errors.iter().any(|e| e.message.contains("'abc'")),

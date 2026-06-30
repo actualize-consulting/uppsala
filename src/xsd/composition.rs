@@ -339,9 +339,13 @@ pub(super) fn process_schema_composition(
                     // libxml2/Xerces and is what lets composite schemas (e.g.
                     // pyFF's `schema.xsd`) build: their imported schemas carry
                     // redundant absolute/classpath import hints for namespaces
-                    // already supplied by a sibling, resolvable import. (Resolution
-                    // does not parse or build the target; a genuinely broken
-                    // *resolvable* schema still surfaces below.)
+                    // already supplied by a sibling, resolvable import.
+                    //
+                    // Only an *unresolvable* location is skipped. Once the hint
+                    // resolves to a real, readable file the imported schema is
+                    // genuinely present, so a malformed (non-well-formed) or
+                    // semantically broken target is a real error and is surfaced,
+                    // not silently dropped.
                     let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir,
@@ -361,10 +365,14 @@ pub(super) fn process_schema_composition(
                             Some(s) => s,
                             None => continue,
                         };
-                    let ext_doc = match crate::parse(&ext_str) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
+                    // The file resolved and was read: a parse failure is a real
+                    // broken-schema error, surfaced with context rather than
+                    // skipped (an unresolvable hint never reaches this point).
+                    let ext_doc = crate::parse(&ext_str).map_err(|e| {
+                        XmlError::validation(format!(
+                            "imported schema '{schema_location}' is not well-formed: {e}"
+                        ))
+                    })?;
 
                     // Build a sub-validator from the external schema.
                     // Same balanced-decrement pattern as the include /
