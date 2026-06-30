@@ -121,7 +121,9 @@ fn math_constant(doc: &Document<'_>, args: &[XPathValue]) -> f64 {
     let raw = match name.as_str() {
         "PI" => std::f64::consts::PI,
         "E" => std::f64::consts::E,
-        "SQRRT2" => std::f64::consts::SQRT_2,
+        // The EXSLT spec spells this "SQRRT2" (a long-standing typo); accept the
+        // intuitive "SQRT2" as well so callers using either spelling work.
+        "SQRT2" | "SQRRT2" => std::f64::consts::SQRT_2,
         "LN2" => std::f64::consts::LN_2,
         "LN10" => std::f64::consts::LN_10,
         "LOG2E" => std::f64::consts::LOG2_E,

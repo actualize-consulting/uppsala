@@ -502,7 +502,13 @@ fn parse_output(doc: &Document<'_>, node: NodeId, output: &mut OutputOptions) {
         output.indent = i == "yes";
     }
     if let Some(e) = doc.get_attribute(node, "encoding") {
-        output.encoding = e.to_string();
+        // The transform result is a Rust `String` (always UTF-8), so only UTF-8
+        // can be honored — declaring any other encoding would mislabel the bytes
+        // and downstream consumers would mis-decode them. Keep the canonical
+        // "UTF-8" and ignore other requests rather than emit a wrong declaration.
+        if e.eq_ignore_ascii_case("utf-8") {
+            output.encoding = "UTF-8".to_string();
+        }
     }
     if let Some(o) = doc.get_attribute(node, "omit-xml-declaration") {
         output.omit_xml_declaration = o == "yes";
@@ -531,12 +537,20 @@ fn compile_template(
         .and_then(|s| s.trim().parse::<f64>().ok());
 
     // Leading xsl:param children declare the template's parameters; the rest is
-    // the body sequence constructor.
+    // the body sequence constructor. Per XSLT 1.0 the params must come first, so
+    // an xsl:param after any non-whitespace content is an error (insignificant
+    // whitespace between params does not end the parameter section).
     let mut params = Vec::new();
     let mut body = Vec::new();
+    let mut seen_body = false;
     for child in doc.children(node) {
         match doc.node_kind(child) {
             Some(NodeKind::Element(ce)) if is_xsl(ce, "param") => {
+                if seen_body {
+                    return Err(XmlError::xpath(
+                        "xsl:param must come before all other template content",
+                    ));
+                }
                 let name = ce
                     .get_attribute("name")
                     .ok_or_else(|| XmlError::xpath("xsl:param requires name"))?
@@ -544,7 +558,13 @@ fn compile_template(
                 let value = compile_value_source(doc, child, ce, ns)?;
                 params.push(WithParam { name, value });
             }
-            _ => compile_node_into(doc, child, ns, &mut body)?,
+            // Whitespace-only text between params is insignificant and does not
+            // start the body (so following xsl:param are still parameters).
+            Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) if t.trim().is_empty() => {}
+            _ => {
+                seen_body = true;
+                compile_node_into(doc, child, ns, &mut body)?;
+            }
         }
     }
 
@@ -2337,6 +2357,40 @@ mod tests {
         </xsl:stylesheet>"#;
         let xml = r#"<r><n>3</n><n>41</n><n>7</n></r>"#;
         assert_eq!(transform_exslt(xslt, xml).unwrap(), "41,1024");
+    }
+
+    /// EXSLT — `math:constant` accepts both the intuitive `SQRT2` spelling and
+    /// the EXSLT-spec `SQRRT2` typo, rounded to the requested significant figures.
+    #[test]
+    fn exslt_math_constant_sqrt2() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:math="http://exslt.org/math">
+            <xsl:output method="text"/>
+            <xsl:template match="/"><xsl:value-of select="math:constant('SQRT2', 4)"/>,<xsl:value-of select="math:constant('SQRRT2', 4)"/></xsl:template>
+        </xsl:stylesheet>"#;
+        assert_eq!(transform_exslt(xslt, "<r/>").unwrap(), "1.414,1.414");
+    }
+
+    /// `xsl:param` after other template content is an error (XSLT 1.0 requires
+    /// params first); insignificant whitespace before it does not count.
+    #[test]
+    fn param_after_content_errors() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:template match="/"><foo/><xsl:param name="x"/></xsl:template>
+        </xsl:stylesheet>"#;
+        assert!(transform(xslt, "<r/>").is_err());
+    }
+
+    /// A non-UTF-8 `xsl:output/@encoding` is not honored: the result is a UTF-8
+    /// string, so the declaration must say UTF-8 rather than mislabel the bytes.
+    #[test]
+    fn output_encoding_forced_utf8() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" encoding="ISO-8859-1"/>
+            <xsl:template match="/"><r/></xsl:template>
+        </xsl:stylesheet>"#;
+        let out = transform(xslt, "<x/>").unwrap();
+        assert!(out.contains(r#"encoding="UTF-8"#), "got {out}");
+        assert!(!out.contains("ISO-8859-1"), "got {out}");
     }
 
     /// EXSLT — `str:padding` builds a fixed-length string from a repeated pad,
