@@ -731,3 +731,109 @@ fn nullable_choice_via_optional_sequence_alternative() {
     assert!(validate_xml_against_xsd("<root><a>x</a><c>y</c></root>", xsd).is_ok());
     assert!(validate_xml_against_xsd("<root/>", xsd).is_ok());
 }
+
+// ─── xs:import schemaLocation hint semantics ────────────────
+
+/// Regression for the composite-schema import bug (see ADR 0011 and
+/// `xsd_bug.md`): an `xs:import` whose `schemaLocation` cannot be resolved
+/// (here a `classpath:` URI) must be skipped — the location is only a hint per
+/// XSD 1.0 Part 1 §4.2.3 — instead of aborting the whole schema build. Before
+/// the fix the build failed with "absolute URI not supported", so the root
+/// element declared in a *sibling, resolvable* import (`urn:inner` `Thing`)
+/// could never be found ("No element declaration found for 'Thing'"). Fixtures
+/// live under `test-data/xsd-import/` (excluded from the published crate, so a
+/// clean checkout without them prints a notice and passes).
+#[test]
+fn import_with_unresolvable_hint_is_skipped_and_root_resolves() {
+    use std::path::Path;
+
+    let composite = Path::new("test-data/xsd-import/composite.xsd");
+    if !composite.exists() {
+        eprintln!(
+            "skipping xs:import hint regression: {} not present",
+            composite.display()
+        );
+        return;
+    }
+
+    let schema_src = std::fs::read_to_string(composite).expect("read composite.xsd");
+    let schema_doc = uppsala::parse(&schema_src).expect("parse composite.xsd");
+    // Build must succeed despite the unresolvable `classpath:` import hint.
+    let validator = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(composite))
+        .expect("composite schema must build despite an unresolvable import hint");
+
+    // The root element comes only from the resolvable `inner.xsd` import.
+    let xml = std::fs::read_to_string("test-data/xsd-import/thing.xml").expect("read thing.xml");
+    let doc = uppsala::parse(&xml).expect("parse thing.xml");
+    let errors = validator.validate(&doc);
+    assert!(
+        errors.is_empty(),
+        "expected <i:Thing> to validate against the imported declaration, got: {errors:?}"
+    );
+}
+
+// ─── libxml2-compatible lenient datatype mode ──────────────
+
+/// Validate with lenient mode toggled on the validator.
+fn validate_lenient(xml: &str, xsd: &str, lenient: bool) -> Result<(), String> {
+    let schema_doc = uppsala::parse(xsd).map_err(|e| format!("Schema parse error: {e}"))?;
+    let mut validator = uppsala::XsdValidator::from_schema(&schema_doc)
+        .map_err(|e| format!("Schema load error: {e}"))?;
+    validator.set_lenient(lenient);
+    let doc = uppsala::parse(xml).map_err(|e| format!("XML parse error: {e}"))?;
+    let errors = validator.validate(&doc);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+}
+
+/// Strict mode rejects an `anyURI` containing a space (RFC 3987); lenient mode
+/// accepts it, matching libxml2. Regression for ADR 0012.
+#[test]
+fn anyuri_space_strict_rejected_lenient_accepted() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:element name="loc" type="xs:anyURI"/>
+    </xs:schema>"#;
+    let xml = "<loc>geo:1.0, 2.0</loc>";
+    assert!(
+        validate_lenient(xml, xsd, false).is_err(),
+        "strict mode must reject an anyURI containing a space"
+    );
+    assert!(
+        validate_lenient(xml, xsd, true).is_ok(),
+        "lenient mode must accept an anyURI containing a space"
+    );
+}
+
+/// A whitespace-separated value that reaches `anyURI` validation as a single
+/// value (e.g. when list typing is not applied) is rejected in strict mode but
+/// accepted in lenient mode — the observable libxml2 result for SAML
+/// `protocolSupportEnumeration`-style values.
+#[test]
+fn anyuri_multitoken_value_lenient() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:element name="e">
+        <xs:complexType><xs:attribute name="protos" type="xs:anyURI"/></xs:complexType>
+      </xs:element>
+    </xs:schema>"#;
+    let xml = r#"<e protos="urn:a urn:b http://x/y"/>"#;
+    assert!(validate_lenient(xml, xsd, false).is_err());
+    assert!(validate_lenient(xml, xsd, true).is_ok());
+}
+
+/// Lenient mode must not turn off unrelated datatype checks: a malformed
+/// integer is still rejected.
+#[test]
+fn lenient_mode_keeps_other_datatype_checks() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:element name="n" type="xs:int"/>
+    </xs:schema>"#;
+    assert!(validate_lenient("<n>not-an-int</n>", xsd, true).is_err());
+    assert!(validate_lenient("<n>42</n>", xsd, true).is_ok());
+}

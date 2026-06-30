@@ -47,6 +47,11 @@ pub struct XsdValidator {
     /// Substitution group membership: head_key -> vec of member keys (transitive).
     /// Each key is (namespace, local_name).
     pub(super) substitution_groups: SubstitutionGroupMap,
+    /// libxml2-compatible lenient datatype validation. When `true`, datatype
+    /// checks that are stricter than libxml2 are relaxed (currently: `anyURI`
+    /// accepts values containing spaces). Default `false` (strict, spec-faithful).
+    /// See [`XsdValidator::set_lenient`].
+    pub(super) lenient: bool,
 }
 
 /// An element declaration parsed from the schema.

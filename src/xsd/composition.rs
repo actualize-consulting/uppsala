@@ -329,16 +329,28 @@ pub(super) fn process_schema_composition(
                         None => continue, // No schemaLocation, skip (namespace-only import)
                     };
 
-                    // Same resolve-then-read sequence as include/redefine.
+                    // `xs:import/@schemaLocation` is only a *hint* (XSD 1.0 Part 1
+                    // §4.2.3): a processor may ignore it and is not obliged to
+                    // resolve it. Unlike `xs:include`/`xs:redefine` (where the
+                    // location is required), an import whose location cannot be
+                    // resolved — an unsupported URI scheme (`http:`, `classpath:`),
+                    // a missing file, or a path outside the base directory — is
+                    // skipped rather than aborting the whole build. This matches
+                    // libxml2/Xerces and is what lets composite schemas (e.g.
+                    // pyFF's `schema.xsd`) build: their imported schemas carry
+                    // redundant absolute/classpath import hints for namespaces
+                    // already supplied by a sibling, resolvable import. (Resolution
+                    // does not parse or build the target; a genuinely broken
+                    // *resolvable* schema still surfaces below.)
                     let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir,
                         canonical_base.as_deref(),
                         state,
                         "import",
-                    )? {
-                        Some(p) => p,
-                        None => continue,
+                    ) {
+                        Ok(Some(p)) => p,
+                        Ok(None) | Err(_) => continue,
                     };
 
                     // Load and parse the external schema, verifying after open
