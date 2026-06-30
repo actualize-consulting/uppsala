@@ -55,7 +55,7 @@ depends heavily on the document shape: long plain-text spans are favorable,
 while very small documents are dominated by fixed parser overhead.
 
 The table below compares release builds (`cargo run --release`) of Uppsala
-0.5.2 against a local checkout of roxmltree 0.21.1 using roxmltree's benchmark
+0.6.0 against a local checkout of roxmltree 0.21.1 using roxmltree's benchmark
 input files. Results are median parse times from 101 samples on x86_64 (the
 SSE2 scanner path); values above 1.0 mean Uppsala parsed faster than roxmltree.
 
@@ -93,7 +93,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-uppsala = "0.3"
+uppsala = "0.6"
 ```
 
 ### Parse and query
