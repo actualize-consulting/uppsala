@@ -331,11 +331,11 @@ pub(super) fn process_schema_composition(
 
                     // `xs:import/@schemaLocation` is only a *hint* (XSD 1.0 Part 1
                     // §4.2.3): a processor may ignore it and is not obliged to
-                    // resolve it. Unlike `xs:include`/`xs:redefine` (where the
-                    // location is required), an import whose location cannot be
-                    // resolved — an unsupported URI scheme (`http:`, `classpath:`),
-                    // a missing file, or a path outside the base directory — is
-                    // skipped rather than aborting the whole build. This matches
+                    // resolve it. Unlike `xs:include`/`xs:redefine` (which still treat
+                    // absolute-URI schemes and base-directory escapes as hard errors),
+                    // an import whose location cannot be resolved — unsupported schemes,
+                    // a missing file, or a path outside the base directory — is skipped
+                    // rather than aborting the whole build. This matches
                     // libxml2/Xerces and is what lets composite schemas (e.g.
                     // pyFF's `schema.xsd`) build: their imported schemas carry
                     // redundant absolute/classpath import hints for namespaces

@@ -58,9 +58,9 @@ let resolved_schema = match resolve_include_path(/* … */, "import") {
 };
 ```
 
-`xs:include`/`xs:redefine` are unchanged: their `schemaLocation` is required, so
-an unresolvable one still fails the build (this is exactly the behaviour ADR 0003
-relies on for the `anyURI_a004` FTP-include skip).
+ `xs:include`/`xs:redefine` are unchanged: they still treat base-directory escapes and unsupported
+ absolute URI schemes as hard errors (ADR 0003 relies on this for the `anyURI_a004`
+ FTP-include skip).
 
 Resolution does not parse or build the target, so this only suppresses *location*
 failures. A genuinely broken schema that *does* resolve still surfaces its build
