@@ -1,4 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<b:e xmlns:b="urn:list-base" xmlns:x="urn:list-ext"
-     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-     xsi:type="x:Derived" nums="1 abc 3" z="hi"/>

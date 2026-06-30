@@ -734,10 +734,33 @@ fn nullable_choice_via_optional_sequence_alternative() {
 
 // ─── xs:import schemaLocation hint semantics ────────────────
 
-/// Create a unique tempdir so a test can write sibling schema files and resolve
-/// `schemaLocation` against them — no dependency on excluded `test-data/`.
-fn import_test_dir(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+/// A unique tempdir that removes itself (and its contents) on drop, so import
+/// regression tests can write sibling schema files without leaving artifacts in
+/// the system temp dir. Derefs to `Path`, so call sites use `dir.join(...)`
+/// unchanged.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Best-effort cleanup; ignore errors (e.g. already removed).
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Create a unique self-cleaning tempdir so a test can write sibling schema
+/// files and resolve `schemaLocation` against them — no dependency on excluded
+/// `test-data/`. Keep the returned guard alive for the duration of the test.
+fn import_test_dir(label: &str) -> TempDir {
+    let path = std::env::temp_dir().join(format!(
         "uppsala-xsdimport-{}-{}-{}",
         label,
         std::process::id(),
@@ -746,8 +769,8 @@ fn import_test_dir(label: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos(),
     ));
-    std::fs::create_dir_all(&dir).expect("create tempdir");
-    dir
+    std::fs::create_dir_all(&path).expect("create tempdir");
+    TempDir { path }
 }
 
 /// Regression for the composite-schema import bug (see ADR 0011 and
