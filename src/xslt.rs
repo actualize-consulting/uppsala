@@ -7,8 +7,12 @@
 //! - an XSLT stylesheet model parsed from an ordinary XML [`Document`],
 //! - XSLT pattern matching for `match=` attributes,
 //! - a template-dispatch engine with the built-in template rules,
-//! - a result-tree representation with its own serializer (so
-//!   `disable-output-escaping` and `xsl:output` controls are honored).
+//! - a result-tree representation with its own serializer that honors
+//!   `disable-output-escaping` and the `xsl:output` `method`
+//!   (`xml`/`text`), `encoding` (UTF-8 only), and `omit-xml-declaration`
+//!   controls. `indent="yes"` is parsed but not yet applied (the serializer
+//!   does not pretty-print); stylesheets that need indentation produce it
+//!   themselves (e.g. pyFF's `pp.xsl`).
 //!
 //! The implemented subset targets pyFF's stylesheets ("Tier A"): see the crate
 //! documentation for the exact feature list. Notably out of scope for now are
@@ -179,6 +183,9 @@ fn collect_rtf_text(node: &ResultNode, out: &mut String) {
 #[derive(Debug, Clone)]
 struct OutputOptions {
     method_text: bool,
+    /// Parsed from `xsl:output/@indent` but not yet applied — the serializer
+    /// does not pretty-print. Retained so the value round-trips and indentation
+    /// can be wired up later without an API change.
     indent: bool,
     encoding: String,
     omit_xml_declaration: bool,
@@ -892,6 +899,14 @@ fn compile_avt(value: &str, _ns: &HashMap<String, String>) -> XmlResult<Avt> {
                 )?));
                 i += 1; // consume '}'
             }
+            // A lone `}` (not part of a `}}` pair) is a static error in an AVT:
+            // a literal right brace must be written as `}}`. Rejecting it surfaces
+            // stylesheet bugs instead of silently emitting the stray brace.
+            '}' => {
+                return Err(XmlError::xpath(
+                    "Unescaped '}' in attribute value template (write '}}' for a literal '}')",
+                ));
+            }
             c => {
                 literal.push(c);
                 i += 1;
@@ -1416,7 +1431,16 @@ impl<'a, 'b> Engine<'a, 'b> {
         match val {
             XPathValue::NodeSet(nodes) => {
                 for n in nodes {
-                    out.push(self.deep_copy_source(n));
+                    // copy-of of the root node (`/`) copies its children — the
+                    // document element plus any top-level comments/PIs — not an
+                    // empty node. A document has no single result-item form.
+                    if let Some(NodeKind::Document) = self.source.node_kind(n) {
+                        for child in self.source.children(n) {
+                            out.push(self.deep_copy_source(child));
+                        }
+                    } else {
+                        out.push(self.deep_copy_source(n));
+                    }
                 }
             }
             other => out.push(ResultItem::Node(ResultNode::Text {
@@ -2190,6 +2214,31 @@ mod tests {
         let xml = r#"<r><keep id="1"><c/></keep><drop/></r>"#;
         let result = transform(xslt, xml).unwrap();
         assert_eq!(result, r#"<out><keep id="1"><c/></keep></out>"#);
+    }
+
+    /// `xsl:copy-of select="/"` copies the document root's children (the document
+    /// element), not an empty node — a node-set may include the `Document` node.
+    #[test]
+    fn copy_of_root_copies_document_element() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:template match="/"><out><xsl:copy-of select="/"/></out></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r a="1"><c>t</c></r>"#;
+        let result = transform(xslt, xml).unwrap();
+        assert_eq!(result, r#"<out><r a="1"><c>t</c></r></out>"#);
+    }
+
+    /// A lone `}` in an attribute value template is a static error; a literal
+    /// right brace must be written as `}}`.
+    #[test]
+    fn avt_lone_close_brace_is_error() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:template match="/"><out id="a}b"/></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+        assert!(transform(xslt, xml).is_err());
     }
 
     /// M4 — `xsl:element` with a literal qualified name and `xsl:attribute` with
