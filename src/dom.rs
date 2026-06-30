@@ -1309,10 +1309,14 @@ impl<'a> Document<'a> {
                     .iter()
                     .map(|(p, u)| (Cow::Owned(p.to_string()), Cow::Owned(u.to_string())))
                     .collect();
-                if let Some(NodeKind::Element(el)) = self.node_kind_mut(new_id) {
-                    el.attributes = attributes;
-                    el.namespace_declarations = ns_decls;
-                }
+                // `create_element` always allocates an element node, so this is
+                // an invariant rather than a recoverable case: a non-element here
+                // would mean a silently partially-copied subtree. Fail loudly.
+                let el = self
+                    .element_mut(new_id)
+                    .expect("create_element must allocate an element node");
+                el.attributes = attributes;
+                el.namespace_declarations = ns_decls;
                 new_id
             }
             NodeKind::Text(t) => self.create_text(Cow::Owned(t.to_string())),

@@ -683,6 +683,81 @@ fn write_sanitized_attr_to_string(
 mod tests {
     use super::*;
 
+    // ─── Run-based escaping core (text + attribute) ────────────────────
+
+    fn esc_text(s: &str) -> String {
+        let mut buf = String::new();
+        write_escaped_text_to_string(&mut buf, s);
+        buf
+    }
+
+    fn esc_attr(s: &str) -> String {
+        let mut buf = String::new();
+        write_escaped_attr_to_string(&mut buf, s);
+        buf
+    }
+
+    #[test]
+    fn text_escaping_handles_markup_and_cr() {
+        // In text context `& < >` and CR are escaped; `" \t \n` are NOT.
+        assert_eq!(
+            esc_text("a & b < c > d\r\n\t\"x\""),
+            "a &amp; b &lt; c &gt; d&#xD;\n\t\"x\""
+        );
+        // A run with no special bytes is copied verbatim (bulk path).
+        assert_eq!(esc_text("plain ascii text 123"), "plain ascii text 123");
+        // Leading and trailing specials (run boundaries at both ends).
+        assert_eq!(esc_text("<x>"), "&lt;x&gt;");
+    }
+
+    #[test]
+    fn attr_escaping_adds_quote_tab_newline() {
+        // Attribute context additionally escapes `"`, TAB and LF; CR too.
+        assert_eq!(
+            esc_attr("a & b < c > d \"q\" \t \n \r"),
+            "a &amp; b &lt; c &gt; d &quot;q&quot; &#x9; &#xA; &#xD;"
+        );
+        // `>` is escaped in both contexts, `'` is left as-is.
+        assert_eq!(esc_attr("'apos' > gt"), "'apos' &gt; gt");
+    }
+
+    #[test]
+    fn invalid_xml_control_chars_become_replacement() {
+        // NUL and other C0 controls (except \t \n \r) are not valid XML 1.0
+        // characters and are replaced with U+FFFD in both contexts.
+        assert_eq!(esc_text("a\u{0}b"), "a\u{FFFD}b");
+        assert_eq!(
+            esc_text("\u{1}\u{8}\u{B}\u{C}\u{1F}"),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(esc_attr("x\u{0}y"), "x\u{FFFD}y");
+        // \t \n \r remain valid XML chars in text context (not replaced).
+        assert_eq!(esc_text("\t\n\r"), "\t\n&#xD;");
+    }
+
+    #[test]
+    fn multibyte_chars_pass_through_or_sanitize() {
+        // Valid multi-byte UTF-8 is copied verbatim, even adjacent to specials.
+        assert_eq!(esc_text("café & déjà-vu — ☃"), "café &amp; déjà-vu — ☃");
+        assert_eq!(esc_attr("naïve=\"x\""), "naïve=&quot;x&quot;");
+        // U+FFFE is a non-character (invalid XML char) and is replaced, while
+        // the surrounding valid multi-byte characters survive.
+        assert_eq!(esc_text("é\u{FFFE}é"), "é\u{FFFD}é");
+        assert_eq!(esc_attr("é\u{FFFE}é"), "é\u{FFFD}é");
+    }
+
+    #[test]
+    fn escaping_matches_public_writer_api() {
+        // The public `text` / attribute paths route through the same core.
+        let mut w = XmlWriter::new();
+        w.text("a & b < c\r");
+        assert_eq!(w.as_str(), "a &amp; b &lt; c&#xD;");
+
+        let mut w = XmlWriter::new();
+        w.empty_element("e", &[("k", "v & \"w\"\t")]);
+        assert_eq!(w.into_string(), "<e k=\"v &amp; &quot;w&quot;&#x9;\"/>");
+    }
+
     // ─── Pure-function tests for the sanitizers ────────────────────────
 
     #[test]
