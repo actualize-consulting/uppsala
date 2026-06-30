@@ -103,16 +103,40 @@ fn pyff_stylesheets_transform() {
         );
         return;
     }
-    let xml = std::fs::read_to_string(&sample).expect("read sample metadata");
+    let single = std::fs::read_to_string(&sample).expect("read sample metadata");
 
-    let mut ran = 0;
+    // `atom.xsl` emits an Atom feed only from an `md:EntitiesDescriptor` aggregate
+    // whose entities carry `md:Extensions/atom:entry`; run against the single
+    // `EntityDescriptor` sample it would yield an empty result tree (no root
+    // element). The sample fixtures are ours (not vendored from pyFF), so we keep
+    // the original single-entity `sample-metadata.xml` untouched and add a small
+    // aggregate fixture for the atom case here.
+    let aggregate_path = dir.join("atom-feed-sample.xml");
+    assert!(
+        aggregate_path.exists(),
+        "expected atom aggregate fixture missing at {}",
+        aggregate_path.display()
+    );
+    let aggregate = std::fs::read_to_string(&aggregate_path).expect("read atom aggregate fixture");
+
     for name in PYFF_STYLESHEETS {
         let path = dir.join(name);
-        if !path.exists() {
-            eprintln!("  (missing {name}, skipping)");
-            continue;
-        }
+        // The sample fixture is present, so the full acceptance corpus is
+        // expected too: a missing stylesheet is a failure, not a silent skip
+        // (otherwise CI could pass having run only part of the corpus).
+        assert!(
+            path.exists(),
+            "{name}: expected pyFF stylesheet fixture missing at {} (sample metadata is present, so the corpus must be complete)",
+            path.display()
+        );
         let xslt = std::fs::read_to_string(&path).expect("read stylesheet");
+
+        // atom.xsl needs the aggregate input; the rest use the single-entity sample.
+        let input = if *name == "atom.xsl" {
+            &aggregate
+        } else {
+            &single
+        };
 
         // Compile once via the reusable API, then transform.
         let style_doc = Parser::new()
@@ -121,7 +145,7 @@ fn pyff_stylesheets_transform() {
         let stylesheet = Stylesheet::compile(&style_doc)
             .unwrap_or_else(|e| panic!("{name}: stylesheet did not compile: {e}"));
         let mut source = Parser::new()
-            .parse(&xml)
+            .parse(input)
             .expect("sample metadata did not parse");
         source.prepare_xpath();
         let out = stylesheet
@@ -130,18 +154,15 @@ fn pyff_stylesheets_transform() {
 
         assert!(!out.is_empty(), "{name}: produced empty output");
 
-        // XML-method output (everything except the text-method atom.xsl) must
-        // be well-formed and re-parseable.
-        if *name != "atom.xsl" {
-            Parser::new()
-                .parse(&out)
-                .unwrap_or_else(|e| panic!("{name}: output is not well-formed XML: {e}\n{out}"));
-        }
+        // None of the vendored stylesheets declare `method="text"`, so every
+        // output is XML and must be well-formed and re-parseable.
+        Parser::new()
+            .parse(&out)
+            .unwrap_or_else(|e| panic!("{name}: output is not well-formed XML: {e}\n{out}"));
         eprintln!("  {name}: OK ({} bytes)", out.len());
-        ran += 1;
     }
     eprintln!(
-        "pyFF acceptance: {ran}/{} stylesheets ran",
+        "pyFF acceptance: {} stylesheets ran",
         PYFF_STYLESHEETS.len()
     );
 }
