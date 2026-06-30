@@ -219,7 +219,27 @@ pub(super) fn process_schema_composition(
         )));
     }
 
-    let base_dir = base_path.and_then(|p| p.parent());
+    // `base_path` is either the schema *directory* or the schema *file*:
+    //   * the public entry (`from_file`, and the etree `XMLSchema(file=...)`
+    //     facade, which passes `os.path.dirname(file)`) supplies a directory,
+    //     since the top-level schema is handed in as a string with no file of
+    //     its own;
+    //   * recursive `xs:import`/`xs:include`/`xs:redefine` loads pass the
+    //     resolved schema *file* path (see the `from_schema_with_composition_state`
+    //     calls below).
+    // `schemaLocation` is resolved relative to the directory in both cases, so
+    // use `base_path` directly when it is a directory and its parent otherwise.
+    // The previous unconditional `.parent()` treated a directory as a file and
+    // stripped one level, so every import/include from the public entry silently
+    // failed to resolve and all imported declarations (types *and* elements) went
+    // missing -- surfacing as "No element declaration found" / "Type not found".
+    let base_dir = base_path.map(|p| {
+        if p.is_dir() {
+            p
+        } else {
+            p.parent().unwrap_or(p)
+        }
+    });
     // Canonicalize the base once per call; reused as the containment
     // anchor for every schemaLocation resolved in the loop below.
     //

@@ -138,6 +138,70 @@ Text with <i:ref term="x"/> and <o:b>bold</o:b> and <i:ref term="y"/>.
     );
 }
 
+/// Regression: `xs:import` must resolve `schemaLocation` when the caller passes
+/// the schema *directory* as `base_path`, not just the schema *file*.
+///
+/// The public entry points hand a directory to `from_schema_with_base_path`:
+/// the schema is supplied as a string (no file of its own), and the pyuppsala
+/// `XsdValidator.from_file(schema_xml, base_path)` / etree
+/// `XMLSchema(file=...)` facade passes `os.path.dirname(file)`. Composition
+/// used to do `base_path.parent()` unconditionally, treating that directory as
+/// a file and stripping one level, so every `xs:import`/`xs:include` silently
+/// failed to resolve and *all* imported declarations (types **and** the global
+/// element used to validate the instance root) went missing -- surfacing as
+/// "No element declaration found for '<root>'". This test passes the directory
+/// (as the real callers do) and asserts the imported global element resolves.
+///
+/// The sibling tests above pass the schema *file* path, whose `.parent()` is
+/// the directory, so they validated correctly even with the bug and never
+/// exercised this path.
+#[test]
+fn import_resolves_with_directory_base_path() {
+    let dir = mkdir_unique("import-dir-base");
+
+    // Imported schema declares a global element (and its type) in its own
+    // namespace -- this is the element used to validate the instance root.
+    let inner = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:i="urn:test:inner"
+           targetNamespace="urn:test:inner"
+           elementFormDefault="qualified">
+  <xs:element name="Thing" type="i:ThingType"/>
+  <xs:complexType name="ThingType">
+    <xs:attribute name="id" type="xs:string"/>
+  </xs:complexType>
+</xs:schema>"#;
+    fs::write(dir.join("inner.xsd"), inner).unwrap();
+
+    // Entry schema (different targetNamespace) only imports the inner one.
+    let composite = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:aggregate" version="1.0">
+  <xs:import namespace="urn:test:inner" schemaLocation="inner.xsd"/>
+</xs:schema>"#;
+
+    let instance = r#"<i:Thing xmlns:i="urn:test:inner" id="x"/>"#;
+
+    // Pass the DIRECTORY as base_path (what the public callers do), NOT the
+    // schema file path.
+    let schema_doc = parse(composite).expect("parse composite schema");
+    let validator = XsdValidator::from_schema_with_base_path(&schema_doc, Some(dir.as_path()))
+        .expect("build validator from directory base_path");
+    let doc = parse(instance).expect("parse instance");
+    let errors: Vec<String> = validator
+        .validate(&doc)
+        .into_iter()
+        .map(|e| format!("{e}"))
+        .collect();
+    fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        errors.is_empty(),
+        "imported global element must resolve when base_path is the schema \
+         directory, got: {errors:?}",
+    );
+}
+
 /// Regression: `<xs:attribute ref="foreign:attr"/>` across an `xs:import`
 /// boundary. Before the fix, the prefix was stripped and the lookup keyed
 /// against the outer schema's targetNamespace, so the imported global
