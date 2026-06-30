@@ -696,10 +696,22 @@ fn compile_xsl_instruction(
             select: compile_sel("select")?,
             disable_escaping: el.get_attribute("disable-output-escaping") == Some("yes"),
         },
-        "text" => Instruction::XslText {
-            value: doc.element_text(node).unwrap_or("").to_string(),
-            disable_escaping: el.get_attribute("disable-output-escaping") == Some("yes"),
-        },
+        "text" => {
+            // Concatenate every Text/CDATA child: `element_text` returns only the
+            // first segment, so a multi-segment `xsl:text` (mixed text + CDATA,
+            // entity-expanded splits) would otherwise drop everything after it.
+            let mut value = String::new();
+            for child in doc.children(node) {
+                match doc.node_kind(child) {
+                    Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => value.push_str(t),
+                    _ => {}
+                }
+            }
+            Instruction::XslText {
+                value,
+                disable_escaping: el.get_attribute("disable-output-escaping") == Some("yes"),
+            }
+        }
         "apply-templates" => Instruction::ApplyTemplates {
             select: match el.get_attribute("select") {
                 Some(s) => Some(CompiledXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH)?),
@@ -821,10 +833,31 @@ fn compile_literal_element(
 
     // Emit a namespace declaration for the element's own prefix/uri so the
     // result re-parses. (Full namespace fixup arrives in a later milestone.)
-    let mut ns_decls = Vec::new();
+    let mut ns_decls: Vec<(Option<String>, String)> = Vec::new();
     if let Some(uri) = el.name.namespace_uri.as_deref() {
         let prefix = el.name.prefix.as_deref().map(|s| s.to_string());
         ns_decls.push((prefix, uri.to_string()));
+    }
+    // Preserve namespace declarations written explicitly on the literal element
+    // (e.g. `xmlns:foo=...`) so prefixes used only by attributes, children, or
+    // QName-valued content still resolve in the output. The `xsl` -> XSLT binding
+    // never appears in result output, and the serializer suppresses any
+    // declaration already in an enclosing result scope, so this cannot duplicate.
+    for (prefix, uri) in &el.namespace_declarations {
+        if prefix.as_ref() == "xsl" && uri.as_ref() == XSLT_NAMESPACE {
+            continue;
+        }
+        let p = if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix.to_string())
+        };
+        if !ns_decls
+            .iter()
+            .any(|(ep, eu)| ep.as_deref() == p.as_deref() && eu.as_str() == uri.as_ref())
+        {
+            ns_decls.push((p, uri.to_string()));
+        }
     }
 
     let mut attrs = Vec::new();
@@ -2227,6 +2260,40 @@ mod tests {
         let xml = r#"<r a="1"><c>t</c></r>"#;
         let result = transform(xslt, xml).unwrap();
         assert_eq!(result, r#"<out><r a="1"><c>t</c></r></out>"#);
+    }
+
+    /// `xsl:text` concatenates all of its text/CDATA children, not just the first
+    /// segment, so a value split across text + CDATA is emitted whole.
+    #[test]
+    fn xsl_text_concatenates_all_segments() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:template match="/"><out><xsl:text>a<![CDATA[b]]>c</xsl:text></out></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+        let result = transform(xslt, xml).unwrap();
+        assert_eq!(result, r#"<out>abc</out>"#);
+    }
+
+    /// A literal result element's explicit namespace declarations (here `ex`,
+    /// used only by a child) are preserved so the output re-parses.
+    #[test]
+    fn literal_element_preserves_extra_ns_decls() {
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" omit-xml-declaration="yes"/>
+            <xsl:template match="/"><out xmlns:ex="urn:ex"><ex:child>v</ex:child></out></xsl:template>
+        </xsl:stylesheet>"#;
+        let xml = r#"<r/>"#;
+        let result = transform(xslt, xml).unwrap();
+        // The `ex` prefix must be declared in the output for `ex:child` to resolve.
+        assert!(
+            result.contains("xmlns:ex=\"urn:ex\""),
+            "missing ex declaration: {result}"
+        );
+        // And the result must re-parse as well-formed, namespace-correct XML.
+        crate::Parser::new()
+            .parse(&result)
+            .expect("re-parse output");
     }
 
     /// A lone `}` in an attribute value template is a static error; a literal
