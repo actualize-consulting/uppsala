@@ -19,6 +19,7 @@ regex engine are built from scratch.
 - **Serialization** with round-trip fidelity, pretty-printing, and streaming output
 - **XmlWriter** for imperative XML construction without a DOM
 - **UTF-16 auto-detection** (LE/BE with or without BOM)
+- **XSLT 1.0 support** We have minimal support for XSLT 1.0, will be added fully in the future.
 
 ## Conformance
 
@@ -55,7 +56,7 @@ depends heavily on the document shape: long plain-text spans are favorable,
 while very small documents are dominated by fixed parser overhead.
 
 The table below compares release builds (`cargo run --release`) of Uppsala
-0.6.0 against a local checkout of roxmltree 0.21.1 using roxmltree's benchmark
+0.7.0 against a local checkout of roxmltree 0.21.1 using roxmltree's benchmark
 input files. Results are median parse times from 101 samples on x86_64 (the
 SSE2 scanner path); values above 1.0 mean Uppsala parsed faster than roxmltree.
 

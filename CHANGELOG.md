@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-01
+
 ### Added
 
 - XSLT 1.0 transform engine (`uppsala::transform`, plus `Stylesheet::compile` /
@@ -23,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `date:date-time()` remains available unconditionally.
 - `Stylesheet::set_max_depth` and `DEFAULT_MAX_XSLT_DEPTH` (default 500): a bound
   on XSLT template-activation recursion.
+- Opt-in libxml2-compatible lenient XSD datatype validation via
+  `XsdValidator::set_lenient(bool)` (default off, strict/spec-faithful). The one
+  relaxed rule is `xs:anyURI`: a value containing a space is accepted, matching
+  libxml2/lxml/pyFF (strict mode still rejects it per RFC 3987). Applies to
+  `anyURI` in element content and attribute values alike; no other datatype,
+  facet, or structural check is weakened. See ADR 0012.
+- `Document::import_subtree(&mut self, src, src_id) -> Option<NodeId>`: deep-copy
+  a node and its entire subtree from another document into this one in a single
+  native pass, returning the new detached root node id (used by the pyuppsala DOM
+  wrapper for cross-tree element moves).
 
 ### Changed
 
@@ -38,6 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   patterns that cannot match a node's kind/name. Net effect: a 91 MB eduGAIN
   aggregate that previously did not complete now transforms in a few seconds
   with every pyFF stylesheet (1–5 s each).
+- `xs:import/@schemaLocation` is now treated as a hint (XSD 1.0 Part 1 §4.2.3):
+  an import whose location cannot be resolved (unsupported scheme, missing file,
+  or a path outside the base directory) is skipped instead of aborting the schema
+  build, matching libxml2/Xerces. `xs:include`/`xs:redefine` are unchanged (they
+  still treat base-directory escapes and unsupported absolute-URI schemes as hard
+  errors). This lets composite schemas such as pyFF's `schema.xsd` build. See
+  ADR 0011.
+- XML serialization escaping (`XmlWriter` text/attribute output and the DOM
+  serializer) is now run-based: safe byte runs are bulk-copied with one
+  `push_str` (SIMD `memcpy`) instead of pushing one character at a time, which is
+  faster on ASCII-heavy payloads like SAML metadata. Output is byte-identical to
+  the previous per-character version.
 
 ### Security
 
