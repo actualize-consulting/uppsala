@@ -44,23 +44,111 @@ impl XsdValidator {
         self.enforce_qname_length_facets = enforce;
     }
 
-    /// Enable libxml2-compatible *lenient* datatype validation. Default is
+    /// Enable libxml2-compatible **lenient** datatype validation. Default is
     /// `false` (strict, spec-faithful).
     ///
-    /// libxml2 — the de-facto reference for many real-world toolchains (lxml,
-    /// pyFF, …) — validates some lexical spaces more permissively than the XSD
-    /// specification. When `lenient` is `true`, uppsala relaxes those checks to
-    /// match it. Currently this affects:
+    /// # What it does
     ///
-    /// - **`anyURI`**: a value containing a space is accepted (strict mode
-    ///   rejects it per RFC 3987). Real-world metadata sometimes places a space
-    ///   inside a single `anyURI` value (e.g. a malformed `Location`), which
-    ///   libxml2 also accepts. (List-of-`anyURI` typing is unaffected and
-    ///   already validates per item — see ADR 0012.)
+    /// Most of the XSD ecosystem — lxml, pyFF, and virtually every Python/C XML
+    /// stack — is built on **libxml2**, which validates a few datatypes slightly
+    /// more permissively than the letter of XSD 1.0 Part 2 / RFC 3987. Documents
+    /// that libxml2 (and therefore every tool downstream of it) treats as valid
+    /// can otherwise produce *spurious* errors under a strict validator. Calling
+    /// `set_lenient(true)` relaxes exactly those checks so uppsala agrees with
+    /// libxml2 on such documents.
     ///
-    /// Enable this when validating documents against schemas authored for
-    /// libxml2/Xerces (e.g. SAML metadata) where strict mode reports spurious
-    /// datatype errors that those processors accept.
+    /// # Scope — one rule today
+    ///
+    /// Lenient mode currently affects a **single** check:
+    ///
+    /// - **`xs:anyURI`**: a value containing a space is **accepted**. uppsala's
+    ///   only `anyURI` lexical check is "reject if the (whitespace-normalized)
+    ///   value contains a space" — a space is invalid per RFC 3987. Strict mode
+    ///   keeps that check; lenient mode drops it, matching libxml2. This applies
+    ///   to an `anyURI` in **element content and in an attribute value** alike.
+    ///
+    /// Everything else is unchanged. `set_lenient(true)` does **not** weaken any
+    /// other datatype, facet, or structural check: a malformed `xs:int` is still
+    /// rejected, `xs:pattern`/`enumeration`/length facets still apply, required
+    /// attributes and content models are still enforced. It only ever *accepts*
+    /// `anyURI` values that strict mode would reject — it never rejects more.
+    ///
+    /// # The values that failed before (real SAML metadata)
+    ///
+    /// Both motivating failures (from pyFF's `swamid-2.0-test.xml`, see ADR 0012)
+    /// are the **same** rule — a single `anyURI` value containing a space:
+    ///
+    /// 1. **`mdui:GeolocationHint` element** (`anyURI` content) with a
+    ///    space after the comma:
+    ///    ```text
+    ///    <mdui:GeolocationHint>geo:40.6308255004333, 22.959268014038116</mdui:GeolocationHint>
+    ///    ```
+    ///
+    /// 2. **`idpdisc:DiscoveryResponse/@Location`** (a *single* `anyURI`
+    ///    attribute) with three space-separated tokens crammed into it —
+    ///    malformed metadata (a `Location` is one URI), but libxml2 accepts it:
+    ///    ```text
+    ///    Location="urn:oasis:names:tc:SAML:2.0:protocol urn:oasis:names:tc:SAML:1.1:protocol http://docs.oasis-open.org/wsfed/federation/200706/secext"
+    ///    ```
+    ///
+    /// # Not a list-typing bug
+    ///
+    /// Case 2 *looks* like SAML's `protocolSupportEnumeration` (a `list` of
+    /// `anyURI`), which first suggested list typing was being lost across the
+    /// cross-import `xsi:type` chain. It is not: `protocolSupportEnumeration`
+    /// validates correctly **per item** everywhere — including when a
+    /// `RoleDescriptor` is substituted via `xsi:type` to a WS-Fed type that
+    /// extends the SAML base across a *different* imported schema. The failing
+    /// value above is a `Location` (a lone `anyURI`), not the list attribute.
+    /// (Pinned by
+    /// `tests/xsd_conformance.rs::cross_import_xsi_type_list_attribute_validates_per_item`.)
+    ///
+    /// # When to enable
+    ///
+    /// Turn this on when validating documents authored for libxml2/Xerces (e.g.
+    /// SAML metadata) where strict mode reports datatype errors those processors
+    /// accept. Leave it **off** for spec-conformant validation — the default
+    /// keeps uppsala at 100% on the W3C XML Schema Test Suite (NIST/MS/Sun).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use uppsala::{parse, XsdValidator};
+    ///
+    /// let schema = parse(
+    ///     r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///          <xs:element name="loc" type="xs:anyURI"/>
+    ///        </xs:schema>"#,
+    /// )
+    /// .unwrap();
+    ///
+    /// // A real mdui:GeolocationHint value: a "geo:" URI with a space.
+    /// let doc = parse("<loc>geo:40.6308255004333, 22.959268014038116</loc>").unwrap();
+    ///
+    /// // Strict (default): the space makes it an invalid anyURI (RFC 3987).
+    /// let strict = XsdValidator::from_schema(&schema).unwrap();
+    /// assert!(!strict.validate(&doc).is_empty());
+    ///
+    /// // Lenient: accepted, matching libxml2 / lxml / pyFF.
+    /// let mut lenient = XsdValidator::from_schema(&schema).unwrap();
+    /// lenient.set_lenient(true);
+    /// assert!(lenient.validate(&doc).is_empty());
+    ///
+    /// // Leniency is scoped: a malformed int is still rejected.
+    /// let int_schema = parse(
+    ///     r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///          <xs:element name="n" type="xs:int"/>
+    ///        </xs:schema>"#,
+    /// )
+    /// .unwrap();
+    /// let mut v = XsdValidator::from_schema(&int_schema).unwrap();
+    /// v.set_lenient(true);
+    /// assert!(!v.validate(&parse("<n>not-an-int</n>").unwrap()).is_empty());
+    /// ```
+    ///
+    /// See ADR 0012 (`docs/adr/0012-libxml2-lenient-datatype-mode.md`) for the
+    /// full rationale and regression tests (`anyuri_space_strict_rejected_lenient_accepted`,
+    /// `anyuri_multitoken_value_lenient`, `lenient_mode_keeps_other_datatype_checks`).
     pub fn set_lenient(&mut self, lenient: bool) {
         self.lenient = lenient;
     }
