@@ -66,6 +66,20 @@ fn is_temporal_type(base_type: &BuiltInType) -> bool {
     )
 }
 
+/// Range-validate a value against a date-like temporal base type, so an invalid
+/// facet bound (e.g. `--99` gMonth) is rejected instead of compared lexically.
+fn is_valid_date_like(s: &str, base_type: &BuiltInType) -> bool {
+    match base_type {
+        BuiltInType::Date => is_valid_date(s),
+        BuiltInType::GYear => is_valid_gyear(s),
+        BuiltInType::GYearMonth => is_valid_gyearmonth(s),
+        BuiltInType::GMonth => is_valid_gmonth(s),
+        BuiltInType::GMonthDay => is_valid_gmonthday(s),
+        BuiltInType::GDay => is_valid_gday(s),
+        _ => true,
+    }
+}
+
 fn compare_facet_values(
     value: &str,
     facet_value: &str,
@@ -79,7 +93,16 @@ fn compare_facet_values(
         | BuiltInType::GYearMonth
         | BuiltInType::GMonth
         | BuiltInType::GMonthDay
-        | BuiltInType::GDay => Some(value.cmp(facet_value)),
+        | BuiltInType::GDay => {
+            // Fail closed on lexically-parseable but out-of-range operands, as
+            // compare_datetime_values/compare_time_values do. A raw comparison of
+            // an invalid facet bound would otherwise silently accept instances.
+            if !is_valid_date_like(value, base_type) || !is_valid_date_like(facet_value, base_type)
+            {
+                return None;
+            }
+            Some(value.cmp(facet_value))
+        }
         _ => Some(compare_values(value, facet_value)),
     }
 }

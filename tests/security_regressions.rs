@@ -1245,6 +1245,59 @@ fn xslt_processing_instruction_rejects_markup_breakout() {
 }
 
 #[test]
+fn xslt_processing_instruction_target_accepts_unicode_ncname() {
+    // The PI target check must use the same full-Unicode NCName rule as the
+    // serializer, so a legal non-ASCII target is accepted rather than rejected
+    // by an ASCII-only shortcut.
+    let xslt = "<xsl:stylesheet version=\"1.0\"\n\
+           xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">\n\
+  <xsl:output method=\"xml\" omit-xml-declaration=\"yes\"/>\n\
+  <xsl:template match=\"/\">\n\
+    <xsl:processing-instruction name=\"caf\u{e9}\">data</xsl:processing-instruction>\n\
+  </xsl:template>\n\
+</xsl:stylesheet>";
+
+    assert_eq!(
+        uppsala::transform(xslt, "<r/>").unwrap(),
+        "<?caf\u{e9} data?>"
+    );
+}
+
+#[test]
+fn xsd_date_like_facet_comparison_fails_closed_on_invalid_bounds() {
+    // compare_facet_values must fail closed for out-of-range facet bounds on all
+    // date-like temporal types, not just xs:dateTime/xs:time. A raw lexical
+    // comparison of an invalid bound would otherwise silently accept instances.
+    let gmonth_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="m">
+    <xs:simpleType>
+      <xs:restriction base="xs:gMonth">
+        <xs:maxInclusive value="--99"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        !validate(gmonth_schema, "<m>--06</m>").is_empty(),
+        "invalid gMonth facet bound must fail closed"
+    );
+
+    let date_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="d">
+    <xs:simpleType>
+      <xs:restriction base="xs:date">
+        <xs:maxInclusive value="2024-99-01"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        !validate(date_schema, "<d>2024-06-01</d>").is_empty(),
+        "invalid date facet bound must fail closed"
+    );
+}
+
+#[test]
 fn exslt_padding_has_output_cap() {
     let xslt = r#"<xsl:stylesheet version="1.0"
            xmlns:xsl="http://www.w3.org/1999/XSL/Transform"

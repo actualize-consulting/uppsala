@@ -188,18 +188,11 @@ fn sanitize_comment_text(text: &str) -> XmlResult<String> {
 }
 
 fn validate_pi_target(target: &str) -> XmlResult<()> {
-    let valid_ncname = target
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && target
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    if !valid_ncname
-        || target.eq_ignore_ascii_case("xml")
-        || target.contains(':')
-        || target.trim() != target
-    {
+    // Reuse the serializer's full-Unicode NCName check so XSLT construction and
+    // serialization agree on which targets are valid (the ASCII-only check here
+    // previously rejected legal non-ASCII names). NCName already excludes ':'
+    // and whitespace; only the reserved "xml" target needs a separate guard.
+    if !crate::writer::is_valid_xml_ncname(target) || target.eq_ignore_ascii_case("xml") {
         return Err(XmlError::validation(
             "xsl:processing-instruction target is not a valid NCName",
         ));
