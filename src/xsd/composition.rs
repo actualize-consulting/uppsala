@@ -219,7 +219,42 @@ pub(super) fn process_schema_composition(
         )));
     }
 
-    let base_dir = base_path.and_then(|p| p.parent());
+    // `base_path` is either the schema *directory* or the schema *file*:
+    //   * the public entry (`from_file`, and the etree `XMLSchema(file=...)`
+    //     facade, which passes `os.path.dirname(file)`) supplies a directory,
+    //     since the top-level schema is handed in as a string with no file of
+    //     its own;
+    //   * recursive `xs:import`/`xs:include`/`xs:redefine` loads pass the
+    //     resolved schema *file* path (see the `from_schema_with_composition_state`
+    //     calls below).
+    // `schemaLocation` is resolved relative to the directory in both cases.
+    //
+    // Only a path that is *known to be a regular file* (the recursive loads) is
+    // reduced to its parent directory. A directory, or any path that cannot be
+    // stat'd (missing or unreadable), is kept as the base directory itself. This
+    // matters for the fail-closed contract below: a bad base directory must
+    // still fail to canonicalize and be rejected, rather than silently resolving
+    // against its parent -- which a `!is_dir()` test would do, since `is_dir()`
+    // also returns false for a missing/unreadable directory.
+    //
+    // (The previous unconditional `.parent()` treated the public entry's
+    // directory as a file and stripped one level, so every import/include
+    // silently failed to resolve and all imported declarations -- types *and*
+    // elements -- went missing, surfacing as "No element declaration found" /
+    // "Type not found".)
+    let base_dir: Option<PathBuf> = base_path.map(|p| {
+        if p.is_file() {
+            // A file always has a parent; an empty parent denotes the current
+            // directory, so fall back to "." rather than the file path itself
+            // (joining onto the file would yield e.g. `schema.xsd/inner.xsd`).
+            match p.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            }
+        } else {
+            p.to_path_buf()
+        }
+    });
     // Canonicalize the base once per call; reused as the containment
     // anchor for every schemaLocation resolved in the loop below.
     //
@@ -228,7 +263,7 @@ pub(super) fn process_schema_composition(
     // etc.). Falling through to `canonical_base = None` would skip the
     // containment check inside `resolve_include_path` and re-open the
     // arbitrary-file-read window F-10 closed.
-    let canonical_base = match base_dir {
+    let canonical_base = match &base_dir {
         Some(b) => Some(b.canonicalize().map_err(|e| {
             XmlError::validation(format!(
                 "Failed to canonicalize schema base directory '{}': {}",
@@ -264,7 +299,7 @@ pub(super) fn process_schema_composition(
                     let kind = if is_redefine { "redefine" } else { "include" };
                     let resolved_schema = match resolve_include_path(
                         schema_location,
-                        base_dir,
+                        base_dir.as_deref(),
                         canonical_base.as_deref(),
                         state,
                         kind,
@@ -348,7 +383,7 @@ pub(super) fn process_schema_composition(
                     // not silently dropped.
                     let resolved_schema = match resolve_include_path(
                         schema_location,
-                        base_dir,
+                        base_dir.as_deref(),
                         canonical_base.as_deref(),
                         state,
                         "import",
