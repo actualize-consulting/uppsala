@@ -1185,6 +1185,29 @@ fn parse_particles(
     Ok(particles)
 }
 
+/// Whether a local `name=` attribute declaration is namespace-qualified.
+///
+/// Per XSD Part 1 §3.2.2, a local attribute use takes the schema target
+/// namespace when its `form` attribute is `qualified`, or when `form` is
+/// absent and the enclosing `xs:schema` sets `attributeFormDefault="qualified"`.
+fn local_attribute_is_qualified(doc: &Document, node: NodeId) -> bool {
+    if let Some(NodeKind::Element(elem)) = doc.node_kind(node) {
+        if let Some(form) = elem.get_attribute("form") {
+            return form == "qualified";
+        }
+    }
+    let mut current = doc.parent(node);
+    while let Some(ancestor) = current {
+        if let Some(NodeKind::Element(e)) = doc.node_kind(ancestor) {
+            if e.name.local_name == "schema" {
+                return e.get_attribute("attributeFormDefault") == Some("qualified");
+            }
+        }
+        current = doc.parent(ancestor);
+    }
+    false
+}
+
 /// Parse an `<xs:attribute>` declaration into an `AttributeDecl`.
 ///
 /// Handles both `name` and `ref` attributes, inline `<xs:simpleType>` children,
@@ -1200,7 +1223,12 @@ fn parse_attribute_decl(
 
     // Handle <attribute ref="..."/> — create a placeholder decl with the ref name
     let (name, namespace) = if let Some(n) = elem.get_attribute("name") {
-        (n.to_string(), None)
+        let namespace = if local_attribute_is_qualified(doc, node) {
+            schema_target_ns.clone()
+        } else {
+            None
+        };
+        (n.to_string(), namespace)
     } else if let Some(ref_name) = elem.get_attribute("ref") {
         (
             strip_prefix(ref_name).to_string(),

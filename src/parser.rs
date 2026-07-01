@@ -1791,8 +1791,9 @@ fn parse_content_model(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
         }
     }
 
-    // children content model
-    parse_cp(cursor, 0, max_depth)?;
+    // children content model; the outer group consumed above is level 0, so
+    // any group opened by a particle inside it is at level 1
+    parse_cp(cursor, 1, max_depth)?;
     cursor.skip_whitespace();
 
     if cursor.peek() == Some(')') {
@@ -1840,14 +1841,17 @@ fn parse_content_model(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
             ));
         }
         cursor.skip_whitespace();
-        parse_cp(cursor, 0, max_depth)?;
+        parse_cp(cursor, 1, max_depth)?;
     }
 }
 
 /// Parse a content particle.
+///
+/// `depth` is the nesting level that a parenthesized group opened by this
+/// particle would occupy (the outermost content-model group is level 0).
 fn parse_cp(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
     if cursor.peek() == Some('(') {
-        parse_children_group(cursor, depth + 1, max_depth)?;
+        parse_children_group(cursor, depth, max_depth)?;
     } else if cursor.starts_with("%") {
         reject_pe_in_markup_decl(cursor)?;
     } else {
@@ -1859,10 +1863,12 @@ fn parse_cp(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
     Ok(())
 }
 
-/// Parse a children group.
+/// Parse a children group at nesting level `depth`.
 fn parse_children_group(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
-    // Matches parse_element's guard (root depth 0, error at depth >= max_depth)
-    // so Parser::with_max_depth maps consistently across element and DTD nesting.
+    // The outermost group (level 0, consumed by parse_content_model) is the
+    // analogue of the document element at depth 0; this guard matches
+    // parse_element's (error at depth >= max_depth) so Parser::with_max_depth
+    // maps consistently across element and DTD content-model nesting.
     if depth >= max_depth {
         return Err(XmlError::parse(
             format!(
@@ -1884,7 +1890,7 @@ fn parse_children_group(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlR
         ));
     }
 
-    parse_cp(cursor, depth, max_depth)?;
+    parse_cp(cursor, depth + 1, max_depth)?;
     cursor.skip_whitespace();
 
     if cursor.peek() == Some(')') {
@@ -1932,7 +1938,7 @@ fn parse_children_group(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlR
             ));
         }
         cursor.skip_whitespace();
-        parse_cp(cursor, depth, max_depth)?;
+        parse_cp(cursor, depth + 1, max_depth)?;
     }
 }
 

@@ -884,6 +884,67 @@ fn xsd_attribute_wildcard_union_other_plus_local_excludes_target() {
 }
 
 #[test]
+fn xsd_attribute_form_default_qualified_matches_target_namespace() {
+    // attributeFormDefault="qualified" puts local attribute uses in the schema
+    // target namespace; namespace-aware attribute matching must accept the
+    // prefixed instance attribute and reject the unqualified spelling.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified"
+           attributeFormDefault="qualified">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:attribute name="id" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"###;
+
+    let qualified = r#"<t:r xmlns:t="urn:t" t:id="ok"/>"#;
+    let errors = validate(schema, qualified);
+    assert!(
+        errors.is_empty(),
+        "qualified local attribute must satisfy its declaration, got {errors:?}"
+    );
+
+    let unqualified = r#"<t:r xmlns:t="urn:t" id="no"/>"#;
+    let errors = validate(schema, unqualified);
+    assert!(
+        !errors.is_empty(),
+        "unqualified attribute must not satisfy a qualified declaration"
+    );
+}
+
+#[test]
+fn xsd_attribute_form_qualified_overrides_unqualified_default() {
+    // form="qualified" on a single attribute use qualifies just that attribute
+    // while sibling declarations stay in no namespace.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:attribute name="q" type="xs:string" use="required" form="qualified"/>
+      <xs:attribute name="u" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"###;
+
+    let valid = r#"<t:r xmlns:t="urn:t" t:q="ok" u="ok"/>"#;
+    let errors = validate(schema, valid);
+    assert!(
+        errors.is_empty(),
+        "form=qualified attribute must match target namespace, got {errors:?}"
+    );
+
+    let invalid = r#"<t:r xmlns:t="urn:t" q="no" u="ok"/>"#;
+    let errors = validate(schema, invalid);
+    assert!(
+        !errors.is_empty(),
+        "unqualified spelling must not satisfy a form=qualified declaration"
+    );
+}
+
+#[test]
 fn xsd_complex_type_derivation_cycles_are_rejected() {
     // Recursive complex-type derivation can otherwise loop while resolving the
     // effective content model. The validator should detect the cycle and report
