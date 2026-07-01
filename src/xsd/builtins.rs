@@ -47,8 +47,23 @@ fn is_valid_xml_name(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
-fn is_date_time_type(base_type: &BuiltInType) -> bool {
-    matches!(base_type, BuiltInType::DateTime | BuiltInType::Time)
+/// Whether a type carries an XSD timezone/fractional-second lexical form whose
+/// enumeration values must be normalized before comparison (e.g. `...+00:00`
+/// vs `...Z`). All XSD date/time types are timezone-bearing; non-temporal types
+/// (string, etc.) must keep their lexical value so a string that merely looks
+/// like a timestamp is not silently normalized.
+fn is_temporal_type(base_type: &BuiltInType) -> bool {
+    matches!(
+        base_type,
+        BuiltInType::DateTime
+            | BuiltInType::Time
+            | BuiltInType::Date
+            | BuiltInType::GYear
+            | BuiltInType::GYearMonth
+            | BuiltInType::GMonth
+            | BuiltInType::GMonthDay
+            | BuiltInType::GDay
+    )
 }
 
 fn compare_facet_values(
@@ -1054,13 +1069,13 @@ pub(crate) fn validate_facet(
             }
         }
         Facet::Enumeration(values) => {
-            let text_normalized = if is_date_time_type(base_type) {
+            let text_normalized = if is_temporal_type(base_type) {
                 normalize_datetime_tz(text.trim())
             } else {
                 text.trim().to_string()
             };
             let match_found = values.iter().any(|v| {
-                let v_normalized = if is_date_time_type(base_type) {
+                let v_normalized = if is_temporal_type(base_type) {
                     normalize_datetime_tz(v.trim())
                 } else {
                     v.trim().to_string()

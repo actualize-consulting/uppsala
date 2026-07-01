@@ -1792,7 +1792,7 @@ fn parse_content_model(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
     }
 
     // children content model
-    parse_cp(cursor, 1, max_depth)?;
+    parse_cp(cursor, 0, max_depth)?;
     cursor.skip_whitespace();
 
     if cursor.peek() == Some(')') {
@@ -1840,7 +1840,7 @@ fn parse_content_model(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
             ));
         }
         cursor.skip_whitespace();
-        parse_cp(cursor, 1, max_depth)?;
+        parse_cp(cursor, 0, max_depth)?;
     }
 }
 
@@ -1861,7 +1861,9 @@ fn parse_cp(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
 
 /// Parse a children group.
 fn parse_children_group(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
-    if depth > max_depth {
+    // Matches parse_element's guard (root depth 0, error at depth >= max_depth)
+    // so Parser::with_max_depth maps consistently across element and DTD nesting.
+    if depth >= max_depth {
         return Err(XmlError::parse(
             format!(
                 "DTD content model depth limit exceeded (max_depth={})",

@@ -969,6 +969,41 @@ fn xsd_string_enumeration_is_not_datetime_normalized() {
 }
 
 #[test]
+fn xsd_temporal_enumeration_normalizes_timezone_beyond_datetime() {
+    // All timezone-bearing temporal types (not just xs:dateTime/xs:time) must
+    // normalize the timezone suffix for enumeration matching, so a lexically
+    // different but value-equivalent instant (`...+00:00` vs `...Z`) still
+    // matches an allowed enumeration value.
+    let date_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="d">
+    <xs:simpleType>
+      <xs:restriction base="xs:date">
+        <xs:enumeration value="2024-01-01Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        validate(date_schema, "<d>2024-01-01+00:00</d>").is_empty(),
+        "xs:date enumeration must normalize +00:00 to Z"
+    );
+
+    let gym_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="g">
+    <xs:simpleType>
+      <xs:restriction base="xs:gYearMonth">
+        <xs:enumeration value="2024-01Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        validate(gym_schema, "<g>2024-01+00:00</g>").is_empty(),
+        "xs:gYearMonth enumeration must normalize +00:00 to Z"
+    );
+}
+
+#[test]
 fn xsd_negative_date_rejects_extra_suffix() {
     let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:element name="d" type="xs:date"/>
