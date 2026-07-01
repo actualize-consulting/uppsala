@@ -178,6 +178,44 @@ fn collect_rtf_text(node: &ResultNode, out: &mut String) {
     }
 }
 
+fn sanitize_comment_text(text: &str) -> XmlResult<String> {
+    if text.contains("--") || text.ends_with('-') {
+        return Err(XmlError::validation(
+            "xsl:comment content must not contain '--' or end with '-'",
+        ));
+    }
+    Ok(text.to_string())
+}
+
+fn validate_pi_target(target: &str) -> XmlResult<()> {
+    let valid_ncname = target
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if !valid_ncname
+        || target.eq_ignore_ascii_case("xml")
+        || target.contains(':')
+        || target.trim() != target
+    {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction target is not a valid NCName",
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_pi_data(data: &str) -> XmlResult<String> {
+    if data.contains("?>") {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction data must not contain '?>'",
+        ));
+    }
+    Ok(data.to_string())
+}
+
 // ─── Output options (xsl:output) ──────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1416,13 +1454,14 @@ impl<'a, 'b> Engine<'a, 'b> {
             }
             Instruction::Comment { body } => {
                 let items = self.execute_sequence(body, focus)?;
-                let text = rtf_string_value(&items_to_nodes(items));
+                let text = sanitize_comment_text(&rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Comment(text)));
             }
             Instruction::Pi { name, body } => {
                 let target = self.eval_avt(name, focus)?;
+                validate_pi_target(&target)?;
                 let items = self.execute_sequence(body, focus)?;
-                let data = rtf_string_value(&items_to_nodes(items));
+                let data = sanitize_pi_data(&rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Pi { target, data }));
             }
             Instruction::CallTemplate { name, params } => {

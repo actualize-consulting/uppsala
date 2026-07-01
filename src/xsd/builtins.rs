@@ -47,6 +47,180 @@ fn is_valid_xml_name(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
+fn is_date_time_type(base_type: &BuiltInType) -> bool {
+    matches!(base_type, BuiltInType::DateTime | BuiltInType::Time)
+}
+
+fn compare_facet_values(
+    value: &str,
+    facet_value: &str,
+    base_type: &BuiltInType,
+) -> Option<Ordering> {
+    match base_type {
+        BuiltInType::DateTime => compare_datetime_values(value, facet_value),
+        BuiltInType::Time => compare_time_values(value, facet_value),
+        BuiltInType::Date
+        | BuiltInType::GYear
+        | BuiltInType::GYearMonth
+        | BuiltInType::GMonth
+        | BuiltInType::GMonthDay
+        | BuiltInType::GDay => Some(value.cmp(facet_value)),
+        _ => Some(compare_values(value, facet_value)),
+    }
+}
+
+fn compare_datetime_values(value: &str, facet_value: &str) -> Option<Ordering> {
+    // Fail closed on lexically-parseable but out-of-range values (e.g. year 0000,
+    // month 99, hour 99). Facet values are stored as raw strings and are not
+    // otherwise range-checked, so an invalid minInclusive/maxInclusive must not
+    // yield a comparable ordering.
+    if !is_valid_datetime(value) || !is_valid_datetime(facet_value) {
+        return None;
+    }
+    let left = datetime_to_utc_tuple(value)?;
+    let right = datetime_to_utc_tuple(facet_value)?;
+    Some(compare_utc_tuple(&left, &right))
+}
+
+fn compare_time_values(value: &str, facet_value: &str) -> Option<Ordering> {
+    // Fail closed on out-of-range time strings (e.g. 99:99:99Z); see
+    // compare_datetime_values for the rationale.
+    if !is_valid_time(value) || !is_valid_time(facet_value) {
+        return None;
+    }
+    let left = time_to_utc_tuple(value)?;
+    let right = time_to_utc_tuple(facet_value)?;
+    Some(compare_utc_tuple(&left, &right))
+}
+
+fn datetime_to_utc_tuple(value: &str) -> Option<(i128, String)> {
+    let (date, time) = value.split_once('T')?;
+    let (year, month, day) = parse_xsd_date_parts(date)?;
+    let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(time)?;
+    let days = days_from_civil(year, month, day);
+    let local_seconds =
+        days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    Some((
+        local_seconds - i128::from(offset_minutes) * 60,
+        normalize_fraction(&fraction),
+    ))
+}
+
+fn time_to_utc_tuple(value: &str) -> Option<(i128, String)> {
+    let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(value)?;
+    let local_seconds = i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    Some((
+        local_seconds - i128::from(offset_minutes) * 60,
+        normalize_fraction(&fraction),
+    ))
+}
+
+fn compare_utc_tuple(left: &(i128, String), right: &(i128, String)) -> Ordering {
+    match left.0.cmp(&right.0) {
+        Ordering::Equal => compare_fraction(&left.1, &right.1),
+        ord => ord,
+    }
+}
+
+fn normalize_fraction(fraction: &str) -> String {
+    fraction.trim_end_matches('0').to_string()
+}
+
+fn compare_fraction(left: &str, right: &str) -> Ordering {
+    let max_len = left.len().max(right.len());
+    let mut left = left.to_string();
+    let mut right = right.to_string();
+    left.extend(std::iter::repeat_n('0', max_len - left.len()));
+    right.extend(std::iter::repeat_n('0', max_len - right.len()));
+    left.cmp(&right)
+}
+
+fn parse_xsd_date_parts(date: &str) -> Option<(i128, u32, u32)> {
+    let (negative, rest) = date
+        .strip_prefix('-')
+        .map(|s| (true, s))
+        .unwrap_or((false, date));
+    let mut parts = rest.split('-');
+    let year_str = parts.next()?;
+    let month_str = parts.next()?;
+    let day_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let year: i128 = year_str.parse().ok()?;
+    let month: u32 = month_str.parse().ok()?;
+    let day: u32 = day_str.parse().ok()?;
+    Some((if negative { -year } else { year }, month, day))
+}
+
+fn parse_xsd_time_parts(time: &str) -> Option<(u32, u32, u32, String, i32)> {
+    let (time, offset_minutes) = split_time_offset(time)?;
+    let mut parts = time.split(':');
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (second_str, frac_str) = second_part.split_once('.').unwrap_or((second_part, ""));
+    let second: u32 = second_str.parse().ok()?;
+    if !frac_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((hour, minute, second, frac_str.to_string(), offset_minutes))
+}
+
+fn split_time_offset(time: &str) -> Option<(&str, i32)> {
+    if let Some(stripped) = time.strip_suffix('Z') {
+        return Some((stripped, 0));
+    }
+    if time.len() >= 6 {
+        let tz_start = time.len() - 6;
+        let tz = &time[tz_start..];
+        let sign = match tz.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return Some((time, 0)),
+        };
+        if tz.as_bytes().get(3) != Some(&b':') {
+            return None;
+        }
+        let hours: i32 = tz[1..3].parse().ok()?;
+        let minutes: i32 = tz[4..6].parse().ok()?;
+        return Some((&time[..tz_start], sign * (hours * 60 + minutes)));
+    }
+    Some((time, 0))
+}
+
+fn days_from_civil(year: i128, month: u32, day: u32) -> i128 {
+    let mut y = year;
+    let m = i128::from(month);
+    y -= i128::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i128::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn push_facet_compare_error(
+    facet_name: &str,
+    value: &str,
+    facet_value: &str,
+    doc: &Document,
+    node: NodeId,
+    errors: &mut Vec<ValidationError>,
+) {
+    errors.push(ValidationError {
+        message: format!(
+            "Cannot compare value '{}' with {} {} for this datatype",
+            value, facet_name, facet_value
+        ),
+        line: Some(doc.node_line(node)),
+        column: Some(doc.node_column(node)),
+    });
+}
+
 /// Check if a string is a valid QName (prefix:localname or just localname).
 /// Both prefix and localname must be valid NCNames.
 /// Covers MS tests: QName001/004/005/007/008/010/011
@@ -679,6 +853,16 @@ pub(crate) fn validate_builtin_value(
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
+            } else if let Some(colon_pos) = v.find(':') {
+                let prefix = &v[..colon_pos];
+                let resolver = build_resolver_for_node(doc, node);
+                if resolver.resolve(prefix).is_none() {
+                    errors.push(ValidationError {
+                        message: format!("QName prefix '{}' is not bound", prefix),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
             }
         }
     }
@@ -738,14 +922,20 @@ pub(crate) fn validate_list_facet(
         }
         Facet::Pattern(pattern) => {
             // Pattern facets on lists apply to the whole collapsed space-separated value
-            if let Ok(re) = XsdRegex::compile(pattern) {
-                if !re.is_match(text) {
+            match XsdRegex::compile(pattern) {
+                Ok(re) if !re.is_match(text) => {
                     errors.push(ValidationError {
                         message: format!("Value '{}' does not match pattern '{}'", text, pattern),
                         line: Some(doc.node_line(node)),
                         column: Some(doc.node_column(node)),
                     });
                 }
+                Ok(_) => {}
+                Err(e) => errors.push(ValidationError {
+                    message: format!("Pattern facet '{}' could not be compiled: {}", pattern, e),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                }),
             }
         }
         Facet::WhiteSpace(_) => {}
@@ -864,9 +1054,17 @@ pub(crate) fn validate_facet(
             }
         }
         Facet::Enumeration(values) => {
-            let text_normalized = normalize_datetime_tz(text.trim());
+            let text_normalized = if is_date_time_type(base_type) {
+                normalize_datetime_tz(text.trim())
+            } else {
+                text.trim().to_string()
+            };
             let match_found = values.iter().any(|v| {
-                let v_normalized = normalize_datetime_tz(v.trim());
+                let v_normalized = if is_date_time_type(base_type) {
+                    normalize_datetime_tz(v.trim())
+                } else {
+                    v.trim().to_string()
+                };
                 v_normalized == text_normalized
             });
             if !match_found {
@@ -877,27 +1075,30 @@ pub(crate) fn validate_facet(
                 });
             }
         }
-        Facet::MinInclusive(min) => {
-            if compare_values(text.trim(), min) == Ordering::Less {
+        Facet::MinInclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
+            Some(Ordering::Less) => {
                 errors.push(ValidationError {
                     message: format!("Value '{}' is less than minInclusive {}", text.trim(), min),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MaxInclusive(max) => {
-            if compare_values(text.trim(), max) == Ordering::Greater {
+            Some(_) => {}
+            None => push_facet_compare_error("minInclusive", text.trim(), min, doc, node, errors),
+        },
+        Facet::MaxInclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
+            Some(Ordering::Greater) => {
                 errors.push(ValidationError {
                     message: format!("Value '{}' exceeds maxInclusive {}", text.trim(), max),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MinExclusive(min) => {
-            let cmp = compare_values(text.trim(), min);
-            if cmp == Ordering::Less || cmp == Ordering::Equal {
+            Some(_) => {}
+            None => push_facet_compare_error("maxInclusive", text.trim(), max, doc, node, errors),
+        },
+        Facet::MinExclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
+            Some(Ordering::Less | Ordering::Equal) => {
                 errors.push(ValidationError {
                     message: format!(
                         "Value '{}' is not greater than minExclusive {}",
@@ -908,10 +1109,11 @@ pub(crate) fn validate_facet(
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MaxExclusive(max) => {
-            let cmp = compare_values(text.trim(), max);
-            if cmp == Ordering::Greater || cmp == Ordering::Equal {
+            Some(_) => {}
+            None => push_facet_compare_error("minExclusive", text.trim(), min, doc, node, errors),
+        },
+        Facet::MaxExclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
+            Some(Ordering::Greater | Ordering::Equal) => {
                 errors.push(ValidationError {
                     message: format!(
                         "Value '{}' is not less than maxExclusive {}",
@@ -922,7 +1124,9 @@ pub(crate) fn validate_facet(
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
+            Some(_) => {}
+            None => push_facet_compare_error("maxExclusive", text.trim(), max, doc, node, errors),
+        },
         Facet::TotalDigits(max_digits) => {
             let digits: String = text.trim().chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.len() > *max_digits {
@@ -953,19 +1157,21 @@ pub(crate) fn validate_facet(
                 }
             }
         }
-        Facet::Pattern(pattern) => {
-            if let Ok(re) = XsdRegex::compile(pattern) {
-                if !re.is_match(text) {
-                    errors.push(ValidationError {
-                        message: format!("Value '{}' does not match pattern '{}'", text, pattern),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
+        Facet::Pattern(pattern) => match XsdRegex::compile(pattern) {
+            Ok(re) if !re.is_match(text) => {
+                errors.push(ValidationError {
+                    message: format!("Value '{}' does not match pattern '{}'", text, pattern),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
             }
-            // If the pattern fails to compile, we silently accept
-            // (graceful degradation for unsupported regex features)
-        }
+            Ok(_) => {}
+            Err(e) => errors.push(ValidationError {
+                message: format!("Pattern facet '{}' could not be compiled: {}", pattern, e),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            }),
+        },
         Facet::WhiteSpace(_) => {
             // White space normalization is applied during parsing
         }

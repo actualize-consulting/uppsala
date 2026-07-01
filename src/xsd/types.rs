@@ -362,6 +362,7 @@ pub(crate) enum MaxOccurs {
 #[derive(Debug, Clone)]
 pub(crate) struct AttributeDecl {
     pub(super) name: String,
+    pub(super) namespace: Option<String>,
     pub(super) type_ref: TypeRef,
     pub(super) required: bool,
     /// Default value (parsed for spec completeness; not yet enforced during validation).

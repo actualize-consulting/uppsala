@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-02
+
+### Security
+
+- XSD validation now fails closed for unresolved element references instead of
+  validating them as unconstrained content, and namespace-sensitive attribute
+  declarations and strict attribute wildcards now compare expanded names instead
+  of falling back to local-name matches.
+- XSD datatype and facet validation is stricter for hostile inputs: date/time
+  facets compare actual instants, non-temporal enumerations no longer receive
+  date/time normalization, malformed negative dates are rejected, invalid pattern
+  facets fail closed, and `xs:QName` rejects unbound prefixes.
+- XSD identity constraints now reject `xs:unique`, `xs:key`, and `xs:keyref`
+  fields that select more than one node, preserving the XSD single-field-value
+  rule instead of silently choosing the first value.
+- DTD content-model parsing now observes the parser nesting-depth limit, so
+  deeply nested declarations fail gracefully with the same configurable cap as
+  element nesting.
+- XSLT generated comments and processing instructions reject content that would
+  break out of XML markup, and opt-in EXSLT `str:padding()` is capped to prevent
+  attacker-selected output allocation.
+
 ## [0.7.0] - 2026-07-01
 
 ### Added

@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 
-use uppsala::{parse, Document, NodeId, QName, XPathEvaluator, XmlWriter, XsdValidator};
+use uppsala::{
+    parse, Document, NodeId, Parser, QName, Stylesheet, XPathEvaluator, XmlWriter, XsdValidator,
+};
 
 fn validate(schema: &str, instance: &str) -> Vec<String> {
     // Keep XSD assertions compact by returning display strings rather than
@@ -21,6 +23,14 @@ fn validate(schema: &str, instance: &str) -> Vec<String> {
         .into_iter()
         .map(|e| e.to_string())
         .collect()
+}
+
+fn transform_exslt(xslt: &str, xml: &str) -> uppsala::XmlResult<String> {
+    let style_doc = Parser::new().parse(xslt)?;
+    let stylesheet = Stylesheet::compile(&style_doc)?.with_exslt(true);
+    let mut source = Parser::new().parse(xml)?;
+    source.prepare_xpath();
+    stylesheet.transform(&source)
 }
 
 fn mkdir_unique(label: &str) -> PathBuf {
@@ -432,6 +442,41 @@ fn xsd_rejects_malformed_time_and_datetime_values() {
     assert!(!validate(schema, "<t>12:00:0é0+000</t>").is_empty());
     assert!(!validate(schema, "<dt>2024-01-01T12:00:00+99:00</dt>").is_empty());
     assert!(!validate(schema, "<dt>2024-01-01T12:00:0é0+000</dt>").is_empty());
+}
+
+#[test]
+fn xsd_datetime_facet_comparison_fails_closed_on_invalid_bounds() {
+    // Facet values (minInclusive/maxInclusive) are stored as raw strings and are
+    // not otherwise range-checked. A lexically-parseable but out-of-range bound
+    // (month 99, hour 99) must not yield a comparable ordering that silently
+    // accepts an instance value; the comparison must fail closed.
+    let dt_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="dt">
+    <xs:simpleType>
+      <xs:restriction base="xs:dateTime">
+        <xs:maxInclusive value="2024-99-01T99:00:00Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        !validate(dt_schema, "<dt>2024-06-01T12:00:00Z</dt>").is_empty(),
+        "invalid dateTime facet bound must fail closed"
+    );
+
+    let time_schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="t">
+    <xs:simpleType>
+      <xs:restriction base="xs:time">
+        <xs:maxInclusive value="99:99:99Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    assert!(
+        !validate(time_schema, "<t>12:00:00Z</t>").is_empty(),
+        "invalid time facet bound must fail closed"
+    );
 }
 
 #[test]
@@ -860,5 +905,347 @@ fn xsd_complex_type_derivation_cycles_are_rejected() {
     assert!(
         errors.iter().any(|e| e.contains("derivation cycle")),
         "expected derivation cycle error, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_datetime_facets_compare_actual_instants() {
+    // Date/time facets must compare temporal values, not lexical strings.
+    // This value sorts after the minimum as text but is two hours earlier in UTC.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="stamp">
+    <xs:simpleType>
+      <xs:restriction base="xs:dateTime">
+        <xs:minInclusive value="2024-01-01T00:00:00Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    let invalid = validate(schema, "<stamp>2024-01-01T00:00:00+02:00</stamp>");
+    assert!(
+        invalid.iter().any(|e| e.contains("minInclusive")),
+        "expected instant-aware minInclusive error, got {invalid:?}"
+    );
+
+    assert!(validate(schema, "<stamp>2024-01-01T02:00:00+02:00</stamp>").is_empty());
+
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="stamp">
+    <xs:simpleType>
+      <xs:restriction base="xs:dateTime">
+        <xs:minInclusive value="2024-01-01T00:00:00.0002Z"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+    let invalid = validate(schema, "<stamp>2024-01-01T00:00:00.0001Z</stamp>");
+    assert!(
+        invalid.iter().any(|e| e.contains("minInclusive")),
+        "expected fractional instant comparison error, got {invalid:?}"
+    );
+}
+
+#[test]
+fn xsd_string_enumeration_is_not_datetime_normalized() {
+    // Enumeration comparison must only normalize temporal datatypes. Treating
+    // every dotted string as a timestamp lets values bypass string allow-lists.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="role">
+    <xs:simpleType>
+      <xs:restriction base="xs:string">
+        <xs:enumeration value="admin"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    assert!(validate(schema, "<role>admin</role>").is_empty());
+    let errors = validate(schema, "<role>admin.000</role>");
+    assert!(
+        errors.iter().any(|e| e.contains("allowed values")),
+        "expected string enumeration rejection, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_negative_date_rejects_extra_suffix() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="d" type="xs:date"/>
+</xs:schema>"#;
+
+    assert!(validate(schema, "<d>-2024-02-29</d>").is_empty());
+    let errors = validate(schema, "<d>-2024-02-29-extra</d>");
+    assert!(
+        errors.iter().any(|e| e.contains("date")),
+        "expected malformed negative date rejection, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_unresolved_element_ref_fails_closed() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="urn:t"
+           xmlns:i="urn:i"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified">
+  <xs:import namespace="urn:i"/>
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="i:child"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+
+    let errors = validate(
+        schema,
+        r#"<t:root xmlns:t="urn:t" xmlns:i="urn:i"><i:child><x/></i:child></t:root>"#,
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("Element reference")),
+        "expected unresolved element reference error, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_attribute_refs_match_expanded_names() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="urn:t"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified"
+           attributeFormDefault="unqualified">
+  <xs:attribute name="role" type="xs:int"/>
+  <xs:element name="user">
+    <xs:complexType>
+      <xs:attribute ref="t:role" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+
+    assert!(validate(schema, r#"<t:user xmlns:t="urn:t" t:role="123"/>"#).is_empty());
+    let errors = validate(schema, r#"<t:user xmlns:t="urn:t" role="123"/>"#);
+    assert!(
+        errors.iter().any(|e| e.contains("Required attribute")),
+        "expected required namespaced attribute rejection, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_strict_any_attribute_uses_actual_attribute_namespace() {
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="urn:t"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified">
+  <xs:attribute name="role" type="xs:int"/>
+  <xs:element name="user">
+    <xs:complexType>
+      <xs:anyAttribute namespace="##any" processContents="strict"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"###;
+
+    assert!(validate(schema, r#"<t:user xmlns:t="urn:t" t:role="123"/>"#).is_empty());
+    let errors = validate(
+        schema,
+        r#"<t:user xmlns:t="urn:t" xmlns:f="urn:f" f:role="abc"/>"#,
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("no global declaration")),
+        "expected exact namespace lookup for strict anyAttribute, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_pattern_compile_errors_fail_closed() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="code">
+    <xs:simpleType>
+      <xs:restriction base="xs:string">
+        <xs:pattern value="["/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"#;
+
+    let errors = validate(schema, "<code>anything</code>");
+    assert!(
+        errors.iter().any(|e| e.contains("could not be compiled")),
+        "expected invalid pattern to reject validation, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_unique_fields_must_select_at_most_one_node() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="item" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="code" type="xs:string" maxOccurs="unbounded"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:unique name="item_code">
+      <xs:selector xpath="item"/>
+      <xs:field xpath="code"/>
+    </xs:unique>
+  </xs:element>
+</xs:schema>"#;
+
+    let errors = validate(
+        schema,
+        "<root><item><code>A</code><code>B</code></item></root>",
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("must select at most one")),
+        "expected multi-field xs:unique rejection, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_keyref_fields_must_select_at_most_one_node() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="item">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="code" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ref">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="code" type="xs:string" maxOccurs="unbounded"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key name="item_code">
+      <xs:selector xpath="item"/>
+      <xs:field xpath="code"/>
+    </xs:key>
+    <xs:keyref name="ref_code" refer="item_code">
+      <xs:selector xpath="ref"/>
+      <xs:field xpath="code"/>
+    </xs:keyref>
+  </xs:element>
+</xs:schema>"#;
+
+    let errors = validate(
+        schema,
+        "<root><item><code>A</code></item><ref><code>A</code><code>B</code></ref></root>",
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("must select at most one")),
+        "expected multi-field xs:keyref rejection, got {errors:?}"
+    );
+}
+
+#[test]
+fn dtd_content_model_depth_uses_parser_limit() {
+    let content_model = format!("{}a{}", "(".repeat(10), ")".repeat(10));
+    let xml = format!("<!DOCTYPE r [<!ELEMENT r {content_model}><!ELEMENT a EMPTY>]><r><a/></r>");
+    let err = Parser::new()
+        .with_max_depth(5)
+        .parse(&xml)
+        .expect_err("DTD content model nesting must honor parser depth limit");
+    assert!(
+        err.to_string().contains("DTD content model depth limit"),
+        "expected DTD depth error, got {err:?}"
+    );
+}
+
+#[test]
+fn xslt_comment_constructor_rejects_markup_breakout() {
+    let xslt = r#"<xsl:stylesheet version="1.0"
+           xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="xml" omit-xml-declaration="yes"/>
+  <xsl:template match="/">
+    <xsl:comment><xsl:value-of select="/r"/></xsl:comment>
+  </xsl:template>
+</xsl:stylesheet>"#;
+
+    assert_eq!(
+        uppsala::transform(xslt, "<r>safe</r>").unwrap(),
+        "<!--safe-->"
+    );
+    let err = uppsala::transform(xslt, "<r>--&gt;&lt;evil/&gt;</r>")
+        .expect_err("comment breakout text must be rejected");
+    assert!(
+        err.to_string().contains("xsl:comment content"),
+        "expected xsl:comment hardening error, got {err:?}"
+    );
+}
+
+#[test]
+fn xslt_processing_instruction_rejects_markup_breakout() {
+    let xslt = r#"<xsl:stylesheet version="1.0"
+           xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="xml" omit-xml-declaration="yes"/>
+  <xsl:template match="/">
+    <xsl:processing-instruction name="ok"><xsl:value-of select="/r"/></xsl:processing-instruction>
+  </xsl:template>
+</xsl:stylesheet>"#;
+
+    assert_eq!(
+        uppsala::transform(xslt, "<r>safe</r>").unwrap(),
+        "<?ok safe?>"
+    );
+    let err = uppsala::transform(xslt, "<r>?&gt;&lt;evil/&gt;</r>")
+        .expect_err("processing-instruction breakout text must be rejected");
+    assert!(
+        err.to_string().contains("xsl:processing-instruction data"),
+        "expected xsl:processing-instruction hardening error, got {err:?}"
+    );
+}
+
+#[test]
+fn exslt_padding_has_output_cap() {
+    let xslt = r#"<xsl:stylesheet version="1.0"
+           xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+           xmlns:str="http://exslt.org/strings">
+  <xsl:output method="text"/>
+  <xsl:template match="/">
+    <xsl:value-of select="str:padding(4, '*')"/>
+  </xsl:template>
+</xsl:stylesheet>"#;
+    assert_eq!(transform_exslt(xslt, "<r/>").unwrap(), "****");
+
+    let xslt = r#"<xsl:stylesheet version="1.0"
+           xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+           xmlns:str="http://exslt.org/strings">
+  <xsl:output method="text"/>
+  <xsl:template match="/">
+    <xsl:value-of select="str:padding(1000001, 'x')"/>
+  </xsl:template>
+</xsl:stylesheet>"#;
+    let err = transform_exslt(xslt, "<r/>").expect_err("oversized padding must fail");
+    assert!(
+        err.to_string().contains("str:padding length"),
+        "expected EXSLT padding cap error, got {err:?}"
+    );
+}
+
+#[test]
+fn xsd_qname_rejects_unbound_prefix() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="q" type="xs:QName"/>
+</xs:schema>"#;
+
+    assert!(validate(schema, r#"<q xmlns:ok="urn:ok">ok:name</q>"#).is_empty());
+    let errors = validate(schema, "<q>missing:name</q>");
+    assert!(
+        errors.iter().any(|e| e.contains("prefix 'missing'")),
+        "expected unbound QName prefix rejection, got {errors:?}"
     );
 }

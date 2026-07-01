@@ -278,6 +278,7 @@ impl XsdValidator {
                             let default = attr_elem.get_attribute("default").map(|s| s.to_string());
                             let decl = AttributeDecl {
                                 name: name.to_string(),
+                                namespace: validator.target_namespace.clone(),
                                 type_ref,
                                 required,
                                 default,
@@ -428,6 +429,7 @@ impl XsdValidator {
                                     attr_elem.get_attribute("default").map(|s| s.to_string());
                                 let decl = AttributeDecl {
                                     name: name.to_string(),
+                                    namespace: validator.target_namespace.clone(),
                                     type_ref,
                                     required,
                                     default,

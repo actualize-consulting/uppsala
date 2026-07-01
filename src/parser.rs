@@ -190,6 +190,7 @@ impl Parser {
             &mut entity_budget,
             self.forbid_dtd,
             self.forbid_entities,
+            self.max_depth,
         )?;
 
         // Parse document element and trailing misc
@@ -1359,6 +1360,7 @@ fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>>
 /// DOCTYPE / internal-subset parsing so any entity expansion that occurs while
 /// processing ATTLIST default values charges against the same cap as document
 /// content.
+#[allow(clippy::too_many_arguments)]
 fn parse_misc<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
@@ -1367,6 +1369,7 @@ fn parse_misc<'a>(
     entity_budget: &mut usize,
     forbid_dtd: bool,
     forbid_entities: bool,
+    max_depth: u32,
 ) -> XmlResult<()> {
     loop {
         cursor.skip_whitespace();
@@ -1393,7 +1396,14 @@ fn parse_misc<'a>(
                     cursor.column(),
                 ));
             }
-            parse_doctype(cursor, doc, entities, entity_budget, forbid_entities)?;
+            parse_doctype(
+                cursor,
+                doc,
+                entities,
+                entity_budget,
+                forbid_entities,
+                max_depth,
+            )?;
         } else {
             break;
         }
@@ -1412,6 +1422,7 @@ fn parse_doctype<'a>(
     entities: &mut EntityMap,
     entity_budget: &mut usize,
     forbid_entities: bool,
+    max_depth: u32,
 ) -> XmlResult<()> {
     let start_pos = cursor.pos;
     cursor.expect("<!DOCTYPE")?;
@@ -1469,7 +1480,7 @@ fn parse_doctype<'a>(
     // Optional internal subset
     if cursor.peek() == Some('[') {
         cursor.advance_char();
-        parse_internal_subset(cursor, entities, entity_budget, forbid_entities)?;
+        parse_internal_subset(cursor, entities, entity_budget, forbid_entities, max_depth)?;
         cursor.expect("]")?;
         cursor.skip_whitespace();
     }
@@ -1567,6 +1578,7 @@ fn parse_internal_subset(
     entities: &mut EntityMap,
     entity_budget: &mut usize,
     forbid_entities: bool,
+    max_depth: u32,
 ) -> XmlResult<()> {
     loop {
         cursor.skip_whitespace();
@@ -1582,7 +1594,7 @@ fn parse_internal_subset(
         } else if cursor.starts_with("<?") {
             parse_pi_in_dtd(cursor)?;
         } else if cursor.starts_with("<!ELEMENT") {
-            parse_element_decl(cursor)?;
+            parse_element_decl(cursor, max_depth)?;
         } else if cursor.starts_with("<!ATTLIST") {
             parse_attlist_decl(cursor, entities, entity_budget)?;
         } else if cursor.starts_with("<!ENTITY") {
@@ -1665,7 +1677,7 @@ fn reject_pe_in_markup_decl(cursor: &Cursor) -> XmlResult<()> {
 }
 
 /// Parse an ELEMENT declaration (`<!ELEMENT name contentspec>`).
-fn parse_element_decl(cursor: &mut Cursor) -> XmlResult<()> {
+fn parse_element_decl(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
     cursor.expect("<!ELEMENT")?;
 
     // Must have whitespace after <!ELEMENT
@@ -1692,7 +1704,7 @@ fn parse_element_decl(cursor: &mut Cursor) -> XmlResult<()> {
     cursor.skip_whitespace();
 
     // Parse content spec: EMPTY | ANY | Mixed | children
-    parse_content_spec(cursor)?;
+    parse_content_spec(cursor, max_depth)?;
 
     cursor.skip_whitespace();
     cursor.expect(">")?;
@@ -1700,7 +1712,7 @@ fn parse_element_decl(cursor: &mut Cursor) -> XmlResult<()> {
 }
 
 /// Parse a content specification for an ELEMENT declaration.
-fn parse_content_spec(cursor: &mut Cursor) -> XmlResult<()> {
+fn parse_content_spec(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
     if cursor.starts_with("EMPTY") {
         cursor.advance(5);
         Ok(())
@@ -1708,7 +1720,7 @@ fn parse_content_spec(cursor: &mut Cursor) -> XmlResult<()> {
         cursor.advance(3);
         Ok(())
     } else if cursor.peek() == Some('(') {
-        parse_content_model(cursor)
+        parse_content_model(cursor, max_depth)
     } else if cursor.starts_with("%") {
         reject_pe_in_markup_decl(cursor)?;
         Ok(())
@@ -1722,7 +1734,7 @@ fn parse_content_spec(cursor: &mut Cursor) -> XmlResult<()> {
 }
 
 /// Parse a content model (children or Mixed content).
-fn parse_content_model(cursor: &mut Cursor) -> XmlResult<()> {
+fn parse_content_model(cursor: &mut Cursor, max_depth: u32) -> XmlResult<()> {
     cursor.expect("(")?;
     cursor.skip_whitespace();
 
@@ -1780,7 +1792,7 @@ fn parse_content_model(cursor: &mut Cursor) -> XmlResult<()> {
     }
 
     // children content model
-    parse_cp(cursor)?;
+    parse_cp(cursor, 1, max_depth)?;
     cursor.skip_whitespace();
 
     if cursor.peek() == Some(')') {
@@ -1828,14 +1840,14 @@ fn parse_content_model(cursor: &mut Cursor) -> XmlResult<()> {
             ));
         }
         cursor.skip_whitespace();
-        parse_cp(cursor)?;
+        parse_cp(cursor, 1, max_depth)?;
     }
 }
 
 /// Parse a content particle.
-fn parse_cp(cursor: &mut Cursor) -> XmlResult<()> {
+fn parse_cp(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
     if cursor.peek() == Some('(') {
-        parse_children_group(cursor)?;
+        parse_children_group(cursor, depth + 1, max_depth)?;
     } else if cursor.starts_with("%") {
         reject_pe_in_markup_decl(cursor)?;
     } else {
@@ -1848,7 +1860,17 @@ fn parse_cp(cursor: &mut Cursor) -> XmlResult<()> {
 }
 
 /// Parse a children group.
-fn parse_children_group(cursor: &mut Cursor) -> XmlResult<()> {
+fn parse_children_group(cursor: &mut Cursor, depth: u32, max_depth: u32) -> XmlResult<()> {
+    if depth > max_depth {
+        return Err(XmlError::parse(
+            format!(
+                "DTD content model depth limit exceeded (max_depth={})",
+                max_depth
+            ),
+            cursor.line(),
+            cursor.column(),
+        ));
+    }
     cursor.expect("(")?;
     cursor.skip_whitespace();
 
@@ -1860,7 +1882,7 @@ fn parse_children_group(cursor: &mut Cursor) -> XmlResult<()> {
         ));
     }
 
-    parse_cp(cursor)?;
+    parse_cp(cursor, depth, max_depth)?;
     cursor.skip_whitespace();
 
     if cursor.peek() == Some(')') {
@@ -1908,7 +1930,7 @@ fn parse_children_group(cursor: &mut Cursor) -> XmlResult<()> {
             ));
         }
         cursor.skip_whitespace();
-        parse_cp(cursor)?;
+        parse_cp(cursor, depth, max_depth)?;
     }
 }
 

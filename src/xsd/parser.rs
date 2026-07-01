@@ -528,7 +528,7 @@ pub(super) fn parse_complex_type(
                     }
                 }
                 "attribute" => {
-                    attributes.push(parse_attribute_decl(doc, child)?);
+                    attributes.push(parse_attribute_decl(doc, child, target_ns)?);
                 }
                 "anyAttribute" => {
                     let new_wc = parse_any_attribute(child_elem, target_ns);
@@ -605,8 +605,9 @@ pub(super) fn parse_complex_type(
                                             }
                                             match gc_child_elem.name.local_name.as_ref() {
                                                 "attribute" => {
-                                                    attributes
-                                                        .push(parse_attribute_decl(doc, gc_child)?);
+                                                    attributes.push(parse_attribute_decl(
+                                                        doc, gc_child, target_ns,
+                                                    )?);
                                                 }
                                                 "anyAttribute" => {
                                                     local_wildcard = Some(parse_any_attribute(
@@ -831,6 +832,7 @@ pub(super) fn parse_attribute_group_def(
                             let prohibited = child_elem.get_attribute("use") == Some("prohibited");
                             attributes.push(AttributeDecl {
                                 name: local_name.to_string(),
+                                namespace: key.0.clone(),
                                 type_ref: TypeRef::BuiltIn(BuiltInType::String),
                                 required,
                                 default: None,
@@ -838,7 +840,7 @@ pub(super) fn parse_attribute_group_def(
                             });
                         }
                     } else {
-                        attributes.push(parse_attribute_decl(doc, child)?);
+                        attributes.push(parse_attribute_decl(doc, child, target_ns)?);
                     }
                 }
                 "attributeGroup" => {
@@ -1187,16 +1189,23 @@ fn parse_particles(
 ///
 /// Handles both `name` and `ref` attributes, inline `<xs:simpleType>` children,
 /// `use` (required/prohibited), and `default`.
-fn parse_attribute_decl(doc: &Document, node: NodeId) -> XmlResult<AttributeDecl> {
+fn parse_attribute_decl(
+    doc: &Document,
+    node: NodeId,
+    schema_target_ns: &Option<String>,
+) -> XmlResult<AttributeDecl> {
     let elem = doc
         .element(node)
         .ok_or_else(|| XmlError::validation("Expected element node for attribute declaration"))?;
 
     // Handle <attribute ref="..."/> — create a placeholder decl with the ref name
-    let name = if let Some(n) = elem.get_attribute("name") {
-        n.to_string()
+    let (name, namespace) = if let Some(n) = elem.get_attribute("name") {
+        (n.to_string(), None)
     } else if let Some(ref_name) = elem.get_attribute("ref") {
-        strip_prefix(ref_name).to_string()
+        (
+            strip_prefix(ref_name).to_string(),
+            resolve_ref_namespace(doc, node, ref_name, schema_target_ns),
+        )
     } else {
         return Err(XmlError::validation(
             "Attribute declaration missing 'name' or 'ref' attribute",
@@ -1228,6 +1237,7 @@ fn parse_attribute_decl(doc: &Document, node: NodeId) -> XmlResult<AttributeDecl
 
     Ok(AttributeDecl {
         name,
+        namespace,
         type_ref,
         required,
         default,
