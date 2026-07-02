@@ -520,7 +520,7 @@ pub(crate) fn safe_xml_ncname(s: &str) -> Cow<'_, str> {
 /// calls this once per attribute per element per serialize).
 pub(crate) fn unique_safe_xml_qname<'a>(s: &'a str, seen: &mut Vec<Cow<'a, str>>) -> Cow<'a, str> {
     let base = safe_xml_qname(s);
-    if !seen.iter().any(|n| *n == base) {
+    if !seen.contains(&base) {
         seen.push(base.clone());
         return base;
     }

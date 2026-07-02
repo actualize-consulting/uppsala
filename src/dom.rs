@@ -417,9 +417,12 @@ pub struct Document<'a> {
     /// after a mutation would append a full fresh set of attribute nodes and
     /// orphan the old ones; a mutate -> query -> mutate -> query workload
     /// (e.g. pyFF's `set_entity_attributes`) then grows the arena
-    /// quadratically and exhausts memory. [`Self::prepare_xpath`] drains the
-    /// superseded slots in here and [`Self::build_attribute_nodes`] overwrites
-    /// them in place before allocating new ones, keeping the arena size flat.
+    /// quadratically and exhausts memory. Re-preparation keeps an element's
+    /// existing slots when its attribute count is unchanged (so attribute
+    /// `NodeId`s stay stable across unrelated mutations); only the slots of
+    /// elements whose attribute list changed shape are drained in here and
+    /// overwritten in place by [`Self::build_attribute_nodes`] before new
+    /// ones are allocated, keeping the arena size flat.
     pub(crate) attr_node_pool: Vec<NodeId>,
     /// Original input for lazy line/column computation from byte positions.
     pub(crate) input: &'a str,
@@ -512,6 +515,34 @@ impl<'a> Document<'a> {
                 .collect(),
             _ => return,
         };
+        // Stable reuse: if this element already has a slot set of the right
+        // size from a previous prepare_xpath generation, refresh those same
+        // slots in place. Attribute NodeIds for elements whose attribute list
+        // did not change shape therefore survive re-preparation, so a handle
+        // cached across an unrelated mutation keeps pointing at the same
+        // attribute instead of aliasing whatever attribute happens to land in
+        // a recycled slot.
+        if let Some(ids) = self.attribute_nodes.remove(&element_id) {
+            if ids.len() == attrs.len() {
+                for (id, (name, value)) in ids.iter().zip(attrs) {
+                    self.nodes[id.0] = NodeData {
+                        kind: NodeKind::Attribute(name, value),
+                        parent: Some(element_id),
+                        first_child: None,
+                        last_child: None,
+                        next_sibling: None,
+                        prev_sibling: None,
+                        byte_pos: 0,
+                        byte_end_pos: 0,
+                    };
+                }
+                self.attribute_nodes.insert(element_id, ids);
+                return;
+            }
+            // The attribute count changed: this element's old slots go to the
+            // pool and a fresh set is assigned below.
+            self.attr_node_pool.extend(ids);
+        }
         let mut attr_ids = Vec::with_capacity(attrs.len());
         for (name, value) in attrs {
             // Reuse a recycled slot from a previous prepare_xpath generation
@@ -552,6 +583,15 @@ impl<'a> Document<'a> {
     ///
     /// Returns an empty slice if [`prepare_xpath()`](Self::prepare_xpath) has
     /// not been called or the element has no attributes.
+    ///
+    /// # Handle stability
+    ///
+    /// The returned `NodeId`s stay valid across a mutation followed by
+    /// re-[`prepare_xpath()`](Self::prepare_xpath) as long as the element's
+    /// own attribute count is unchanged. If attributes were added to or
+    /// removed from the element (or the element no longer has any), its old
+    /// attribute `NodeId`s are invalidated and their arena slots may be
+    /// repurposed for other attributes -- do not read through them.
     pub fn get_attribute_nodes(&self, element_id: NodeId) -> &[NodeId] {
         self.attribute_nodes
             .get(&element_id)
@@ -562,6 +602,14 @@ impl<'a> Document<'a> {
     /// Build virtual attribute nodes for all elements in the document.
     /// Must be called before XPath evaluation if the document was parsed
     /// without attribute node construction (the default for performance).
+    ///
+    /// Re-preparing after a mutation recycles the arena slots of superseded
+    /// virtual attribute nodes rather than leaking them. Attribute `NodeId`s
+    /// obtained earlier (from XPath results or
+    /// [`get_attribute_nodes()`](Self::get_attribute_nodes)) remain valid for
+    /// elements whose attribute count is unchanged; for elements whose
+    /// attribute list changed shape they are invalidated and may be
+    /// repurposed for different attributes.
     pub fn prepare_xpath(&mut self) {
         // Build-once on the common parse -> prepare -> query path: skip the work
         // when no mutation has invalidated the caches since the last prepare.
@@ -574,17 +622,17 @@ impl<'a> Document<'a> {
         if !self.xpath_dirty {
             return;
         }
-        // Recycle the previous generation of virtual attribute nodes instead of
-        // orphaning them: the arena is append-only, so leaking a full set per
-        // re-preparation makes a mutate/query loop grow the arena without bound
-        // (observed as multi-GB blowups in pyFF). Draining the old slot ids into
-        // the pool lets `build_attribute_nodes` overwrite them in place. Note
-        // this means an attribute NodeId returned by an earlier evaluation is
-        // repurposed by the next re-preparation after a mutation; such handles
-        // were already stale (they pointed at an orphaned snapshot before).
-        for (_, ids) in self.attribute_nodes.drain() {
-            self.attr_node_pool.extend(ids);
-        }
+        // Recycle superseded virtual attribute nodes instead of orphaning
+        // them: the arena is append-only, so leaking a full set per
+        // re-preparation makes a mutate/query loop grow the arena without
+        // bound (observed as multi-GB blowups in pyFF). Elements whose
+        // attribute count is unchanged keep their exact slot set (refreshed in
+        // place by `build_attribute_nodes`), so their attribute NodeIds remain
+        // stable across re-preparation. Only the slots of elements that no
+        // longer carry attributes -- and, inside `build_attribute_nodes`, of
+        // elements whose attribute count changed -- go through the pool and
+        // may be repurposed; NodeIds pointing at those were invalidated by the
+        // mutation itself.
         let element_ids: Vec<NodeId> = self
             .nodes
             .iter()
@@ -594,6 +642,20 @@ impl<'a> Document<'a> {
                 _ => None,
             })
             .collect();
+        if !self.attribute_nodes.is_empty() {
+            let live: HashSet<NodeId> = element_ids.iter().copied().collect();
+            let stale: Vec<NodeId> = self
+                .attribute_nodes
+                .keys()
+                .filter(|k| !live.contains(k))
+                .copied()
+                .collect();
+            for key in stale {
+                if let Some(ids) = self.attribute_nodes.remove(&key) {
+                    self.attr_node_pool.extend(ids);
+                }
+            }
+        }
         for elem_id in element_ids {
             self.build_attribute_nodes(elem_id);
         }
@@ -2305,6 +2367,48 @@ mod dom_tests {
                 baseline + i + 1,
                 "arena grew beyond the real nodes added (attribute nodes leaked)"
             );
+        }
+    }
+
+    /// An attribute `NodeId` cached before an unrelated mutation must still
+    /// denote the same attribute after re-preparation: elements whose
+    /// attribute count is unchanged keep their exact slot set, so recycling
+    /// cannot silently alias the handle to a different element's attribute
+    /// (previously `<c public>`'s handle could end up reading `<r secret>`).
+    #[test]
+    fn prepare_xpath_keeps_attribute_node_ids_stable() {
+        let mut doc = Parser::new()
+            .parse(r#"<r secret="TOPSECRET"><c public="hello"/></r>"#)
+            .unwrap();
+        doc.prepare_xpath();
+        let r = doc.first_child(doc.root()).unwrap();
+        let c = doc.first_child(r).unwrap();
+        let cached = doc.get_attribute_nodes(c)[0];
+
+        // Unrelated mutation (no attribute changes on c), then re-prepare.
+        let e = doc.create_element(QName::local("x"));
+        doc.append_child(r, e);
+        doc.prepare_xpath();
+
+        assert_eq!(doc.get_attribute_nodes(c), &[cached]);
+        match doc.node_kind(cached) {
+            Some(NodeKind::Attribute(name, value)) => {
+                assert_eq!(name.local_name, "public");
+                assert_eq!(value, "hello");
+            }
+            other => panic!("expected attribute node, got {:?}", other),
+        }
+
+        // Changing c's attribute *count* invalidates its handles (documented);
+        // the old slot is recycled, not leaked, and the new set is coherent.
+        doc.element_mut(c)
+            .unwrap()
+            .set_attribute(QName::local("extra"), Cow::Borrowed("1"));
+        doc.prepare_xpath();
+        let ids = doc.get_attribute_nodes(c);
+        assert_eq!(ids.len(), 2);
+        for &id in ids {
+            assert!(matches!(doc.node_kind(id), Some(NodeKind::Attribute(..))));
         }
     }
 
