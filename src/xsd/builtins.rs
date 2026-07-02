@@ -274,20 +274,25 @@ fn normalize_fraction(fraction: &str) -> String {
 }
 
 fn compare_fraction(left: &str, right: &str) -> Ordering {
-    // Compare digit-by-digit with an implied '0' past the shorter end. The
+    // Digit-wise comparison with an implied '0' past the shorter end. The
     // fractional part is attacker-sized (validation allows any number of
-    // digits), so no padded copies are allocated. Both strings are ASCII
-    // digits by the time they reach a comparison.
-    let mut left = left.bytes();
-    let mut right = right.bytes();
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return Ordering::Equal,
-            (l, r) => match l.unwrap_or(b'0').cmp(&r.unwrap_or(b'0')) {
-                Ordering::Equal => {}
-                ord => return ord,
-            },
-        }
+    // digits), so nothing is allocated: the shared prefix is an ordered byte
+    // slice comparison (lowered to SIMD-optimized memcmp) and the leftover
+    // tail only decides the ordering if it contains a non-zero digit. Both
+    // strings are ASCII digits by the time they reach a comparison.
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let shared = left.len().min(right.len());
+    match left[..shared].cmp(&right[..shared]) {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+    if left[shared..].iter().any(|&b| b != b'0') {
+        Ordering::Greater
+    } else if right[shared..].iter().any(|&b| b != b'0') {
+        Ordering::Less
+    } else {
+        Ordering::Equal
     }
 }
 

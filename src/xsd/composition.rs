@@ -561,10 +561,13 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
 
 /// Fix up attribute uses for chameleon include: references to the module's
 /// global attributes follow those globals into the including schema's target
-/// namespace, while local unqualified declarations stay in no namespace.
+/// namespace, and local uses qualified via `form`/`attributeFormDefault`
+/// (whose namespace was None because the module had no targetNamespace) take
+/// the target namespace as well. Local unqualified declarations stay in no
+/// namespace.
 fn chameleon_fixup_attribute_decls(attributes: &mut [AttributeDecl], target_ns: &Option<String>) {
     for attr in attributes {
-        if attr.is_ref && attr.namespace.is_none() {
+        if (attr.is_ref || attr.qualified) && attr.namespace.is_none() {
             attr.namespace = target_ns.clone();
         }
     }

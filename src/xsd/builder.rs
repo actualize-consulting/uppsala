@@ -284,6 +284,7 @@ impl XsdValidator {
                                 default,
                                 prohibited: false,
                                 is_ref: false,
+                                qualified: true,
                             };
                             let key = (validator.target_namespace.clone(), name.to_string());
                             validator.global_attributes.insert(key, decl);
@@ -436,6 +437,7 @@ impl XsdValidator {
                                     default,
                                     prohibited: false,
                                     is_ref: false,
+                                    qualified: true,
                                 };
                                 let key = (validator.target_namespace.clone(), name.to_string());
                                 validator.global_attributes.insert(key, decl);

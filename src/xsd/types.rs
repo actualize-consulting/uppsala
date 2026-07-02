@@ -373,6 +373,11 @@ pub(crate) struct AttributeDecl {
     /// chameleon include, ref'd no-namespace attributes move to the including
     /// schema's target namespace while local unqualified ones stay unqualified.
     pub(super) is_ref: bool,
+    /// Whether a local (`name=`) use was namespace-qualified via
+    /// `form="qualified"` or `attributeFormDefault="qualified"`. Persisted so
+    /// chameleon include can move qualified local uses of a no-namespace
+    /// module into the including schema's target namespace.
+    pub(super) qualified: bool,
 }
 
 /// A simple type definition.

@@ -178,13 +178,13 @@ fn collect_rtf_text(node: &ResultNode, out: &mut String) {
     }
 }
 
-fn sanitize_comment_text(text: &str) -> XmlResult<String> {
+fn sanitize_comment_text(text: String) -> XmlResult<String> {
     if text.contains("--") || text.ends_with('-') {
         return Err(XmlError::validation(
             "xsl:comment content must not contain '--' or end with '-'",
         ));
     }
-    Ok(text.to_string())
+    Ok(text)
 }
 
 fn validate_pi_target(target: &str) -> XmlResult<()> {
@@ -205,13 +205,13 @@ fn validate_pi_target(target: &str) -> XmlResult<()> {
     Ok(())
 }
 
-fn sanitize_pi_data(data: &str) -> XmlResult<String> {
+fn sanitize_pi_data(data: String) -> XmlResult<String> {
     if data.contains("?>") {
         return Err(XmlError::validation(
             "xsl:processing-instruction data must not contain '?>'",
         ));
     }
-    Ok(data.to_string())
+    Ok(data)
 }
 
 // ─── Output options (xsl:output) ──────────────────────────
@@ -1452,14 +1452,14 @@ impl<'a, 'b> Engine<'a, 'b> {
             }
             Instruction::Comment { body } => {
                 let items = self.execute_sequence(body, focus)?;
-                let text = sanitize_comment_text(&rtf_string_value(&items_to_nodes(items)))?;
+                let text = sanitize_comment_text(rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Comment(text)));
             }
             Instruction::Pi { name, body } => {
                 let target = self.eval_avt(name, focus)?;
                 validate_pi_target(&target)?;
                 let items = self.execute_sequence(body, focus)?;
-                let data = sanitize_pi_data(&rtf_string_value(&items_to_nodes(items)))?;
+                let data = sanitize_pi_data(rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Pi { target, data }));
             }
             Instruction::CallTemplate { name, params } => {

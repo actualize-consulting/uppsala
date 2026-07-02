@@ -839,6 +839,7 @@ pub(super) fn parse_attribute_group_def(
                                 default: None,
                                 prohibited,
                                 is_ref: true,
+                                qualified: false,
                             });
                         }
                     } else {
@@ -1228,18 +1229,20 @@ fn parse_attribute_decl(
         .ok_or_else(|| XmlError::validation("Expected element node for attribute declaration"))?;
 
     // Handle <attribute ref="..."/> — create a placeholder decl with the ref name
-    let (name, namespace, is_ref) = if let Some(n) = elem.get_attribute("name") {
-        let namespace = if local_attribute_is_qualified(doc, node) {
+    let (name, namespace, is_ref, qualified) = if let Some(n) = elem.get_attribute("name") {
+        let qualified = local_attribute_is_qualified(doc, node);
+        let namespace = if qualified {
             schema_target_ns.clone()
         } else {
             None
         };
-        (n.to_string(), namespace, false)
+        (n.to_string(), namespace, false, qualified)
     } else if let Some(ref_name) = elem.get_attribute("ref") {
         (
             strip_prefix(ref_name).to_string(),
             resolve_ref_namespace(doc, node, ref_name, schema_target_ns),
             true,
+            false,
         )
     } else {
         return Err(XmlError::validation(
@@ -1278,6 +1281,7 @@ fn parse_attribute_decl(
         default,
         prohibited,
         is_ref,
+        qualified,
     })
 }
 

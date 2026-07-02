@@ -509,12 +509,18 @@ impl XsdValidator {
             return ct.attributes.clone();
         }
 
+        // Attribute declarations are namespace-aware: merge and override by
+        // expanded name, not local name, so declarations that share a local
+        // name across namespaces are kept distinct.
+        let same_expanded_name =
+            |a: &AttributeDecl, b: &AttributeDecl| a.name == b.name && a.namespace == b.namespace;
+
         match ct.derived_by_extension {
             Some(true) => {
                 // Extension: base attributes + derived attributes
                 let mut result = base_attrs;
                 for attr in &ct.attributes {
-                    if !result.iter().any(|a| a.name == attr.name) {
+                    if !result.iter().any(|a| same_expanded_name(a, attr)) {
                         result.push(attr.clone());
                     }
                 }
@@ -527,7 +533,10 @@ impl XsdValidator {
                 let mut result = Vec::new();
                 for base_attr in &base_attrs {
                     // Check if the restriction overrides or prohibits this attribute
-                    let override_attr = ct.attributes.iter().find(|a| a.name == base_attr.name);
+                    let override_attr = ct
+                        .attributes
+                        .iter()
+                        .find(|a| same_expanded_name(a, base_attr));
                     if let Some(oa) = override_attr {
                         // Use the overridden version (but check if prohibited)
                         if !oa.prohibited {
@@ -542,7 +551,7 @@ impl XsdValidator {
                 // Also add any new attributes from restriction that aren't in base
                 // (unusual but technically possible)
                 for attr in &ct.attributes {
-                    if !attr.prohibited && !result.iter().any(|a| a.name == attr.name) {
+                    if !attr.prohibited && !result.iter().any(|a| same_expanded_name(a, attr)) {
                         result.push(attr.clone());
                     }
                 }

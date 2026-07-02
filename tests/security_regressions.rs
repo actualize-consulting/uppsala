@@ -1073,6 +1073,88 @@ fn xsd_gyear_facet_comparison_is_numeric_not_lexical() {
 }
 
 #[test]
+fn xsd_effective_attributes_merge_by_expanded_name() {
+    // A derived type adds a qualified attribute sharing the local name of the
+    // base type's unqualified one; namespace-aware merging must keep both
+    // (name-only merging would drop the derived declaration).
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="urn:t"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified">
+  <xs:complexType name="Base">
+    <xs:attribute name="id" type="xs:string" use="required"/>
+  </xs:complexType>
+  <xs:complexType name="Derived">
+    <xs:complexContent>
+      <xs:extension base="t:Base">
+        <xs:attribute name="id" type="xs:string" use="required" form="qualified"/>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+  <xs:element name="r" type="t:Derived"/>
+</xs:schema>"###;
+
+    let both = r#"<t:r xmlns:t="urn:t" id="a" t:id="b"/>"#;
+    let errors = validate(schema, both);
+    assert!(
+        errors.is_empty(),
+        "both same-local-name attributes must validate, got {errors:?}"
+    );
+
+    // The qualified declaration is its own required attribute; supplying only
+    // the unqualified one must not satisfy it.
+    let missing = validate(schema, r#"<t:r xmlns:t="urn:t" id="a"/>"#);
+    assert!(
+        !missing.is_empty(),
+        "missing qualified attribute must be reported"
+    );
+}
+
+#[test]
+fn chameleon_include_qualifies_form_qualified_local_attributes() {
+    // A chameleon-included module with attributeFormDefault="qualified": its
+    // local attribute uses move into the including schema's target namespace
+    // along with everything else.
+    let dir = mkdir_unique("chameleon-form");
+
+    let module = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified"
+           attributeFormDefault="qualified">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:attribute name="att" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    fs::write(dir.join("module.xsd"), module).unwrap();
+
+    let outer = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:chamform"
+           xmlns="urn:chamform"
+           elementFormDefault="qualified">
+  <xs:include schemaLocation="module.xsd"/>
+</xs:schema>"#;
+    let outer_path = dir.join("outer.xsd");
+    fs::write(&outer_path, outer).unwrap();
+
+    let schema_doc = parse(outer).unwrap();
+    let validator =
+        XsdValidator::from_schema_with_base_path(&schema_doc, Some(&outer_path)).unwrap();
+    let doc = parse(r#"<c:root xmlns:c="urn:chamform" c:att="yes"/>"#).unwrap();
+    let errors: Vec<String> = validator
+        .validate(&doc)
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect();
+
+    fs::remove_dir_all(&dir).ok();
+    assert!(
+        errors.is_empty(),
+        "chameleon-included qualified local attribute must match target namespace, got {errors:?}"
+    );
+}
+
+#[test]
 fn xsd_unknown_attribute_form_falls_back_to_schema_default() {
     // An unrecognized form= value must not silently force the attribute to be
     // unqualified; like parse_element_decl, it falls back to the schema's
