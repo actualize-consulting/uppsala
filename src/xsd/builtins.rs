@@ -277,8 +277,14 @@ fn compare_fraction(left: &str, right: &str) -> Ordering {
     let max_len = left.len().max(right.len());
     let mut left = left.to_string();
     let mut right = right.to_string();
-    left.extend(std::iter::repeat_n('0', max_len - left.len()));
-    right.extend(std::iter::repeat_n('0', max_len - right.len()));
+    // Zero-pad with plain loops; std::iter::repeat_n would raise the
+    // minimum supported Rust version.
+    while left.len() < max_len {
+        left.push('0');
+    }
+    while right.len() < max_len {
+        right.push('0');
+    }
     left.cmp(&right)
 }
 
