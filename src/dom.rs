@@ -412,6 +412,15 @@ pub struct Document<'a> {
     /// common parse -> prepare -> query path while still allowing a mutated
     /// document to be re-prepared.
     pub(crate) xpath_dirty: bool,
+    /// Recycle pool of arena slots that previously held virtual attribute
+    /// nodes. The arena is append-only, so without reuse every re-preparation
+    /// after a mutation would append a full fresh set of attribute nodes and
+    /// orphan the old ones; a mutate -> query -> mutate -> query workload
+    /// (e.g. pyFF's `set_entity_attributes`) then grows the arena
+    /// quadratically and exhausts memory. [`Self::prepare_xpath`] drains the
+    /// superseded slots in here and [`Self::build_attribute_nodes`] overwrites
+    /// them in place before allocating new ones, keeping the arena size flat.
+    pub(crate) attr_node_pool: Vec<NodeId>,
     /// Original input for lazy line/column computation from byte positions.
     pub(crate) input: &'a str,
 }
@@ -437,6 +446,7 @@ impl<'a> Document<'a> {
             attribute_nodes: HashMap::new(),
             doc_order: Vec::new(),
             xpath_dirty: true,
+            attr_node_pool: Vec::new(),
             input: "",
         }
     }
@@ -451,6 +461,7 @@ impl<'a> Document<'a> {
             attribute_nodes: self.attribute_nodes,
             doc_order: self.doc_order,
             xpath_dirty: self.xpath_dirty,
+            attr_node_pool: self.attr_node_pool,
             input: "",
         }
     }
@@ -503,11 +514,33 @@ impl<'a> Document<'a> {
         };
         let mut attr_ids = Vec::with_capacity(attrs.len());
         for (name, value) in attrs {
-            let attr_id = self.alloc_node(NodeKind::Attribute(name, value), 0);
-            // Set parent to the element (attribute nodes have an owner element)
-            if let Some(node) = self.nodes.get_mut(attr_id.0) {
-                node.parent = Some(element_id);
-            }
+            // Reuse a recycled slot from a previous prepare_xpath generation
+            // when one is available (see `attr_node_pool`); the arena is
+            // append-only, so this is what keeps repeated re-preparations from
+            // growing it without bound. Fall back to appending a fresh slot.
+            let attr_id = match self.attr_node_pool.pop() {
+                Some(id) => {
+                    self.nodes[id.0] = NodeData {
+                        kind: NodeKind::Attribute(name, value),
+                        parent: Some(element_id),
+                        first_child: None,
+                        last_child: None,
+                        next_sibling: None,
+                        prev_sibling: None,
+                        byte_pos: 0,
+                        byte_end_pos: 0,
+                    };
+                    id
+                }
+                None => {
+                    let id = self.alloc_node(NodeKind::Attribute(name, value), 0);
+                    // Set parent to the element (attribute nodes have an owner element)
+                    if let Some(node) = self.nodes.get_mut(id.0) {
+                        node.parent = Some(element_id);
+                    }
+                    id
+                }
+            };
             attr_ids.push(attr_id);
         }
         if !attr_ids.is_empty() {
@@ -537,13 +570,21 @@ impl<'a> Document<'a> {
         // would make re-preparation a silent no-op and leave a stale
         // document-order index, corrupting node-set ordering/dedup). Rebuilding
         // is O(n) and runs only on the first prepare or after an edit, never per
-        // node. (Re-preparation orphans the previously built virtual attribute
-        // nodes in `nodes`; they become unreachable in the index and are
-        // otherwise unreferenced.)
+        // node.
         if !self.xpath_dirty {
             return;
         }
-        self.attribute_nodes.clear();
+        // Recycle the previous generation of virtual attribute nodes instead of
+        // orphaning them: the arena is append-only, so leaking a full set per
+        // re-preparation makes a mutate/query loop grow the arena without bound
+        // (observed as multi-GB blowups in pyFF). Draining the old slot ids into
+        // the pool lets `build_attribute_nodes` overwrite them in place. Note
+        // this means an attribute NodeId returned by an earlier evaluation is
+        // repurposed by the next re-preparation after a mutation; such handles
+        // were already stale (they pointed at an orphaned snapshot before).
+        for (_, ids) in self.attribute_nodes.drain() {
+            self.attr_node_pool.extend(ids);
+        }
         let element_ids: Vec<NodeId> = self
             .nodes
             .iter()
@@ -1569,15 +1610,23 @@ impl<'a> Document<'a> {
                 // already satisfy every QName, so nothing extra is emitted.
                 let (elem_name_override, attr_overrides, child_local) =
                     plan_element_namespaces(elem, scope);
-                let raw_pname = match &elem_name_override {
-                    Some(name) => Cow::Borrowed(name.as_str()),
-                    None => elem.name.prefixed_name(),
-                };
-                let pname = crate::writer::safe_xml_qname(&raw_pname);
-                out.write_str(&pname)?;
+                // Emit the element name piecewise (prefix, ':', local) with the
+                // same sanitization safe_xml_qname applied to the joined string,
+                // so the common valid-name case allocates nothing. The override
+                // path (planner-synthesized names) still writes the built string.
+                match &elem_name_override {
+                    Some(name) => out.write_str(&crate::writer::safe_xml_qname(name))?,
+                    None => crate::writer::write_qname_sanitized(
+                        out,
+                        elem.name.prefix.as_deref(),
+                        &elem.name.local_name,
+                    )?,
+                }
                 // Track names already emitted for this start tag so sanitized
                 // programmatic attributes cannot collide into duplicate XML.
-                let mut seen_attrs = Vec::new();
+                // Holds Cows: valid unique names (every parsed document) are
+                // recorded as borrows, so the tracking allocates nothing.
+                let mut seen_attrs: Vec<Cow<'_, str>> = Vec::new();
                 // Namespace declarations. `child_local` holds every binding this
                 // element introduces (stored + synthesized) in order; emit only
                 // the *last* binding per prefix so a synthesized override — e.g. an
@@ -1605,7 +1654,7 @@ impl<'a> Document<'a> {
                         if seen_attrs.iter().any(|name| name == "xmlns") {
                             continue;
                         }
-                        seen_attrs.push("xmlns".to_string());
+                        seen_attrs.push(Cow::Borrowed("xmlns"));
                         out.write_str(" xmlns=\"")?;
                     } else {
                         let safe = crate::writer::safe_xml_ncname(prefix).into_owned();
@@ -1613,12 +1662,12 @@ impl<'a> Document<'a> {
                         let mut suffix = 1usize;
                         while seen_attrs
                             .iter()
-                            .any(|name| name == &format!("xmlns:{}", candidate))
+                            .any(|name| *name == format!("xmlns:{}", candidate))
                         {
                             candidate = format!("{}_{}", safe, suffix);
                             suffix += 1;
                         }
-                        seen_attrs.push(format!("xmlns:{}", candidate));
+                        seen_attrs.push(Cow::Owned(format!("xmlns:{}", candidate)));
                         out.write_str(" xmlns:")?;
                         out.write_str(&candidate)?;
                         out.write_str("=\"")?;
@@ -1628,14 +1677,35 @@ impl<'a> Document<'a> {
                 }
                 // Attributes. A namespaced attribute without a usable prefix
                 // gets one via `attr_overrides` (see `plan_element_namespaces`).
+                // The common case (valid unprefixed name, no override -- the
+                // bulk of any parsed document) borrows straight from the
+                // element and allocates nothing; only prefixed attributes pay
+                // the `prefix:local` join, exactly as the old code did.
                 for (attr, override_name) in elem.attributes.iter().zip(attr_overrides.iter()) {
                     out.write_char(' ')?;
-                    let raw_aname = match override_name {
-                        Some(name) => Cow::Borrowed(name.as_str()),
-                        None => attr.name.prefixed_name(),
-                    };
-                    let aname = crate::writer::unique_safe_xml_qname(&raw_aname, &mut seen_attrs);
-                    out.write_str(&aname)?;
+                    match override_name {
+                        Some(name) => {
+                            let aname = crate::writer::unique_safe_xml_qname(name, &mut seen_attrs);
+                            out.write_str(&aname)?;
+                        }
+                        None => match attr.name.prefix.as_deref() {
+                            None => {
+                                let aname = crate::writer::unique_safe_xml_qname(
+                                    &attr.name.local_name,
+                                    &mut seen_attrs,
+                                );
+                                out.write_str(&aname)?;
+                            }
+                            Some(_) => {
+                                let joined = attr.name.prefixed_name().into_owned();
+                                let aname = crate::writer::unique_safe_xml_qname_owned(
+                                    joined,
+                                    &mut seen_attrs,
+                                );
+                                out.write_str(&aname)?;
+                            }
+                        },
+                    }
                     out.write_str("=\"")?;
                     write_escaped_attr(out, &attr.value)?;
                     out.write_char('"')?;
@@ -1646,11 +1716,25 @@ impl<'a> Document<'a> {
                     parent: Some(scope),
                     local: &child_local,
                 };
-                let children = self.children(id);
-                if children.is_empty() {
+                // Re-emit the element name for close tags with the same
+                // override/piecewise logic as the open tag above (the name is
+                // deterministic, so open and close always match).
+                let write_close_name = |out: &mut dyn fmt::Write| -> fmt::Result {
+                    match &elem_name_override {
+                        Some(name) => out.write_str(&crate::writer::safe_xml_qname(name)),
+                        None => crate::writer::write_qname_sanitized(
+                            out,
+                            elem.name.prefix.as_deref(),
+                            &elem.name.local_name,
+                        ),
+                    }
+                };
+                // Walk children via the sibling links rather than materialising
+                // a Vec per element per serialize.
+                if self.first_child(id).is_none() {
                     if opts.expand_empty_elements {
                         out.write_str("></")?;
-                        out.write_str(&pname)?;
+                        write_close_name(out)?;
                         out.write_char('>')?;
                     } else {
                         out.write_str("/>")?;
@@ -1659,32 +1743,37 @@ impl<'a> Document<'a> {
                     out.write_char('>')?;
                     // Determine if this is "element-only" content for pretty-printing.
                     // If any child is text or CDATA, we treat it as mixed content
-                    // and do NOT insert newlines/indent (to preserve whitespace semantics).
-                    let element_only = opts.indent.is_some()
-                        && children.iter().all(|&cid| {
-                            !matches!(
+                    // and do NOT insert newlines/indent (to preserve whitespace
+                    // semantics). Only probed when pretty-printing; the compact
+                    // path never pays this extra sibling walk.
+                    let element_only = opts.indent.is_some() && {
+                        let mut only = true;
+                        let mut c = self.first_child(id);
+                        while let Some(cid) = c {
+                            if matches!(
                                 self.node_kind(cid),
                                 Some(NodeKind::Text(_)) | Some(NodeKind::CData(_))
-                            )
-                        });
+                            ) {
+                                only = false;
+                                break;
+                            }
+                            c = self.next_sibling(cid);
+                        }
+                        only
+                    };
                     if element_only {
                         out.write_char('\n')?;
                     }
-                    for child in &children {
-                        self.write_node_to(
-                            *child,
-                            out,
-                            opts,
-                            depth + 1,
-                            element_only,
-                            &child_scope,
-                        )?;
+                    let mut child = self.first_child(id);
+                    while let Some(cid) = child {
+                        self.write_node_to(cid, out, opts, depth + 1, element_only, &child_scope)?;
+                        child = self.next_sibling(cid);
                     }
                     if element_only {
                         write_indent(out, opts, depth)?;
                     }
                     out.write_str("</")?;
-                    out.write_str(&pname)?;
+                    write_close_name(out)?;
                     out.write_char('>')?;
                 }
                 // Trailing newline after the document element when pretty-printing
@@ -2130,16 +2219,10 @@ fn write_indent(out: &mut dyn fmt::Write, opts: &XmlWriteOptions, depth: usize) 
 /// - `>` → `&gt;`
 /// - `\r` → `&#xD;` (preserves CR on round-trip; XML parser normalizes CR)
 fn write_escaped_text(out: &mut dyn fmt::Write, s: &str) -> fmt::Result {
-    for c in s.chars() {
-        match c {
-            '&' => out.write_str("&amp;")?,
-            '<' => out.write_str("&lt;")?,
-            '>' => out.write_str("&gt;")?,
-            '\r' => out.write_str("&#xD;")?,
-            _ => out.write_char(crate::writer::sanitized_xml_char(c))?,
-        }
-    }
-    Ok(())
+    // Run-based: bulk-copies unescaped runs instead of a virtual write_char
+    // per character (see writer::write_escaped_run_dyn). Byte-identical
+    // output to the previous per-character loop.
+    crate::writer::write_escaped_run_dyn(out, s, false)
 }
 
 /// Write attribute value with XML escaping to a `fmt::Write` sink.
@@ -2153,19 +2236,8 @@ fn write_escaped_text(out: &mut dyn fmt::Write, s: &str) -> fmt::Result {
 /// - `\n` → `&#xA;` (preserves newline; XML parser normalizes to space)
 /// - `\r` → `&#xD;` (preserves CR; XML parser normalizes CR)
 fn write_escaped_attr(out: &mut dyn fmt::Write, s: &str) -> fmt::Result {
-    for c in s.chars() {
-        match c {
-            '&' => out.write_str("&amp;")?,
-            '<' => out.write_str("&lt;")?,
-            '>' => out.write_str("&gt;")?,
-            '"' => out.write_str("&quot;")?,
-            '\t' => out.write_str("&#x9;")?,
-            '\n' => out.write_str("&#xA;")?,
-            '\r' => out.write_str("&#xD;")?,
-            _ => out.write_char(crate::writer::sanitized_xml_char(c))?,
-        }
-    }
-    Ok(())
+    // Run-based; see write_escaped_text above.
+    crate::writer::write_escaped_run_dyn(out, s, true)
 }
 
 /// Adapter that allows writing to an `io::Write` via the `fmt::Write` trait.
@@ -2206,6 +2278,34 @@ mod dom_tests {
             u32::MAX,
             "re-prepare did not reindex the appended node"
         );
+    }
+
+    /// Repeated mutate -> `prepare_xpath()` rounds must not grow the arena
+    /// beyond the genuinely new nodes: the virtual attribute nodes of the
+    /// previous generation are recycled through `attr_node_pool`, not
+    /// orphaned. Without recycling, a mutate/query loop (pyFF's
+    /// `set_entity_attributes` pattern) appends a full fresh attribute-node
+    /// set per round and the arena grows quadratically until OOM.
+    #[test]
+    fn prepare_xpath_recycles_attribute_nodes() {
+        let mut doc = Parser::new()
+            .parse(r#"<r a="1" b="2"><c d="3"/></r>"#)
+            .unwrap();
+        doc.prepare_xpath();
+        let baseline = doc.nodes.len();
+        let r = doc.first_child(doc.root).unwrap();
+        for i in 0..100 {
+            // Each round: one real new element (arena +1), then re-prepare.
+            // The three attribute nodes (a, b, d) must reuse their slots.
+            let e = doc.create_element(QName::local("x"));
+            doc.append_child(r, e);
+            doc.prepare_xpath();
+            assert_eq!(
+                doc.nodes.len(),
+                baseline + i + 1,
+                "arena grew beyond the real nodes added (attribute nodes leaked)"
+            );
+        }
     }
 
     /// `import_subtree` deep-copies an element subtree (name, namespace

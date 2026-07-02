@@ -44,6 +44,101 @@ pub(crate) fn find_byte(data: &[u8], byte: u8) -> Option<usize> {
     data.iter().position(|&b| b == byte)
 }
 
+/// Length of the prefix of `data` that the serializer's escaper can copy
+/// verbatim: bytes that are not `&`, `<`, `>`, `\r` (plus `"`, `\t`, `\n` in
+/// attribute context), not an invalid ASCII control character, and not the
+/// start of a multi-byte sequence (>= 0x80, which needs char-level XML
+/// validity checking). The serializer bulk-copies this run and handles the
+/// single following special byte individually.
+pub(crate) fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is guaranteed on all x86_64 processors.
+        unsafe { scan_escape_sse2(data, is_attr) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        scan_escape_scalar(data, is_attr)
+    }
+}
+
+/// Scalar fallback / tail scan for [`scan_escape_run`]. The byte
+/// classification must match `writer::write_escaped_run_dyn`'s special-byte
+/// rules exactly.
+fn scan_escape_scalar(data: &[u8], is_attr: bool) -> usize {
+    let mut pos = 0;
+    while pos < data.len() {
+        let b = data[pos];
+        let special = if b >= 0x80 {
+            true
+        } else {
+            match b {
+                b'&' | b'<' | b'>' | b'\r' => true,
+                b'"' | b'\t' | b'\n' if is_attr => true,
+                0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => true,
+                _ => false,
+            }
+        };
+        if special {
+            break;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn scan_escape_sse2(data: &[u8], is_attr: bool) -> usize {
+    use std::arch::x86_64::*;
+
+    let mut pos = 0;
+
+    let v_amp = _mm_set1_epi8(b'&' as i8);
+    let v_lt = _mm_set1_epi8(b'<' as i8);
+    let v_gt = _mm_set1_epi8(b'>' as i8);
+    let v_cr = _mm_set1_epi8(b'\r' as i8);
+    let v_quot = _mm_set1_epi8(b'"' as i8);
+    let v_tab = _mm_set1_epi8(0x09);
+    let v_lf = _mm_set1_epi8(0x0A);
+    let v_1f = _mm_set1_epi8(0x1F_u8 as i8);
+
+    while pos + 16 <= data.len() {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(pos) as *const __m128i);
+
+        // Escaped delimiters common to both contexts.
+        let mut special = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(chunk, v_amp), _mm_cmpeq_epi8(chunk, v_lt)),
+            _mm_or_si128(_mm_cmpeq_epi8(chunk, v_gt), _mm_cmpeq_epi8(chunk, v_cr)),
+        );
+        if is_attr {
+            special = _mm_or_si128(
+                special,
+                _mm_or_si128(
+                    _mm_cmpeq_epi8(chunk, v_quot),
+                    _mm_or_si128(_mm_cmpeq_epi8(chunk, v_tab), _mm_cmpeq_epi8(chunk, v_lf)),
+                ),
+            );
+        }
+        // Invalid ASCII control characters: <= 0x1F minus TAB/LF (CR is
+        // already a delimiter above; TAB/LF are delimiters in attr context).
+        let le_1f = _mm_cmpeq_epi8(_mm_min_epu8(chunk, v_1f), chunk);
+        let allowed_ctrl = _mm_or_si128(_mm_cmpeq_epi8(chunk, v_tab), _mm_cmpeq_epi8(chunk, v_lf));
+        let bad_ctrl = _mm_andnot_si128(allowed_ctrl, le_1f);
+
+        // High bit set = start/continuation of a multi-byte character.
+        let mask = (_mm_movemask_epi8(special) as u32)
+            | (_mm_movemask_epi8(bad_ctrl) as u32)
+            | (_mm_movemask_epi8(chunk) as u32);
+        if mask != 0 {
+            return pos + mask.trailing_zeros() as usize;
+        }
+        pos += 16;
+    }
+
+    pos + scan_escape_scalar(&data[pos..], is_attr)
+}
+
 // ---------------------------------------------------------------------------
 // SSE2 implementations (x86_64 only)
 // ---------------------------------------------------------------------------
