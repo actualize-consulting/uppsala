@@ -1176,6 +1176,10 @@ impl<'a> Document<'a> {
     // ─── Tree mutation ───
 
     /// Append a child node to a parent. Detaches the child from any previous parent.
+    ///
+    /// The document root and virtual XPath attribute nodes are not part of the
+    /// sibling-linked tree and cannot be appended; such calls are a no-op (as
+    /// are self/ancestor cycles and invalid ids).
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         if !self.can_reparent(parent, child) {
             return;
@@ -1214,6 +1218,10 @@ impl<'a> Document<'a> {
         if new_child == reference
             || !self.can_reparent(parent, new_child)
             || self.parent(reference) != Some(parent)
+            // A virtual attribute node passes the parent check (its `parent`
+            // is the owner element) but is not in the child list; splicing
+            // around its empty sibling links would corrupt the real children.
+            || !self.is_linkable_node(reference)
         {
             return;
         }
@@ -1248,6 +1256,8 @@ impl<'a> Document<'a> {
         if new_child == reference
             || !self.can_reparent(parent, new_child)
             || self.parent(reference) != Some(parent)
+            // See insert_before: an attribute node is not a real child.
+            || !self.is_linkable_node(reference)
         {
             return;
         }
@@ -1289,6 +1299,10 @@ impl<'a> Document<'a> {
         if new_child == old_child
             || !self.can_reparent(parent, new_child)
             || self.parent(old_child) != Some(parent)
+            // See insert_before: an attribute node is not a real child, so it
+            // cannot be replaced; splicing `new_child` in via its empty
+            // sibling links would make it the parent's sole child.
+            || !self.is_linkable_node(old_child)
         {
             return;
         }
@@ -1330,7 +1344,18 @@ impl<'a> Document<'a> {
     /// The node remains in the arena and can be re-attached elsewhere with
     /// [`append_child`](Self::append_child), [`insert_before`](Self::insert_before),
     /// or [`insert_after`](Self::insert_after).
+    ///
+    /// Virtual XPath attribute nodes are not part of the sibling-linked tree;
+    /// detaching one is a no-op (remove the attribute from its owner element
+    /// instead).
     pub fn detach(&mut self, id: NodeId) {
+        // A virtual attribute node has `parent = Some(owner)` but sits in no
+        // child list; the unlink logic below would interpret its empty sibling
+        // links as "only child" and wipe the owner's real child list. There is
+        // nothing to detach for such nodes (see `is_linkable_node`).
+        if !self.is_linkable_node(id) {
+            return;
+        }
         let (parent_id, prev, next) = match self.nodes.get(id.0) {
             Some(n) => (n.parent, n.prev_sibling, n.next_sibling),
             None => return,
@@ -1449,10 +1474,24 @@ impl<'a> Document<'a> {
         id.0 < self.nodes.len()
     }
 
+    /// True when `id` denotes a node that participates in the sibling-linked
+    /// tree. The document root and virtual XPath attribute nodes do not: an
+    /// attribute node carries `parent = Some(owner_element)` but is never in
+    /// the owner's child list, so child-list surgery that trusts its (empty)
+    /// sibling links would wipe the owner's real `first_child`/`last_child`.
+    /// Every mutator that unlinks or splices around a node checks this first.
+    fn is_linkable_node(&self, id: NodeId) -> bool {
+        !matches!(
+            self.node_kind(id),
+            None | Some(NodeKind::Document) | Some(NodeKind::Attribute(_, _))
+        )
+    }
+
     fn can_reparent(&self, parent: NodeId, child: NodeId) -> bool {
         self.valid_node_id(parent)
             && self.valid_node_id(child)
             && parent != child
+            && self.is_linkable_node(child)
             && !self.is_ancestor_of(child, parent)
     }
 
@@ -2410,6 +2449,49 @@ mod dom_tests {
         for &id in ids {
             assert!(matches!(doc.node_kind(id), Some(NodeKind::Attribute(..))));
         }
+    }
+
+    /// Virtual attribute nodes carry `parent = Some(owner)` but live in no
+    /// child list, so tree mutators must reject them: previously
+    /// `append_child`/`detach`/`remove_child`/`insert_before`/`insert_after`/
+    /// `replace_child` interpreted an attribute node's empty sibling links as
+    /// "only child" and silently wiped the owner element's real child list
+    /// (`<r a="1"><c b="2"/><tail/></r>` serialized as `<r a="1"/>` after
+    /// `append_child(c, attr_of_r)`). All such calls are now no-ops.
+    #[test]
+    fn tree_mutators_reject_virtual_attribute_nodes() {
+        let src = r#"<r a="1"><c b="2"/><tail/></r>"#;
+        let mut doc = Parser::new().parse(src).unwrap();
+        doc.prepare_xpath();
+        let r = doc.first_child(doc.root()).unwrap();
+        let c = doc.first_child(r).unwrap();
+        let attr = doc.get_attribute_nodes(r)[0];
+        let orphan = doc.create_element(QName::local("x"));
+
+        doc.append_child(c, attr);
+        doc.detach(attr);
+        doc.remove_child(r, attr);
+        doc.insert_before(r, orphan, attr);
+        doc.insert_after(r, orphan, attr);
+        doc.replace_child(r, orphan, attr);
+
+        // The tree is untouched: both children of <r> survive, the attribute
+        // node still belongs to its owner, and nothing was spliced in.
+        assert_eq!(doc.to_xml(), src);
+        assert_eq!(doc.children(r).len(), 2);
+        assert_eq!(doc.parent(attr), Some(r));
+        assert_eq!(doc.parent(orphan), None);
+        assert!(matches!(
+            doc.node_kind(attr),
+            Some(NodeKind::Attribute(name, value))
+                if name.local_name == "a" && value == "1"
+        ));
+
+        // The document root is equally non-reparentable.
+        let root = doc.root();
+        doc.append_child(c, root);
+        assert_eq!(doc.parent(root), None);
+        assert_eq!(doc.to_xml(), src);
     }
 
     /// `import_subtree` deep-copies an element subtree (name, namespace
