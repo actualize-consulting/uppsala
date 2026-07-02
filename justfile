@@ -91,6 +91,52 @@ perf-suite dir="../roxmltree/benches" samples="101":
 perf-file file samples="101":
     cargo run --release --manifest-path performance-harness/Cargo.toml -- file {{file}} {{samples}}
 
+# ─── Fuzzing (audit/fuzz, cargo-fuzz + libFuzzer) ───
+
+# Install the fuzzing toolchain (nightly + cargo-fuzz). Run once per machine.
+fuzz-setup:
+    rustup toolchain install nightly
+    rustup component add llvm-tools-preview --toolchain nightly
+    sfw cargo install cargo-fuzz
+
+# Build every fuzz target once (ASan on; the SIMD scanners are `unsafe`).
+fuzz-build:
+    ./audit/fuzz/scripts/build.sh
+
+# Fuzz ALL targets in a detached tmux session (remote-friendly: run over SSH,
+# log out, it keeps going; `just fuzz-attach` to reattach, arg=seconds, 0=forever)
+fuzz seconds="0":
+    ./audit/fuzz/scripts/fuzz-all.sh {{seconds}}
+
+# Fuzz a single target in the foreground, all cores via fork mode.
+# e.g. `just fuzz-one fuzz_roundtrip 3600`
+fuzz-one target seconds="0":
+    ./audit/fuzz/scripts/run.sh {{target}} {{seconds}}
+
+# Reattach to the running fuzz session.
+fuzz-attach:
+    tmux attach -t uppsala-fuzz
+
+# Stop all fuzzing (kills the tmux session).
+fuzz-stop:
+    tmux kill-session -t uppsala-fuzz || true
+
+# List any crash/timeout/oom artifacts found so far.
+fuzz-crashes:
+    @find audit/fuzz/artifacts -type f 2>/dev/null | sort || echo "no artifacts yet"
+
+# Reproduce a crash: `just fuzz-repro fuzz_parse audit/fuzz/artifacts/fuzz_parse/crash-abc`
+fuzz-repro target artifact:
+    ./audit/fuzz/scripts/repro.sh {{target}} {{artifact}}
+
+# HTML line-coverage report for a target's corpus.
+fuzz-coverage target:
+    ./audit/fuzz/scripts/coverage.sh {{target}}
+
+# Minimize a target's corpus (drop redundant inputs).
+fuzz-cmin target:
+    ./audit/fuzz/scripts/minimize.sh {{target}}
+
 # Run clippy lints
 clippy:
     cargo clippy -- -D warnings

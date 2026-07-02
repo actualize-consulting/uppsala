@@ -1,0 +1,7 @@
+# cargo-fuzz build + runtime artifacts (all regenerable).
+# Curated inputs live in seeds/ (tracked); corpus/ is the fuzzer's working set.
+/target
+/artifacts
+/coverage
+/corpus
+Cargo.lock

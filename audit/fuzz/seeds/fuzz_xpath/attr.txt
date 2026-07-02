@@ -1,0 +1,2 @@
+//x:a/@id
+<r xmlns:x="urn:e"><x:a id="1"/></r>
