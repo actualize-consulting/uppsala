@@ -80,6 +80,25 @@ fn is_valid_date_like(s: &str, base_type: &BuiltInType) -> bool {
     }
 }
 
+/// A temporal value placed on the timeline: `seconds` is UTC-normalized when
+/// the lexical form carries a timezone, otherwise local. Local vs UTC-normalized
+/// instants are only partially ordered (see `compare_temporal_instants`).
+struct TemporalInstant {
+    seconds: i128,
+    fraction: String,
+    has_tz: bool,
+}
+
+/// Maximum timezone offset (14:00) in seconds. Per the XSD order relation on
+/// dateTime (Part 2 section 3.2.7.4), a timezone-less value compared against a
+/// timezoned one is determinate only when they are more than this far apart.
+const MAX_TZ_OFFSET_SECONDS: i128 = 14 * 3_600;
+
+/// Reference year used to place the recurring gMonth/gMonthDay/gDay types on
+/// the timeline for comparison (a leap year, so --02-29 is representable),
+/// mirroring the XSD 1.1 timeline mapping.
+const G_TYPE_REFERENCE_YEAR: i128 = 1972;
+
 fn compare_facet_values(
     value: &str,
     facet_value: &str,
@@ -101,7 +120,9 @@ fn compare_facet_values(
             {
                 return None;
             }
-            Some(value.cmp(facet_value))
+            let left = date_like_to_instant(value, base_type)?;
+            let right = date_like_to_instant(facet_value, base_type)?;
+            compare_temporal_instants(&left, &right)
         }
         _ => Some(compare_values(value, facet_value)),
     }
@@ -115,9 +136,9 @@ fn compare_datetime_values(value: &str, facet_value: &str) -> Option<Ordering> {
     if !is_valid_datetime(value) || !is_valid_datetime(facet_value) {
         return None;
     }
-    let left = datetime_to_utc_tuple(value)?;
-    let right = datetime_to_utc_tuple(facet_value)?;
-    Some(compare_utc_tuple(&left, &right))
+    let left = datetime_to_instant(value)?;
+    let right = datetime_to_instant(facet_value)?;
+    compare_temporal_instants(&left, &right)
 }
 
 fn compare_time_values(value: &str, facet_value: &str) -> Option<Ordering> {
@@ -126,36 +147,124 @@ fn compare_time_values(value: &str, facet_value: &str) -> Option<Ordering> {
     if !is_valid_time(value) || !is_valid_time(facet_value) {
         return None;
     }
-    let left = time_to_utc_tuple(value)?;
-    let right = time_to_utc_tuple(facet_value)?;
-    Some(compare_utc_tuple(&left, &right))
+    let left = time_to_instant(value)?;
+    let right = time_to_instant(facet_value)?;
+    compare_temporal_instants(&left, &right)
 }
 
-fn datetime_to_utc_tuple(value: &str) -> Option<(i128, String)> {
+fn datetime_to_instant(value: &str) -> Option<TemporalInstant> {
     let (date, time) = value.split_once('T')?;
     let (year, month, day) = parse_xsd_date_parts(date)?;
     let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(time)?;
     let days = days_from_civil(year, month, day);
     let local_seconds =
         days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
-    Some((
-        local_seconds - i128::from(offset_minutes) * 60,
-        normalize_fraction(&fraction),
-    ))
+    Some(TemporalInstant {
+        seconds: local_seconds - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: normalize_fraction(&fraction),
+        has_tz: offset_minutes.is_some(),
+    })
 }
 
-fn time_to_utc_tuple(value: &str) -> Option<(i128, String)> {
+fn time_to_instant(value: &str) -> Option<TemporalInstant> {
     let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(value)?;
     let local_seconds = i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
-    Some((
-        local_seconds - i128::from(offset_minutes) * 60,
-        normalize_fraction(&fraction),
-    ))
+    Some(TemporalInstant {
+        seconds: local_seconds - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: normalize_fraction(&fraction),
+        has_tz: offset_minutes.is_some(),
+    })
 }
 
-fn compare_utc_tuple(left: &(i128, String), right: &(i128, String)) -> Ordering {
-    match left.0.cmp(&right.0) {
-        Ordering::Equal => compare_fraction(&left.1, &right.1),
+/// Map a date-like temporal value (date, gYear, gYearMonth, gMonth, gMonthDay,
+/// gDay) onto the timeline as the starting instant of its period, so ordering
+/// honors timezone offsets and numeric years instead of lexical form.
+fn date_like_to_instant(value: &str, base_type: &BuiltInType) -> Option<TemporalInstant> {
+    let (body, offset_minutes) = split_tz_suffix(value);
+    let (year, month, day) = match base_type {
+        BuiltInType::Date => parse_xsd_date_parts(body)?,
+        BuiltInType::GYear => (body.parse().ok()?, 1, 1),
+        BuiltInType::GYearMonth => {
+            let (year, month) = body.rsplit_once('-')?;
+            (year.parse().ok()?, month.parse().ok()?, 1)
+        }
+        BuiltInType::GMonth => {
+            // Accept --MM and the XSD 1.0 legacy --MM-- form.
+            let month = body.strip_prefix("--")?.trim_end_matches("--");
+            (G_TYPE_REFERENCE_YEAR, month.parse().ok()?, 1)
+        }
+        BuiltInType::GMonthDay => {
+            let (month, day) = body.strip_prefix("--")?.split_once('-')?;
+            (
+                G_TYPE_REFERENCE_YEAR,
+                month.parse().ok()?,
+                day.parse().ok()?,
+            )
+        }
+        BuiltInType::GDay => (
+            G_TYPE_REFERENCE_YEAR,
+            1,
+            body.strip_prefix("---")?.parse().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(TemporalInstant {
+        seconds: days_from_civil(year, month, day) * 86_400
+            - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: String::new(),
+        has_tz: offset_minutes.is_some(),
+    })
+}
+
+/// Compare two timeline instants per XSD's partial order: values that both
+/// carry (or both omit) a timezone are totally ordered; a timezone-less value
+/// against a timezoned one is determinate only when more than 14 hours apart.
+/// Indeterminate comparisons return None, which the facet checks report as an
+/// error (fail closed) instead of assuming UTC.
+fn compare_temporal_instants(left: &TemporalInstant, right: &TemporalInstant) -> Option<Ordering> {
+    match (left.has_tz, right.has_tz) {
+        (true, true) | (false, false) => Some(compare_instant_parts(
+            left.seconds,
+            &left.fraction,
+            right.seconds,
+            &right.fraction,
+        )),
+        (false, true) => {
+            // Timezone-less left could lie anywhere in [-14:00, +14:00]:
+            // left < right only if even its latest interpretation is earlier,
+            // and left > right only if even its earliest one is later.
+            if compare_instant_parts(
+                left.seconds + MAX_TZ_OFFSET_SECONDS,
+                &left.fraction,
+                right.seconds,
+                &right.fraction,
+            ) == Ordering::Less
+            {
+                Some(Ordering::Less)
+            } else if compare_instant_parts(
+                left.seconds - MAX_TZ_OFFSET_SECONDS,
+                &left.fraction,
+                right.seconds,
+                &right.fraction,
+            ) == Ordering::Greater
+            {
+                Some(Ordering::Greater)
+            } else {
+                None
+            }
+        }
+        (true, false) => compare_temporal_instants(right, left).map(Ordering::reverse),
+    }
+}
+
+fn compare_instant_parts(
+    left_seconds: i128,
+    left_fraction: &str,
+    right_seconds: i128,
+    right_fraction: &str,
+) -> Ordering {
+    match left_seconds.cmp(&right_seconds) {
+        Ordering::Equal => compare_fraction(left_fraction, right_fraction),
         ord => ord,
     }
 }
@@ -191,8 +300,8 @@ fn parse_xsd_date_parts(date: &str) -> Option<(i128, u32, u32)> {
     Some((if negative { -year } else { year }, month, day))
 }
 
-fn parse_xsd_time_parts(time: &str) -> Option<(u32, u32, u32, String, i32)> {
-    let (time, offset_minutes) = split_time_offset(time)?;
+fn parse_xsd_time_parts(time: &str) -> Option<(u32, u32, u32, String, Option<i32>)> {
+    let (time, offset_minutes) = split_tz_suffix(time);
     let mut parts = time.split(':');
     let hour: u32 = parts.next()?.parse().ok()?;
     let minute: u32 = parts.next()?.parse().ok()?;
@@ -208,26 +317,37 @@ fn parse_xsd_time_parts(time: &str) -> Option<(u32, u32, u32, String, i32)> {
     Some((hour, minute, second, frac_str.to_string(), offset_minutes))
 }
 
-fn split_time_offset(time: &str) -> Option<(&str, i32)> {
-    if let Some(stripped) = time.strip_suffix('Z') {
-        return Some((stripped, 0));
+/// Split an optional trailing timezone (`Z` or `+hh:mm`/`-hh:mm`) from a
+/// temporal lexical form. Returns the remaining body and the offset in
+/// minutes; a missing timezone is `None`, not UTC. Unrecognized suffixes are
+/// left in the body, where the callers' numeric parsing fails closed (the
+/// overall lexical form is range-validated separately before comparison).
+fn split_tz_suffix(s: &str) -> (&str, Option<i32>) {
+    if let Some(stripped) = s.strip_suffix('Z') {
+        return (stripped, Some(0));
     }
-    if time.len() >= 6 {
-        let tz_start = time.len() - 6;
-        let tz = &time[tz_start..];
-        let sign = match tz.as_bytes().first()? {
+    if s.len() >= 6 {
+        let tz_start = s.len() - 6;
+        let tz = &s.as_bytes()[tz_start..];
+        if !tz.is_ascii() {
+            return (s, None);
+        }
+        let sign = match tz[0] {
             b'+' => 1,
             b'-' => -1,
-            _ => return Some((time, 0)),
+            _ => return (s, None),
         };
-        if tz.as_bytes().get(3) != Some(&b':') {
-            return None;
+        if tz[3] != b':' {
+            return (s, None);
         }
-        let hours: i32 = tz[1..3].parse().ok()?;
-        let minutes: i32 = tz[4..6].parse().ok()?;
-        return Some((&time[..tz_start], sign * (hours * 60 + minutes)));
+        if let (Ok(hours), Ok(minutes)) = (
+            s[tz_start + 1..tz_start + 3].parse::<i32>(),
+            s[tz_start + 4..].parse::<i32>(),
+        ) {
+            return (&s[..tz_start], Some(sign * (hours * 60 + minutes)));
+        }
     }
-    Some((time, 0))
+    (s, None)
 }
 
 fn days_from_civil(year: i128, month: u32, day: u32) -> i128 {

@@ -820,6 +820,7 @@ pub(super) fn parse_attribute_group_def(
                             // Use the global attribute declaration but allow
                             // local overrides for use/required
                             let mut attr = global_attr.clone();
+                            attr.is_ref = true;
                             if child_elem.get_attribute("use") == Some("required") {
                                 attr.required = true;
                             } else if child_elem.get_attribute("use") == Some("prohibited") {
@@ -837,6 +838,7 @@ pub(super) fn parse_attribute_group_def(
                                 required,
                                 default: None,
                                 prohibited,
+                                is_ref: true,
                             });
                         }
                     } else {
@@ -1226,17 +1228,18 @@ fn parse_attribute_decl(
         .ok_or_else(|| XmlError::validation("Expected element node for attribute declaration"))?;
 
     // Handle <attribute ref="..."/> — create a placeholder decl with the ref name
-    let (name, namespace) = if let Some(n) = elem.get_attribute("name") {
+    let (name, namespace, is_ref) = if let Some(n) = elem.get_attribute("name") {
         let namespace = if local_attribute_is_qualified(doc, node) {
             schema_target_ns.clone()
         } else {
             None
         };
-        (n.to_string(), namespace)
+        (n.to_string(), namespace, false)
     } else if let Some(ref_name) = elem.get_attribute("ref") {
         (
             strip_prefix(ref_name).to_string(),
             resolve_ref_namespace(doc, node, ref_name, schema_target_ns),
+            true,
         )
     } else {
         return Err(XmlError::validation(
@@ -1274,6 +1277,7 @@ fn parse_attribute_decl(
         required,
         default,
         prohibited,
+        is_ref,
     })
 }
 

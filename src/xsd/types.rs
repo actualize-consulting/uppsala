@@ -369,6 +369,10 @@ pub(crate) struct AttributeDecl {
     #[allow(dead_code)]
     pub(super) default: Option<String>,
     pub(super) prohibited: bool,
+    /// Whether this use came from `ref=` (a global attribute reference). Under
+    /// chameleon include, ref'd no-namespace attributes move to the including
+    /// schema's target namespace while local unqualified ones stay unqualified.
+    pub(super) is_ref: bool,
 }
 
 /// A simple type definition.

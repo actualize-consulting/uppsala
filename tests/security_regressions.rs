@@ -586,6 +586,53 @@ fn prefixed_xsd_type_qnames_resolve_to_imported_namespace() {
 }
 
 #[test]
+fn chameleon_include_qualifies_referenced_attributes() {
+    // A no-namespace module included into a target namespace (chameleon
+    // include) moves its global attributes into that namespace; attribute
+    // uses that reference them must follow, or namespace-aware matching
+    // rejects valid instances (W3C Sun xsd024 pattern).
+    let dir = mkdir_unique("chameleon-attr");
+
+    let module = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified">
+  <xs:element name="root" type="rootType"/>
+  <xs:complexType name="rootType">
+    <xs:attributeGroup ref="attGroup"/>
+  </xs:complexType>
+  <xs:attributeGroup name="attGroup">
+    <xs:attribute ref="att"/>
+  </xs:attributeGroup>
+  <xs:attribute name="att" type="xs:string"/>
+</xs:schema>"#;
+    fs::write(dir.join("module.xsd"), module).unwrap();
+
+    let outer = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:cham"
+           xmlns="urn:cham"
+           elementFormDefault="qualified">
+  <xs:include schemaLocation="module.xsd"/>
+</xs:schema>"#;
+    let outer_path = dir.join("outer.xsd");
+    fs::write(&outer_path, outer).unwrap();
+
+    let schema_doc = parse(outer).unwrap();
+    let validator =
+        XsdValidator::from_schema_with_base_path(&schema_doc, Some(&outer_path)).unwrap();
+    let doc = parse(r#"<c:root xmlns:c="urn:cham" c:att="yes"/>"#).unwrap();
+    let errors: Vec<String> = validator
+        .validate(&doc)
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect();
+
+    fs::remove_dir_all(&dir).ok();
+    assert!(
+        errors.is_empty(),
+        "chameleon-included attribute ref must match target namespace, got {errors:?}"
+    );
+}
+
+#[test]
 fn unknown_named_xsd_type_fails_closed() {
     // An unresolved schema type reference must be a validation error. Treating
     // it as string-like content would silently bypass the intended constraint.
@@ -942,6 +989,87 @@ fn xsd_attribute_form_qualified_overrides_unqualified_default() {
         !errors.is_empty(),
         "unqualified spelling must not satisfy a form=qualified declaration"
     );
+}
+
+#[test]
+fn xsd_timezone_less_temporal_facet_comparison_fails_closed() {
+    // A timezone-less facet bound and a timezoned value are only partially
+    // ordered (XSD Part 2 section 3.2.7.4); a missing timezone must not be
+    // silently treated as UTC.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="t">
+    <xs:simpleType>
+      <xs:restriction base="xs:time">
+        <xs:minInclusive value="12:00:00"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"###;
+
+    // 22:00:00-12:00 is 34:00:00 UTC-normalized: more than 14 hours after the
+    // timezone-less bound, so the order is determinate and the value is valid.
+    let errors = validate(schema, "<t>22:00:00-12:00</t>");
+    assert!(
+        errors.is_empty(),
+        "determinate cross-timezone comparison must validate, got {errors:?}"
+    );
+
+    // 13:00:00+05:00 is 08:00:00Z: within the +/-14:00 window of the
+    // timezone-less bound, so the comparison is indeterminate and must fail
+    // closed (treating the bound as UTC would wrongly accept the value).
+    let errors = validate(schema, "<t>13:00:00+05:00</t>");
+    assert!(
+        errors.iter().any(|e| e.contains("Cannot compare")),
+        "expected indeterminate comparison error, got {errors:?}"
+    );
+
+    // Both timezone-less: totally ordered, normal facet enforcement applies.
+    assert!(validate(schema, "<t>12:30:00</t>").is_empty());
+    assert!(!validate(schema, "<t>11:00:00</t>").is_empty());
+}
+
+#[test]
+fn xsd_date_facet_comparison_uses_timeline_not_lexical_order() {
+    // 2024-01-02+14:00 and 2024-01-01-10:00 denote the same instant
+    // (2024-01-01T10:00:00Z); lexical comparison would reject the value as
+    // greater than the bound.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="d">
+    <xs:simpleType>
+      <xs:restriction base="xs:date">
+        <xs:maxInclusive value="2024-01-01-10:00"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"###;
+
+    let errors = validate(schema, "<d>2024-01-02+14:00</d>");
+    assert!(
+        errors.is_empty(),
+        "timezone-normalized equal date must satisfy maxInclusive, got {errors:?}"
+    );
+    assert!(!validate(schema, "<d>2024-01-02-10:00</d>").is_empty());
+}
+
+#[test]
+fn xsd_gyear_facet_comparison_is_numeric_not_lexical() {
+    // Lexically "9999" > "10000"; on the timeline 9999 precedes 10000.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="y">
+    <xs:simpleType>
+      <xs:restriction base="xs:gYear">
+        <xs:maxInclusive value="10000"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>"###;
+
+    let errors = validate(schema, "<y>9999</y>");
+    assert!(
+        errors.is_empty(),
+        "gYear must compare numerically, got {errors:?}"
+    );
+    assert!(!validate(schema, "<y>10001</y>").is_empty());
 }
 
 #[test]
