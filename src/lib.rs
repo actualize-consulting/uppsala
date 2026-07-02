@@ -111,6 +111,12 @@ pub mod namespace;
 pub mod parser;
 /// Accelerated byte scanning for parser hot loops.
 mod simd;
+
+/// Fuzz-only re-export of the internal SIMD scanners (scalar + SSE2) and the
+/// serializer escaper, for the differential harnesses in `audit/fuzz`. Gated
+/// behind `--features fuzzing`; absent from normal and release builds.
+#[cfg(feature = "fuzzing")]
+pub use crate::simd::fuzz_exports;
 /// Imperative [`XmlWriter`] for streaming XML construction.
 pub mod writer;
 /// XPath 1.0 evaluation engine.

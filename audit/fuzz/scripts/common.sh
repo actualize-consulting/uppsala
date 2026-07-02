@@ -6,6 +6,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # .../audit/fuzz
 REPO_ROOT="$(cd "$FUZZ_DIR/../.." && pwd)"                    # repo root
 
 ALL_TARGETS=(
+  fuzz_simd_differential
+  fuzz_escape_differential
   fuzz_parse
   fuzz_parse_bytes
   fuzz_roundtrip
@@ -20,6 +22,9 @@ ALL_TARGETS=(
 # Map a target to its libFuzzer dictionary (empty if none).
 dict_for() {
   case "$1" in
+    # Byte-oriented differential scanners: no XML dictionary, boundary-length
+    # seeds matter instead (see seeds/).
+    fuzz_simd_differential|fuzz_escape_differential) echo "" ;;
     fuzz_xpath)      echo "$FUZZ_DIR/dict/xpath.dict" ;;
     fuzz_xsd_regex)  echo "$FUZZ_DIR/dict/xsd_regex.dict" ;;
     *)               echo "$FUZZ_DIR/dict/xml.dict" ;;   # all XML-shaped inputs

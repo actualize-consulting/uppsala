@@ -12,7 +12,9 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-uppsala = { path = "../.." }
+# `fuzzing` exposes the internal SIMD scan halves (scalar + SSE2) and the
+# serializer escaper via `uppsala::fuzz_exports`, for the differential harnesses.
+uppsala = { path = "../..", features = ["fuzzing"] }
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
@@ -23,6 +25,21 @@ arbitrary = { version = "1", features = ["derive"] }
 [profile.release]
 debug = 1
 codegen-units = 1
+
+# --- Differential harnesses: unsafe SSE2 vs scalar (highest priority) ---
+[[bin]]
+name = "fuzz_simd_differential"
+path = "fuzz_targets/fuzz_simd_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_escape_differential"
+path = "fuzz_targets/fuzz_escape_differential.rs"
+test = false
+doc = false
+bench = false
 
 # --- Parser surface (drives SIMD scan_content_sse2 / scan_attr_sse2) ---
 [[bin]]

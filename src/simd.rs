@@ -186,8 +186,21 @@ unsafe fn scan_content_sse2(data: &[u8]) -> (usize, bool) {
                 _mm_or_si128(_mm_cmpeq_epi8(chunk, v_lf), eq_cr),
             );
             let bad_ctrl = _mm_andnot_si128(allowed, le_1f);
-            let ctrl_bits = _mm_movemask_epi8(bad_ctrl) as u32;
-            if hi_bits != 0 || ctrl_bits != 0 {
+            let mut validate_bits = hi_bits | (_mm_movemask_epi8(bad_ctrl) as u32);
+            // Only the bytes BEFORE the first delimiter belong to the run the
+            // caller validates, so restrict the validation lanes to them. This
+            // makes `needs_validation` match the scalar reference exactly, which
+            // stops at the delimiter: without the mask, an invalid byte *after*
+            // the delimiter in the same 16-byte chunk would set the flag even
+            // though that byte is not part of the returned run (a benign but
+            // real SSE2-vs-scalar divergence — e.g. `"<" + 0xC3 + "a"*14`).
+            // When this chunk has no delimiter every lane is in the run, so keep
+            // all 16 (`1 << 0` wraps to a full-ones mask only via the branch).
+            if delim_mask != 0 {
+                let d = delim_mask.trailing_zeros();
+                validate_bits &= (1u32 << d).wrapping_sub(1);
+            }
+            if validate_bits != 0 {
                 needs_validation = true;
             }
         }
@@ -240,8 +253,16 @@ unsafe fn scan_attr_sse2(data: &[u8], quote: u8) -> (usize, bool) {
                 _mm_or_si128(_mm_cmpeq_epi8(chunk, v_lf), _mm_cmpeq_epi8(chunk, v_cr)),
             );
             let bad_ctrl = _mm_andnot_si128(allowed, le_1f);
-            let ctrl_bits = _mm_movemask_epi8(bad_ctrl) as u32;
-            if hi_bits != 0 || ctrl_bits != 0 {
+            let mut validate_bits = hi_bits | (_mm_movemask_epi8(bad_ctrl) as u32);
+            // Restrict validation lanes to bytes before the first delimiter so
+            // the flag matches `scan_attr_scalar` exactly (see the same fix in
+            // scan_content_sse2). Keep all 16 lanes when the chunk has no
+            // delimiter.
+            if delim_mask != 0 {
+                let d = delim_mask.trailing_zeros();
+                validate_bits &= (1u32 << d).wrapping_sub(1);
+            }
+            if validate_bits != 0 {
                 needs_validation = true;
             }
         }
@@ -453,5 +474,83 @@ mod tests {
         let (pos, flag) = scan_attr_delimiters(&data, b'"');
         assert_eq!(pos, 50);
         assert!(!flag);
+    }
+
+    #[test]
+    fn content_flag_matches_scalar_when_delim_precedes_invalid() {
+        // Regression: a delimiter at lane 0 followed by an invalid byte within
+        // the same 16-byte SIMD chunk must NOT set needs_validation — the
+        // returned run is empty, and the scalar reference stops at the
+        // delimiter with the flag clear. The SSE2 path previously over-reported
+        // here (returned (0, true) vs scalar (0, false)).
+        let mut data = vec![b'<', 0xC3];
+        data.resize(16, b'a'); // delimiter, invalid byte, then clean fill
+        assert_eq!(scan_content_delimiters(&data), (0, false));
+
+        // Non-empty run followed by a delimiter then an invalid byte, all in one
+        // chunk: the run "aa" is clean, so the flag stays false.
+        let mut data2 = vec![b'a', b'a', b'<', 0xC3];
+        data2.resize(16, b'a');
+        assert_eq!(scan_content_delimiters(&data2), (2, false));
+
+        // Same shape for attribute scanning (quote at lane 0).
+        let mut adata = vec![b'"', 0xC3];
+        adata.resize(16, b'a');
+        assert_eq!(scan_attr_delimiters(&adata, b'"'), (0, false));
+    }
+}
+
+/// Fuzz-only surface exposing both the scalar reference and the SSE2
+/// implementations of every scanner (plus a direct handle on the serializer's
+/// escaper), so the differential fuzz harnesses can assert the two paths agree.
+/// Compiled only under `--features fuzzing`; never part of a normal or release
+/// build. Child module → can reach the parent's private `scan_*_scalar`/`_sse2`.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_exports {
+    /// Arch-dispatched entry points (what the parser actually calls). Wrapped
+    /// rather than `pub use`d because the originals are `pub(crate)`.
+    pub fn scan_content_delimiters(data: &[u8]) -> (usize, bool) {
+        super::scan_content_delimiters(data)
+    }
+    pub fn scan_attr_delimiters(data: &[u8], quote: u8) -> (usize, bool) {
+        super::scan_attr_delimiters(data, quote)
+    }
+    pub fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
+        super::scan_escape_run(data, is_attr)
+    }
+
+    /// Scalar references — the ground truth, available on every architecture.
+    pub fn scan_content_scalar(data: &[u8]) -> (usize, bool) {
+        super::scan_content_scalar(data)
+    }
+    pub fn scan_attr_scalar(data: &[u8], quote: u8) -> (usize, bool) {
+        super::scan_attr_scalar(data, quote)
+    }
+    pub fn scan_escape_scalar(data: &[u8], is_attr: bool) -> usize {
+        super::scan_escape_scalar(data, is_attr)
+    }
+
+    /// SSE2 implementations (x86_64 only). Safe wrappers: SSE2 is guaranteed on
+    /// x86_64, matching the SAFETY note at the real call sites.
+    #[cfg(target_arch = "x86_64")]
+    pub fn scan_content_sse2(data: &[u8]) -> (usize, bool) {
+        unsafe { super::scan_content_sse2(data) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn scan_attr_sse2(data: &[u8], quote: u8) -> (usize, bool) {
+        unsafe { super::scan_attr_sse2(data, quote) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn scan_escape_sse2(data: &[u8], is_attr: bool) -> usize {
+        unsafe { super::scan_escape_sse2(data, is_attr) }
+    }
+
+    /// Escape `s` through the real serializer escaper (`write_escaped_run_dyn`),
+    /// returning the fragment. Lets the escape harness assert the output never
+    /// contains an injectable byte, independent of the SSE2/scalar comparison.
+    pub fn escape_to_string(s: &str, is_attr: bool) -> String {
+        let mut out = String::new();
+        let _ = crate::writer::write_escaped_run_dyn(&mut out, s, is_attr);
+        out
     }
 }

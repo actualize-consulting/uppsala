@@ -20,6 +20,8 @@ harnesses are chosen to drive every one of those routines with adversarial input
 
 | Target | Surface exercised | `unsafe` / recently-changed code it stresses |
 |---|---|---|
+| `fuzz_simd_differential` | **SSE2 vs scalar**, `scan_content`/`scan_attr` | direct equality check on the `unsafe` scanners (highest value) |
+| `fuzz_escape_differential` | **SSE2 vs scalar**, `scan_escape` + escaper safety | `scan_escape_sse2`; asserts no injectable byte survives escaping |
 | `fuzz_parse` | `parse(&str)` | `scan_content_sse2`, `scan_attr_sse2` |
 | `fuzz_parse_bytes` | `parse_bytes(&[u8])` | UTF-16/BOM decode + parser |
 | `fuzz_roundtrip` | parse → serialize → reparse (fixpoint oracle) | `scan_escape_sse2`, sibling-walk serializer |
@@ -29,6 +31,37 @@ harnesses are chosen to drive every one of those routines with adversarial input
 | `fuzz_transform` | `transform(xslt, xml)` | XSLT engine + XPath + serializer |
 | `fuzz_xsd_regex` | `XsdRegex::compile` + `is_match` | backtracking NFA matcher |
 | `fuzz_xsd_builder` | `XsdValidator::from_schema` | schema builder |
+
+### Differential harnesses & the `needs_validation` finding
+
+The two `*_differential` targets compare each `unsafe` SSE2 scanner against its
+scalar reference *directly* (via the crate's `fuzzing` feature, which exposes
+`uppsala::fuzz_exports`). This is the strongest way to test SIMD: many SIMD bugs
+don't crash, they just compute a different answer — invisible unless you assert
+the two paths agree. Because it forces the SSE2 tail/`len % 16` path over
+unaligned `_mm_loadu_si128` loads, it is also the best ASan target.
+
+Building these targets found a **real (benign) divergence** and it has been
+fixed on this branch:
+
+> `scan_content_sse2` accumulated `needs_validation` over the whole 16-byte
+> chunk, including bytes *after* the first delimiter, while `scan_content_scalar`
+> stops at the delimiter. So `"<" + 0xC3 + "a"*14` gave SSE2 `(0, true)` vs
+> scalar `(0, false)`. Direction analysis (3M random trials): the position
+> always matched and the SSE2 path only ever *over-*reported the flag — the
+> parser (`parser.rs`) uses it solely to decide whether to validate the returned
+> run `data[..pos]`, so an over-report meant redundant validation of a clean
+> range, never a skipped validation of a dirty one. Not exploitable, but a genuine
+> cross-path inconsistency. **Fix:** mask the validation lanes to bytes before
+> the delimiter (`src/simd.rs`), making SSE2 byte-identical to scalar (verified
+> over 3M random trials + an exhaustive boundary sweep). `fuzz_simd_differential`
+> is now the permanent regression guard; a unit test
+> (`content_flag_matches_scalar_when_delim_precedes_invalid`) pins the witness.
+
+`fuzz_escape_differential` additionally asserts a **reference-independent safety
+property**: the real escaper's output on any fragment never contains a raw `<`,
+`>`, `\r`, or a bare `&` (nor a raw `"`/`\t`/`\n` in attribute context) — the
+markup-injection guarantee that matters to a SAML consumer.
 
 `fuzz_serialize` and `fuzz_dom_mutate` are **structure-aware** (they use the
 `arbitrary` crate to build DOMs / edit sequences from the raw bytes), so they
@@ -174,7 +207,7 @@ cargo +nightly fuzz run   --fuzz-dir audit/fuzz fuzz_roundtrip -- -fork=$(nproc)
 ```
 audit/fuzz/
 ├── Cargo.toml              # detached fuzz crate (uppsala + libfuzzer-sys + arbitrary)
-├── fuzz_targets/*.rs       # the 9 harnesses
+├── fuzz_targets/*.rs       # the 11 harnesses (2 differential + 9 end-to-end)
 ├── seeds/<target>/         # curated seed inputs (tracked)
 ├── dict/*.dict             # libFuzzer dictionaries
 └── scripts/

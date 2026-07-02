@@ -19,6 +19,11 @@ default = []
 # output stays clean. Currently emitted by the XSD validator submodule
 # (identity constraint evaluation, attribute type resolution, etc.).
 debug-logging = []
+# Fuzz-only: exposes the internal SIMD scan halves (scalar + SSE2) and the
+# serializer escaper via `uppsala::fuzz_exports`, so the differential fuzz
+# harnesses in audit/fuzz can compare the paths directly. Adds no dependencies
+# and is never enabled by normal or release builds.
+fuzzing = []
 
 [dependencies]
 
