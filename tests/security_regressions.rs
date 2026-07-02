@@ -1458,6 +1458,37 @@ fn xslt_processing_instruction_rejects_markup_breakout() {
 }
 
 #[test]
+fn xslt_processing_instruction_target_errors_are_distinct() {
+    // The reserved "xml" target and a syntactically invalid NCName are
+    // different failures; each gets its own diagnostic.
+    let stylesheet = |name: &str| {
+        format!(
+            r#"<xsl:stylesheet version="1.0"
+           xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="xml" omit-xml-declaration="yes"/>
+  <xsl:template match="/">
+    <xsl:processing-instruction name="{name}">d</xsl:processing-instruction>
+  </xsl:template>
+</xsl:stylesheet>"#
+        )
+    };
+
+    let err = uppsala::transform(&stylesheet("xMl"), "<r/>")
+        .expect_err("reserved xml PI target must be rejected");
+    assert!(
+        err.to_string().contains("reserved name 'xml'"),
+        "expected reserved-target diagnostic, got {err:?}"
+    );
+
+    let err = uppsala::transform(&stylesheet("1bad"), "<r/>")
+        .expect_err("non-NCName PI target must be rejected");
+    assert!(
+        err.to_string().contains("not a valid NCName"),
+        "expected NCName diagnostic, got {err:?}"
+    );
+}
+
+#[test]
 fn xslt_processing_instruction_target_accepts_unicode_ncname() {
     // The PI target check must use the same full-Unicode NCName rule as the
     // serializer, so a legal non-ASCII target is accepted rather than rejected

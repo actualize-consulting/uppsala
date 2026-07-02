@@ -192,9 +192,14 @@ fn validate_pi_target(target: &str) -> XmlResult<()> {
     // serialization agree on which targets are valid (the ASCII-only check here
     // previously rejected legal non-ASCII names). NCName already excludes ':'
     // and whitespace; only the reserved "xml" target needs a separate guard.
-    if !crate::writer::is_valid_xml_ncname(target) || target.eq_ignore_ascii_case("xml") {
+    if !crate::writer::is_valid_xml_ncname(target) {
         return Err(XmlError::validation(
             "xsl:processing-instruction target is not a valid NCName",
+        ));
+    }
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction target must not be the reserved name 'xml'",
         ));
     }
     Ok(())
