@@ -234,11 +234,12 @@ fn parse_alternation(
         *pos += 1;
         branches.push(parse_sequence(chars, pos, depth, max_depth)?);
     }
-    if branches.len() == 1 {
-        Ok(branches.pop().unwrap())
-    } else {
-        Ok(RegexNode::Alternation(branches))
-    }
+    // A single branch collapses to that branch (no Alternation wrapper).
+    // `remove(0)` is panic-free here: the length is exactly 1.
+    Ok(match branches.len() {
+        1 => branches.remove(0),
+        _ => RegexNode::Alternation(branches),
+    })
 }
 
 /// Parse a sequence of quantified atoms.
@@ -252,11 +253,12 @@ fn parse_sequence(
     while *pos < chars.len() && chars[*pos] != '|' && chars[*pos] != ')' {
         items.push(parse_quantified(chars, pos, depth, max_depth)?);
     }
-    if items.len() == 1 {
-        Ok(items.pop().unwrap())
-    } else {
-        Ok(RegexNode::Sequence(items))
-    }
+    // A single item collapses to that item (no Sequence wrapper); zero items
+    // stays an empty Sequence. `remove(0)` is panic-free here: the length is 1.
+    Ok(match items.len() {
+        1 => items.remove(0),
+        _ => RegexNode::Sequence(items),
+    })
 }
 
 /// Parse an atom followed by an optional quantifier.
