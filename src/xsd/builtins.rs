@@ -274,18 +274,21 @@ fn normalize_fraction(fraction: &str) -> String {
 }
 
 fn compare_fraction(left: &str, right: &str) -> Ordering {
-    let max_len = left.len().max(right.len());
-    let mut left = left.to_string();
-    let mut right = right.to_string();
-    // Zero-pad with plain loops; std::iter::repeat_n would raise the
-    // minimum supported Rust version.
-    while left.len() < max_len {
-        left.push('0');
+    // Compare digit-by-digit with an implied '0' past the shorter end. The
+    // fractional part is attacker-sized (validation allows any number of
+    // digits), so no padded copies are allocated. Both strings are ASCII
+    // digits by the time they reach a comparison.
+    let mut left = left.bytes();
+    let mut right = right.bytes();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (l, r) => match l.unwrap_or(b'0').cmp(&r.unwrap_or(b'0')) {
+                Ordering::Equal => {}
+                ord => return ord,
+            },
+        }
     }
-    while right.len() < max_len {
-        right.push('0');
-    }
-    left.cmp(&right)
 }
 
 fn parse_xsd_date_parts(date: &str) -> Option<(i128, u32, u32)> {
