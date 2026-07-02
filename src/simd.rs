@@ -62,6 +62,91 @@ pub(crate) fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
     }
 }
 
+/// Length of the leading run of ASCII NCName *continuation* characters
+/// (`[0-9A-Za-z_.-]`). Any other byte — including any non-ASCII byte
+/// (`>= 0x80`) — ends the run.
+///
+/// This is the SIMD core of `writer::is_valid_xml_ncname`'s ASCII fast path:
+/// the caller inspects the byte at the returned offset to decide between
+/// "all valid ASCII" (offset == len), an "invalid ASCII name" (offset byte
+/// `< 0x80`), and "fall through to the Unicode `NameChar` production" (offset
+/// byte `>= 0x80`, the start of a multi-byte character).
+pub(crate) fn scan_ncname_continuation(data: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is guaranteed on all x86_64 processors.
+        unsafe { scan_ncname_continuation_sse2(data) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        scan_ncname_continuation_scalar(data)
+    }
+}
+
+/// Scalar fallback / tail scan for [`scan_ncname_continuation`]. The byte
+/// classification is the reference the SSE2 path must match exactly.
+fn scan_ncname_continuation_scalar(data: &[u8]) -> usize {
+    let mut pos = 0;
+    while pos < data.len() {
+        let b = data[pos];
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+            break;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+
+    let mut pos = 0;
+    // Range bounds and the three standalone characters `_ - .`.
+    let v_0 = _mm_set1_epi8(b'0' as i8);
+    let v_9 = _mm_set1_epi8(b'9' as i8);
+    let v_ua = _mm_set1_epi8(b'A' as i8);
+    let v_uz = _mm_set1_epi8(b'Z' as i8);
+    let v_la = _mm_set1_epi8(b'a' as i8);
+    let v_lz = _mm_set1_epi8(b'z' as i8);
+    let v_us = _mm_set1_epi8(b'_' as i8);
+    let v_hy = _mm_set1_epi8(b'-' as i8);
+    let v_dot = _mm_set1_epi8(b'.' as i8);
+
+    while pos + 16 <= data.len() {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(pos) as *const __m128i);
+
+        // Unsigned range test [lo, hi]: `max(x, lo) == x` (x >= lo) and
+        // `min(x, hi) == x` (x <= hi). Non-ASCII bytes (>= 0x80) fail every
+        // range and every single-char equality, so they end the run.
+        let in_range = |lo, hi| {
+            _mm_and_si128(
+                _mm_cmpeq_epi8(_mm_max_epu8(chunk, lo), chunk),
+                _mm_cmpeq_epi8(_mm_min_epu8(chunk, hi), chunk),
+            )
+        };
+        let singles = _mm_or_si128(
+            _mm_cmpeq_epi8(chunk, v_us),
+            _mm_or_si128(_mm_cmpeq_epi8(chunk, v_hy), _mm_cmpeq_epi8(chunk, v_dot)),
+        );
+        let valid = _mm_or_si128(
+            _mm_or_si128(in_range(v_0, v_9), in_range(v_ua, v_uz)),
+            _mm_or_si128(in_range(v_la, v_lz), singles),
+        );
+
+        // A lane is 0xFF when valid, so its movemask bit is 1; the first invalid
+        // lane is the first 0 bit in the low 16.
+        let invalid = (!(_mm_movemask_epi8(valid) as u32)) & 0xFFFF;
+        if invalid != 0 {
+            return pos + invalid.trailing_zeros() as usize;
+        }
+        pos += 16;
+    }
+
+    pos + scan_ncname_continuation_scalar(&data[pos..])
+}
+
 /// Scalar fallback / tail scan for [`scan_escape_run`]. The byte
 /// classification must match `writer::write_escaped_run_dyn`'s special-byte
 /// rules exactly.
@@ -477,6 +562,43 @@ mod tests {
     }
 
     #[test]
+    fn ncname_continuation_stops_and_lengths() {
+        // Full leading run of valid continuation chars.
+        assert_eq!(scan_ncname_continuation(b"abc-1.2_z"), 9);
+        // Stops at the first invalid ASCII byte.
+        assert_eq!(scan_ncname_continuation(b"abc def"), 3);
+        assert_eq!(scan_ncname_continuation(b"ab:cd"), 2);
+        // Stops at a non-ASCII byte (caller falls through to Unicode).
+        assert_eq!(scan_ncname_continuation("ab\u{e9}".as_bytes()), 2);
+        // Empty / immediate stop.
+        assert_eq!(scan_ncname_continuation(b""), 0);
+        assert_eq!(scan_ncname_continuation(b" x"), 0);
+        // Length spanning the SIMD chunk boundary + tail.
+        assert_eq!(scan_ncname_continuation(b"aaaaaaaaaaaaaaaaaa"), 18);
+        assert_eq!(scan_ncname_continuation(b"aaaaaaaaaaaaaaaaa/"), 17);
+    }
+
+    #[test]
+    fn ncname_continuation_sse2_matches_scalar() {
+        // Differential spot-check (the exhaustive check lives in the fuzz
+        // harness fuzz_simd_differential): every stop byte at every position
+        // across the 16-byte SIMD boundary must agree with the scalar scan.
+        for len in 0..40usize {
+            for p in 0..len {
+                for &sp in &[b' ', b':', b'/', 0x00u8, 0x80u8, 0xFFu8] {
+                    let mut d = vec![b'a'; len];
+                    d[p] = sp;
+                    assert_eq!(
+                        scan_ncname_continuation(&d),
+                        scan_ncname_continuation_scalar(&d),
+                        "len={len} pos={p} byte={sp:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn content_flag_matches_scalar_when_delim_precedes_invalid() {
         // Regression: a delimiter at lane 0 followed by an invalid byte within
         // the same 16-byte SIMD chunk must NOT set needs_validation — the
@@ -518,6 +640,9 @@ pub mod fuzz_exports {
     pub fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
         super::scan_escape_run(data, is_attr)
     }
+    pub fn scan_ncname_continuation(data: &[u8]) -> usize {
+        super::scan_ncname_continuation(data)
+    }
 
     /// Scalar references — the ground truth, available on every architecture.
     pub fn scan_content_scalar(data: &[u8]) -> (usize, bool) {
@@ -528,6 +653,9 @@ pub mod fuzz_exports {
     }
     pub fn scan_escape_scalar(data: &[u8], is_attr: bool) -> usize {
         super::scan_escape_scalar(data, is_attr)
+    }
+    pub fn scan_ncname_continuation_scalar(data: &[u8]) -> usize {
+        super::scan_ncname_continuation_scalar(data)
     }
 
     /// SSE2 implementations (x86_64 only). Safe wrappers: SSE2 is guaranteed on
@@ -543,6 +671,10 @@ pub mod fuzz_exports {
     #[cfg(target_arch = "x86_64")]
     pub fn scan_escape_sse2(data: &[u8], is_attr: bool) -> usize {
         unsafe { super::scan_escape_sse2(data, is_attr) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
+        unsafe { super::scan_ncname_continuation_sse2(data) }
     }
 
     /// Escape `s` through the real serializer escaper (`write_escaped_run_dyn`),

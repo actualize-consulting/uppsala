@@ -615,22 +615,37 @@ pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
 }
 
 pub(crate) fn is_valid_xml_ncname(s: &str) -> bool {
-    // ASCII fast path: names in real-world XML are overwhelmingly ASCII, and
-    // this predicate runs for every element/attribute name on every
-    // serialize. Byte checks avoid the char-decode loop; any non-ASCII byte
-    // falls through to the exact Unicode-production check below.
+    // ASCII fast path, single pass: names in real-world XML are overwhelmingly
+    // ASCII, and this predicate runs for every element/attribute name on every
+    // serialize. Byte checks avoid the char-decode loop. We validate ASCII
+    // bytes as we go and only fall through to the exact Unicode-production check
+    // the moment a non-ASCII byte appears (an ASCII byte is a whole char, so an
+    // invalid one is invalid under either production and can fail fast).
     let bytes = s.as_bytes();
     let Some(&first) = bytes.first() else {
         return false;
     };
-    if s.is_ascii() {
+    if first.is_ascii() {
         if !(first.is_ascii_alphabetic() || first == b'_') {
             return false;
         }
-        return bytes[1..]
-            .iter()
-            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+        // SIMD scan of the continuation bytes: the length of the leading run of
+        // ASCII NCName characters (`[0-9A-Za-z_.-]`). A run that ends before the
+        // string does means the next byte is either an invalid ASCII byte (the
+        // name is invalid) or the start of a non-ASCII character (fall through
+        // to the full Unicode production). An all-ASCII valid name is settled in
+        // this single pass, with no char-decode.
+        let pos = 1 + crate::simd::scan_ncname_continuation(&bytes[1..]);
+        if pos == bytes.len() {
+            return true;
+        }
+        if bytes[pos] < 0x80 {
+            return false;
+        }
+        // else: non-ASCII byte present -> fall through to the Unicode check.
     }
+    // A non-ASCII byte is present somewhere: validate against the full Unicode
+    // NameStartChar / NameChar productions.
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if is_ncname_start_char(c) => {}

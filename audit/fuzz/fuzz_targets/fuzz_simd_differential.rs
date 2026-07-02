@@ -93,8 +93,33 @@ fuzz_target!(|bytes: &[u8]| {
     check_content(&input.data);
     // Fuzz the quote byte across all 256 values, not just `"` and `'`.
     check_attr(&input.data, input.quote);
+
+    // NCName continuation scanner: SSE2 must equal scalar, the returned length
+    // must be in bounds, and the byte at the stop offset (if any) must genuinely
+    // be a non-continuation byte.
+    let ncn_scalar = sx::scan_ncname_continuation_scalar(&input.data);
+    assert!(ncn_scalar <= input.data.len());
+    if ncn_scalar < input.data.len() {
+        let b = input.data[ncn_scalar];
+        let is_cont = b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.');
+        assert!(
+            !is_cont,
+            "ncname scan stopped on a continuation byte {b:#04x}"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ncn_sse2 = sx::scan_ncname_continuation_sse2(&input.data);
+        assert_eq!(
+            ncn_sse2, ncn_scalar,
+            "scan_ncname_continuation divergence: sse2={ncn_sse2} scalar={ncn_scalar} data={:?}",
+            input.data
+        );
+    }
+
     // Drive the arch-dispatched entry points too, so the SSE2 tail path is
     // exercised even when the checks above short-circuit early.
     let _ = sx::scan_content_delimiters(&input.data);
     let _ = sx::scan_attr_delimiters(&input.data, input.quote);
+    let _ = sx::scan_ncname_continuation(&input.data);
 });
