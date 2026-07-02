@@ -189,8 +189,11 @@ just fuzz-coverage fuzz_roundtrip   # HTML report under audit/fuzz/coverage/<tar
 just fuzz-cmin fuzz_roundtrip       # drop redundant corpus entries
 ```
 
-`fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`) plus
-`cargo-binutils` and `rustfilt` (`sfw cargo install cargo-binutils rustfilt`).
+`fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`); it
+calls `llvm-cov` directly rather than the `cargo cov` wrapper, which panics on
+some `cargo-binutils`/clap combinations. `rustfilt` is optional — install it
+(`sfw cargo install rustfilt`) for demangled function names; without it the
+report still renders with mangled symbols.
 
 ## Manual invocation (no just)
 

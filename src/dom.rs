@@ -2151,8 +2151,14 @@ fn plan_element_namespaces<'e>(
         // A reserved prefix with no namespace URI must still be stripped: `xml`
         // and `xmlns` are implicitly bound, so `xml:Foo` would re-parse into the
         // XML namespace and `xmlns:Foo` into the XMLNS namespace, silently
-        // changing the element's namespace. Serialize the bare local name.
-        (Some("xml"), None) | (Some("xmlns"), None) => Some(elem.name.local_name.to_string()),
+        // changing the element's namespace. Serialize the bare local name,
+        // sanitized as an NCName: the parser may have accepted a multi-colon
+        // name (`xmlns:xmlns:C` → local `xmlns:C`), and emitting that verbatim
+        // would re-parse as a *new* `xmlns`-prefixed element, so serialization
+        // would strip one layer per round instead of being a one-pass fixpoint.
+        (Some("xml"), None) | (Some("xmlns"), None) => {
+            Some(crate::writer::safe_xml_ncname(&elem.name.local_name).into_owned())
+        }
         (Some(_), None) => None, // prefixed but no URI: leave the name as-is
         // The XML namespace is bound to `xml` and only `xml`, and is never
         // declared. Any other prefix (or none) for that URI is rewritten to
@@ -2164,8 +2170,12 @@ fn plan_element_namespaces<'e>(
         // every binding to it, so a synthesized `xmlns:nsN="...2000/xmlns/"`
         // declaration would not be namespace-well-formed and would not re-parse.
         // The namespace is unrepresentable, so drop it and serialize the bare
-        // local name (never emitting an `xmlns`/`xmlns:*` name).
-        (_, Some(u)) if u == xmlns_ns => Some(elem.name.local_name.to_string()),
+        // local name (never emitting an `xmlns`/`xmlns:*` name). NCName-sanitize
+        // it so a multi-colon local name cannot re-form a prefixed name on
+        // re-parse (see the reserved-prefix arm above).
+        (_, Some(u)) if u == xmlns_ns => {
+            Some(crate::writer::safe_xml_ncname(&elem.name.local_name).into_owned())
+        }
         // The reserved `xml`/`xmlns` prefixes bound to any *other* (representable)
         // URI are rebound to a fresh non-reserved prefix; emitting them verbatim
         // would re-parse as the XML namespace / as a declaration.
@@ -2197,7 +2207,9 @@ fn plan_element_namespaces<'e>(
                 Some(if attr.name.local_name.as_ref() == "xmlns" {
                     "xmlns_".to_string()
                 } else {
-                    attr.name.local_name.to_string()
+                    // NCName-sanitize so a multi-colon local name cannot re-form
+                    // a prefixed attribute on re-parse (see the element arm).
+                    crate::writer::safe_xml_ncname(&attr.name.local_name).into_owned()
                 })
             }
             (_, None) => None,
@@ -2209,7 +2221,7 @@ fn plan_element_namespaces<'e>(
             (_, Some(u)) if u == xmlns_ns => Some(if attr.name.local_name.as_ref() == "xmlns" {
                 "xmlns_".to_string()
             } else {
-                attr.name.local_name.to_string()
+                crate::writer::safe_xml_ncname(&attr.name.local_name).into_owned()
             }),
             // Reserved `xml`/`xmlns` prefixes on a representable URI: rebind to a
             // fresh non-reserved prefix so the attribute does not masquerade as a
