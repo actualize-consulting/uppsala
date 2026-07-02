@@ -1192,8 +1192,12 @@ fn parse_particles(
 /// absent and the enclosing `xs:schema` sets `attributeFormDefault="qualified"`.
 fn local_attribute_is_qualified(doc: &Document, node: NodeId) -> bool {
     if let Some(NodeKind::Element(elem)) = doc.node_kind(node) {
-        if let Some(form) = elem.get_attribute("form") {
-            return form == "qualified";
+        // Match parse_element_decl: only an explicit qualified/unqualified
+        // overrides the schema default; unknown form values fall through.
+        match elem.get_attribute("form") {
+            Some("qualified") => return true,
+            Some("unqualified") => return false,
+            _ => {}
         }
     }
     let mut current = doc.parent(node);

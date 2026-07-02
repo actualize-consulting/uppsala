@@ -945,6 +945,30 @@ fn xsd_attribute_form_qualified_overrides_unqualified_default() {
 }
 
 #[test]
+fn xsd_unknown_attribute_form_falls_back_to_schema_default() {
+    // An unrecognized form= value must not silently force the attribute to be
+    // unqualified; like parse_element_decl, it falls back to the schema's
+    // attributeFormDefault.
+    let schema = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t"
+           elementFormDefault="qualified"
+           attributeFormDefault="qualified">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:attribute name="id" type="xs:string" use="required" form="bogus"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"###;
+
+    let qualified = r#"<t:r xmlns:t="urn:t" t:id="ok"/>"#;
+    let errors = validate(schema, qualified);
+    assert!(
+        errors.is_empty(),
+        "unknown form must fall back to attributeFormDefault, got {errors:?}"
+    );
+}
+
+#[test]
 fn xsd_complex_type_derivation_cycles_are_rejected() {
     // Recursive complex-type derivation can otherwise loop while resolving the
     // effective content model. The validator should detect the cycle and report
