@@ -152,8 +152,11 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        // Collect first so the seen-name borrows outlive the loop (the
+        // iterator's items are owned per-iteration otherwise).
+        let attrs: Vec<(K, V)> = attrs.into_iter().collect();
         let mut seen_attrs = Vec::new();
-        for (key, val) in attrs {
+        for (key, val) in &attrs {
             write_sanitized_attr_to_string(
                 &mut self.buf,
                 key.as_ref(),
@@ -188,8 +191,10 @@ impl XmlWriter {
         let name = safe_xml_qname(name);
         self.buf.push('<');
         self.buf.push_str(&name);
+        // Collect first so the seen-name borrows outlive the loop.
+        let attrs: Vec<(K, V)> = attrs.into_iter().collect();
         let mut seen_attrs = Vec::new();
-        for (key, val) in attrs {
+        for (key, val) in &attrs {
             write_sanitized_attr_to_string(
                 &mut self.buf,
                 key.as_ref(),
@@ -508,8 +513,13 @@ pub(crate) fn safe_xml_ncname(s: &str) -> Cow<'_, str> {
 /// `"bad\tattr"` to the same fallback name (`"_"`). XML forbids duplicate
 /// attribute names, so callers pass a per-element `seen` set and this helper
 /// appends deterministic suffixes (`_1`, `_2`, ...) when needed.
-pub(crate) fn unique_safe_xml_qname(s: &str, seen: &mut Vec<String>) -> String {
-    let base = safe_xml_qname(s).into_owned();
+///
+/// `seen` holds `Cow`s and the returned name borrows the input whenever the
+/// name is valid and unused -- the overwhelmingly common case for parsed
+/// documents -- so that path performs no allocation at all (the serializer
+/// calls this once per attribute per element per serialize).
+pub(crate) fn unique_safe_xml_qname<'a>(s: &'a str, seen: &mut Vec<Cow<'a, str>>) -> Cow<'a, str> {
+    let base = safe_xml_qname(s);
     if !seen.contains(&base) {
         seen.push(base.clone());
         return base;
@@ -518,26 +528,124 @@ pub(crate) fn unique_safe_xml_qname(s: &str, seen: &mut Vec<String>) -> String {
     let mut suffix = 1usize;
     loop {
         let candidate = format!("{}_{}", base, suffix);
-        if !seen.contains(&candidate) {
-            seen.push(candidate.clone());
+        if !seen.iter().any(|n| n.as_ref() == candidate) {
+            seen.push(Cow::Owned(candidate.clone()));
+            return Cow::Owned(candidate);
+        }
+        suffix += 1;
+    }
+}
+
+/// Owned-input variant of [`unique_safe_xml_qname`], for callers whose name
+/// string is built per call (a prefixed attribute's `prefix:local` join) and
+/// so cannot be borrowed by the `seen` list. Identical sanitization and
+/// dedup semantics.
+pub(crate) fn unique_safe_xml_qname_owned(s: String, seen: &mut Vec<Cow<'_, str>>) -> String {
+    let base = if is_valid_xml_qname(&s) {
+        s
+    } else {
+        "_".to_string()
+    };
+    if !seen.iter().any(|n| n.as_ref() == base) {
+        seen.push(Cow::Owned(base.clone()));
+        return base;
+    }
+
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{}_{}", base, suffix);
+        if !seen.iter().any(|n| n.as_ref() == candidate) {
+            seen.push(Cow::Owned(candidate.clone()));
             return candidate;
         }
         suffix += 1;
     }
 }
 
+/// Write the serialized form of a possibly-prefixed name directly to the
+/// sink, sanitizing exactly like `safe_xml_qname(prefixed_name())` but
+/// without materialising the `prefix:local` string first. The valid-name
+/// path (every parsed document) performs zero allocation; an invalid name
+/// collapses to `_` just as before. Used for element open AND close tags,
+/// which previously each paid a `format!` per prefixed element.
+pub(crate) fn write_qname_sanitized(
+    out: &mut dyn core::fmt::Write,
+    prefix: Option<&str>,
+    local: &str,
+) -> core::fmt::Result {
+    match prefix {
+        Some(p) => {
+            // `prefixed_name()` would yield "p:local"; that string is a valid
+            // QName exactly when both pieces are valid NCNames.
+            if is_valid_xml_ncname(p) && is_valid_xml_ncname(local) {
+                out.write_str(p)?;
+                out.write_char(':')?;
+                out.write_str(local)
+            } else {
+                out.write_str("_")
+            }
+        }
+        // Unprefixed: the raw name may itself be "a:b" (a QName with the colon
+        // stored in the local name), so validate with the QName production,
+        // matching `safe_xml_qname` on the joined string.
+        None => {
+            if is_valid_xml_qname(local) {
+                out.write_str(local)
+            } else {
+                out.write_str("_")
+            }
+        }
+    }
+}
+
 pub(crate) fn is_valid_xml_qname(s: &str) -> bool {
-    let mut parts = s.split(':');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    let Some(second) = parts.next() else {
-        return is_valid_xml_ncname(first);
-    };
-    parts.next().is_none() && is_valid_xml_ncname(first) && is_valid_xml_ncname(second)
+    // Byte-level colon split (a colon is a single ASCII byte, so byte offsets
+    // are char boundaries); avoids the generic pattern-searcher machinery on
+    // this per-name-per-serialize path.
+    let bytes = s.as_bytes();
+    match bytes.iter().position(|&b| b == b':') {
+        None => is_valid_xml_ncname(s),
+        Some(i) => {
+            let rest = &bytes[i + 1..];
+            !rest.contains(&b':')
+                && is_valid_xml_ncname(&s[..i])
+                && is_valid_xml_ncname(&s[i + 1..])
+        }
+    }
 }
 
 pub(crate) fn is_valid_xml_ncname(s: &str) -> bool {
+    // ASCII fast path, single pass: names in real-world XML are overwhelmingly
+    // ASCII, and this predicate runs for every element/attribute name on every
+    // serialize. Byte checks avoid the char-decode loop. We validate ASCII
+    // bytes as we go and only fall through to the exact Unicode-production check
+    // the moment a non-ASCII byte appears (an ASCII byte is a whole char, so an
+    // invalid one is invalid under either production and can fail fast).
+    let bytes = s.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if first.is_ascii() {
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return false;
+        }
+        // SIMD scan of the continuation bytes: the length of the leading run of
+        // ASCII NCName characters (`[0-9A-Za-z_.-]`). A run that ends before the
+        // string does means the next byte is either an invalid ASCII byte (the
+        // name is invalid) or the start of a non-ASCII character (fall through
+        // to the full Unicode production). An all-ASCII valid name is settled in
+        // this single pass, with no char-decode.
+        let pos = 1 + crate::simd::scan_ncname_continuation(&bytes[1..]);
+        if pos == bytes.len() {
+            return true;
+        }
+        if bytes[pos] < 0x80 {
+            return false;
+        }
+        // else: non-ASCII byte present -> fall through to the Unicode check.
+    }
+    // A non-ASCII byte is present somewhere: validate against the full Unicode
+    // NameStartChar / NameChar productions.
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if is_ncname_start_char(c) => {}
@@ -653,6 +761,61 @@ fn write_escaped_run_based(buf: &mut String, s: &str, is_attr: bool) {
     }
 }
 
+/// Run-based XML escaping to a generic `fmt::Write` sink -- the same
+/// algorithm and byte-identical output as [`write_escaped_run_based`], for
+/// the DOM serializer's `&mut dyn fmt::Write` pipeline. The previous
+/// per-character loop there paid a virtual `write_char` call (plus a UTF-8
+/// re-encode) for every byte of every text node and attribute value, which
+/// profiled as ~38% of whole-document serialization; bulk `write_str` of the
+/// safe runs removes that entirely.
+pub(crate) fn write_escaped_run_dyn(
+    out: &mut dyn core::fmt::Write,
+    s: &str,
+    is_attr: bool,
+) -> core::fmt::Result {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // SIMD-scan the longest verbatim-copyable run (16 bytes/cycle on
+        // x86_64) and bulk-write it, then handle the one special byte.
+        let run = crate::simd::scan_escape_run(&bytes[i..], is_attr);
+        if run > 0 {
+            out.write_str(&s[i..i + run])?;
+            i += run;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+        let b = bytes[i];
+        if b >= 0x80 {
+            // Multi-byte UTF-8 character: copy verbatim when it is a valid
+            // XML character, otherwise emit the replacement character.
+            let ch = s[i..].chars().next().unwrap();
+            let n = ch.len_utf8();
+            if is_xml_char(ch) {
+                out.write_str(&s[i..i + n])?;
+            } else {
+                out.write_char('\u{FFFD}')?;
+            }
+            i += n;
+        } else {
+            match b {
+                b'&' => out.write_str("&amp;")?,
+                b'<' => out.write_str("&lt;")?,
+                b'>' => out.write_str("&gt;")?,
+                b'\r' => out.write_str("&#xD;")?,
+                b'"' if is_attr => out.write_str("&quot;")?,
+                b'\t' if is_attr => out.write_str("&#x9;")?,
+                b'\n' if is_attr => out.write_str("&#xA;")?,
+                // Remaining ASCII control characters are all invalid XML chars.
+                _ => out.write_char(sanitized_xml_char(b as char))?,
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Write text content with XML escaping directly to a String.
 fn write_escaped_text_to_string(buf: &mut String, s: &str) {
     write_escaped_run_based(buf, s, false);
@@ -665,11 +828,11 @@ fn write_escaped_attr_to_string(buf: &mut String, s: &str) {
 
 /// Write one attribute after structural-name sanitization and per-element
 /// collision disambiguation.
-fn write_sanitized_attr_to_string(
+fn write_sanitized_attr_to_string<'a>(
     buf: &mut String,
-    key: &str,
+    key: &'a str,
     value: &str,
-    seen_attrs: &mut Vec<String>,
+    seen_attrs: &mut Vec<Cow<'a, str>>,
 ) {
     let key = unique_safe_xml_qname(key, seen_attrs);
     buf.push(' ');

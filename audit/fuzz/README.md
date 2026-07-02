@@ -1,0 +1,224 @@
+# Fuzzing uppsala
+
+A [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) / libFuzzer
+harness suite for uppsala, targeting the untrusted-input surfaces — the parser,
+the serializer (including the **`unsafe` SSE2 SIMD scanners** in `src/simd.rs`),
+the DOM mutation + `prepare_xpath()` machinery, XPath, XSLT, and the XSD builder.
+
+This crate is **not** part of uppsala's build. Its `[workspace]` table detaches
+it, so `cargo build`/`cargo test` at the repo root never pull in
+`libfuzzer-sys`/`arbitrary` and uppsala keeps its zero-dependency guarantee.
+Only the fuzzer compiles this crate.
+
+## Why these harnesses
+
+uppsala's only `unsafe` code is the three SSE2 routines in `src/simd.rs`:
+`scan_content_sse2` and `scan_attr_sse2` (parser hot loops) and the newer
+`scan_escape_sse2` (serializer escape scanner). A wrong length, a misread lane
+mask, or a bad alignment there is a memory-safety bug that ASan will catch. The
+harnesses are chosen to drive every one of those routines with adversarial input.
+
+| Target | Surface exercised | `unsafe` / recently-changed code it stresses |
+|---|---|---|
+| `fuzz_simd_differential` | **SSE2 vs scalar**, `scan_content`/`scan_attr` | direct equality check on the `unsafe` scanners (highest value) |
+| `fuzz_escape_differential` | **SSE2 vs scalar**, `scan_escape` + escaper safety | `scan_escape_sse2`; asserts no injectable byte survives escaping |
+| `fuzz_parse` | `parse(&str)` | `scan_content_sse2`, `scan_attr_sse2` |
+| `fuzz_parse_bytes` | `parse_bytes(&[u8])` | UTF-16/BOM decode + parser |
+| `fuzz_roundtrip` | parse → serialize → reparse (fixpoint oracle) | `scan_escape_sse2`, sibling-walk serializer |
+| `fuzz_serialize` | **builds an arbitrary DOM** → serialize 3 ways | `scan_escape_sse2` at all alignments; name sanitizers |
+| `fuzz_dom_mutate` | arbitrary edit sequence + `prepare_xpath()` | attribute-node arena recycling; `is_linkable_node` guards |
+| `fuzz_xpath` | XPath lex/parse/eval | evaluator, doc-order index |
+| `fuzz_transform` | `transform(xslt, xml)` | XSLT engine + XPath + serializer |
+| `fuzz_xsd_regex` | `XsdRegex::compile` + `is_match` | backtracking NFA matcher |
+| `fuzz_xsd_builder` | `XsdValidator::from_schema` | schema builder |
+
+### Differential harnesses & the `needs_validation` finding
+
+The two `*_differential` targets compare each `unsafe` SSE2 scanner against its
+scalar reference *directly* (via the crate's `fuzzing` feature, which exposes
+`uppsala::fuzz_exports`). This is the strongest way to test SIMD: many SIMD bugs
+don't crash, they just compute a different answer — invisible unless you assert
+the two paths agree. Because it forces the SSE2 tail/`len % 16` path over
+unaligned `_mm_loadu_si128` loads, it is also the best ASan target.
+
+Building these targets found a **real (benign) divergence** and it has been
+fixed on this branch:
+
+> `scan_content_sse2` accumulated `needs_validation` over the whole 16-byte
+> chunk, including bytes *after* the first delimiter, while `scan_content_scalar`
+> stops at the delimiter. So `"<" + 0xC3 + "a"*14` gave SSE2 `(0, true)` vs
+> scalar `(0, false)`. Direction analysis (3M random trials): the position
+> always matched and the SSE2 path only ever *over-*reported the flag — the
+> parser (`parser.rs`) uses it solely to decide whether to validate the returned
+> run `data[..pos]`, so an over-report meant redundant validation of a clean
+> range, never a skipped validation of a dirty one. Not exploitable, but a genuine
+> cross-path inconsistency. **Fix:** mask the validation lanes to bytes before
+> the delimiter (`src/simd.rs`), making SSE2 byte-identical to scalar (verified
+> over 3M random trials + an exhaustive boundary sweep). `fuzz_simd_differential`
+> is now the permanent regression guard; a unit test
+> (`content_flag_matches_scalar_when_delim_precedes_invalid`) pins the witness.
+
+`fuzz_escape_differential` additionally asserts a **reference-independent safety
+property**: the real escaper's output on any fragment never contains a raw `<`,
+`>`, `\r`, or a bare `&` (nor a raw `"`/`\t`/`\n` in attribute context) — the
+markup-injection guarantee that matters to a SAML consumer.
+
+`fuzz_serialize` and `fuzz_dom_mutate` are **structure-aware** (they use the
+`arbitrary` crate to build DOMs / edit sequences from the raw bytes), so they
+reach code the byte-oriented parser harnesses can't — in particular the
+serializer fed with control characters, invalid-XML scalars, `]]>`, `?>` and
+multibyte sequences at arbitrary offsets, and the tree mutators fed with virtual
+attribute nodes and the document root (the operands that used to corrupt the
+tree). Both bound tree depth and node count so a harness-side stack overflow
+can't masquerade as a library finding.
+
+### Oracles
+
+Beyond "don't crash / don't trip ASan", two harnesses assert semantic
+invariants:
+
+- **`fuzz_roundtrip`** — serialization is a fixpoint: `parse(s).to_xml()` must
+  equal `parse(parse(s).to_xml()).to_xml()`. The assert only fires when both
+  parses succeed, so parser resource limits never cause false positives.
+- **`fuzz_dom_mutate`** — after any edit sequence the document must still
+  serialize to XML that reparses; a wiped child list or a cyclic sibling link
+  shows up as a reparse failure, an ASan report, or a libFuzzer timeout.
+
+Input splitting for the multi-part harnesses: `fuzz_xpath` and `fuzz_xsd_regex`
+split on the first newline (`expr\nxml`, `pattern\ninput`); `fuzz_dom_mutate`
+uses the first line as seed XML and the rest as edit opcodes; `fuzz_transform`
+splits on a NUL byte (`stylesheet\0source`) since NUL never appears in XML.
+
+## Quick start
+
+```bash
+# One-time, per machine:
+just fuzz-setup            # nightly toolchain + llvm-tools + cargo-fuzz
+
+# Fuzz everything on a remote box, then walk away:
+just fuzz                  # detached tmux session 'uppsala-fuzz', runs forever
+just fuzz-attach           # reattach to watch
+just fuzz-crashes          # list any crash artifacts found
+just fuzz-stop             # stop the whole session
+```
+
+`just fuzz-setup` installs cargo-fuzz through `sfw` (Socket Firewall), matching
+this repo's package-install policy.
+
+## Running on a remote multicore server (tmux)
+
+`just fuzz` is built for exactly this. It:
+
+1. builds all targets once (so the windows don't fight over the build lock),
+2. opens a **detached** tmux session `uppsala-fuzz` with one window per target,
+3. splits cores evenly across targets — each target runs libFuzzer **fork mode**
+   (`-fork=N`), which keeps fuzzing across crashes and saves each one.
+
+Because the session is detached and owned by the tmux server, it **survives SSH
+logout**. Typical remote workflow:
+
+```bash
+ssh bigbox
+cd uppsala
+just fuzz-setup            # first time only
+just fuzz                  # launches detached session, returns immediately
+# ... log out; fuzzing continues ...
+
+# later:
+ssh bigbox
+cd uppsala
+just fuzz-attach           # Ctrl-b n / Ctrl-b p to switch targets, Ctrl-b d to detach
+just fuzz-crashes          # anything found?
+just fuzz-stop             # done
+```
+
+Run for a fixed budget instead of forever:
+
+```bash
+just fuzz 3600             # 1 hour per target, then each stops on its own
+```
+
+Focus a single target in the foreground (all cores, fork mode):
+
+```bash
+just fuzz-one fuzz_roundtrip 3600
+```
+
+Tuning knobs (env vars, honored by the scripts):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `JOBS` | `nproc` (or cores/targets under `just fuzz`) | fork workers for a target |
+| `MAX_LEN` | `16384` | max input length in bytes |
+| `SESSION` | `uppsala-fuzz` | tmux session name |
+
+## Keep the SIMD sanitizer ON
+
+Because the SIMD scanners are `unsafe`, **do not** pass `--sanitizer none`.
+AddressSanitizer is on by default here and is the whole point of fuzzing this
+code — it's what turns a mis-indexed SSE2 lane into a reported crash instead of
+silent corruption. (The `--sanitizer none` 2× speedup advice only applies to
+100% safe-Rust projects.)
+
+## Triage
+
+A crash is written under `audit/fuzz/artifacts/<target>/`. Reproduce it with a
+stack trace:
+
+```bash
+just fuzz-crashes                                  # list them
+just fuzz-repro fuzz_parse audit/fuzz/artifacts/fuzz_parse/crash-<hash>
+```
+
+The failing input is just bytes; for the split harnesses, remember the
+separator (newline / NUL) when reading it.
+
+## Corpus and coverage
+
+- **Seeds** (curated, tracked): `audit/fuzz/seeds/<target>/`. `run.sh` copies
+  them into the working corpus on start.
+- **Working corpus** (grows as the fuzzer finds coverage; git-ignored):
+  `audit/fuzz/corpus/<target>/`.
+- **Dictionaries**: `audit/fuzz/dict/` (`xml.dict`, `xpath.dict`,
+  `xsd_regex.dict`) — auto-selected per target by `run.sh`.
+
+Coverage report and corpus minimization:
+
+```bash
+just fuzz-coverage fuzz_roundtrip   # HTML report under audit/fuzz/coverage/<target>/html
+just fuzz-cmin fuzz_roundtrip       # drop redundant corpus entries
+```
+
+`fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`); it
+calls `llvm-cov` directly rather than the `cargo cov` wrapper, which panics on
+some `cargo-binutils`/clap combinations. `rustfilt` is optional — install it
+(`sfw cargo install rustfilt`) for demangled function names; without it the
+report still renders with mangled symbols.
+
+## Manual invocation (no just)
+
+Everything routes through `cargo +nightly fuzz ... --fuzz-dir audit/fuzz`:
+
+```bash
+cargo +nightly fuzz build --fuzz-dir audit/fuzz
+cargo +nightly fuzz run   --fuzz-dir audit/fuzz fuzz_roundtrip -- -max_total_time=300
+cargo +nightly fuzz run   --fuzz-dir audit/fuzz fuzz_roundtrip -- -fork=$(nproc) -ignore_crashes=1
+```
+
+## Layout
+
+```
+audit/fuzz/
+├── Cargo.toml              # detached fuzz crate (uppsala + libfuzzer-sys + arbitrary)
+├── fuzz_targets/*.rs       # the 11 harnesses (2 differential + 9 end-to-end)
+├── seeds/<target>/         # curated seed inputs (tracked)
+├── dict/*.dict             # libFuzzer dictionaries
+└── scripts/
+    ├── common.sh           # shared paths, target list, dict/tool checks
+    ├── build.sh            # build all targets once
+    ├── run.sh              # run one target, fork mode, auto seed+dict
+    ├── fuzz-all.sh         # tmux orchestrator (one window per target)
+    ├── repro.sh            # reproduce a crash artifact
+    ├── minimize.sh         # cmin a corpus
+    └── coverage.sh         # HTML coverage report
+```

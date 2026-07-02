@@ -1000,6 +1000,41 @@ fn ns_xmlns_prefixed_attribute_does_not_masquerade_as_declaration() {
 }
 
 #[test]
+fn ns_reserved_prefix_strip_is_single_pass_idempotent() {
+    // Regression (fuzz_roundtrip): the parser leniently accepts a multi-colon
+    // element name like `xmlns:xmlns:C` (prefix `xmlns`, local `xmlns:C`). When
+    // the serializer strips the reserved `xmlns` prefix it must sanitize the
+    // remaining local name as an NCName; emitting the raw `xmlns:C` re-parses as
+    // a *new* `xmlns`-prefixed element, so serialization strips one layer per
+    // round instead of being a one-pass fixpoint. Assert `to_xml()` output is a
+    // fixed point of parse->serialize for the whole family of stacked names.
+    for input in [
+        "<xmlns:xmlns:C/>",
+        "<xmlns:xmlns:xmlns:Z/>",
+        "<a><xmlns:xmlns:V/></a>",
+        "<xml:xml:foo/>",
+    ] {
+        let out1 = uppsala::parse(input).unwrap().to_xml();
+        let out2 = uppsala::parse(&out1).unwrap().to_xml();
+        assert_eq!(
+            out1, out2,
+            "serialization not a one-pass fixpoint for {input:?}: {out1:?} -> {out2:?}"
+        );
+        // And the emitted name carries no colon (it is a bare NCName or `_`).
+        let inner = out1.trim_start_matches("<a>").trim_end_matches("</a>");
+        assert!(
+            !inner
+                .trim_start_matches('<')
+                .split(['/', '>'])
+                .next()
+                .unwrap()
+                .contains(':'),
+            "emitted element name still contains a colon: {out1:?}"
+        );
+    }
+}
+
+#[test]
 fn ns_xmlns_namespace_uri_is_dropped_on_serialization() {
     use uppsala::{Document, QName};
     // The XMLNS namespace cannot be bound to any prefix (the parser ignores such

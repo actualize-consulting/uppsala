@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted. Amended by ADR 0014 (SSE2/scalar `needs_validation` parity fix and
+differential fuzzing of the scanners).
 
 ## Context
 

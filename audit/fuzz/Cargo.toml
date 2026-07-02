@@ -1,0 +1,109 @@
+# Fuzzing crate for uppsala. Kept OUT of the main crate's dependency graph:
+# the empty `[workspace]` table below detaches it so `cargo build`/`cargo test`
+# in the repo root never pull in libfuzzer-sys/arbitrary, preserving uppsala's
+# zero-dependency guarantee. Only the fuzzer builds this.
+[package]
+name = "uppsala-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# `fuzzing` exposes the internal SIMD scan halves (scalar + SSE2) and the
+# serializer escaper via `uppsala::fuzz_exports`, for the differential harnesses.
+uppsala = { path = "../..", features = ["fuzzing"] }
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# Detach from the parent package so uppsala stays dependency-free.
+[workspace]
+
+# Fuzzers must be built optimized but with symbols for readable crash traces.
+[profile.release]
+debug = 1
+codegen-units = 1
+
+# --- Differential harnesses: unsafe SSE2 vs scalar (highest priority) ---
+[[bin]]
+name = "fuzz_simd_differential"
+path = "fuzz_targets/fuzz_simd_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_escape_differential"
+path = "fuzz_targets/fuzz_escape_differential.rs"
+test = false
+doc = false
+bench = false
+
+# --- Parser surface (drives SIMD scan_content_sse2 / scan_attr_sse2) ---
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_bytes"
+path = "fuzz_targets/fuzz_parse_bytes.rs"
+test = false
+doc = false
+bench = false
+
+# --- Serializer surface (drives SIMD scan_escape_sse2 + name sanitization) ---
+[[bin]]
+name = "fuzz_roundtrip"
+path = "fuzz_targets/fuzz_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_serialize"
+path = "fuzz_targets/fuzz_serialize.rs"
+test = false
+doc = false
+bench = false
+
+# --- DOM mutation / prepare_xpath arena recycling + attribute-node guards ---
+[[bin]]
+name = "fuzz_dom_mutate"
+path = "fuzz_targets/fuzz_dom_mutate.rs"
+test = false
+doc = false
+bench = false
+
+# --- XPath, XSLT, XSD surfaces ---
+[[bin]]
+name = "fuzz_xpath"
+path = "fuzz_targets/fuzz_xpath.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transform"
+path = "fuzz_targets/fuzz_transform.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xsd_regex"
+path = "fuzz_targets/fuzz_xsd_regex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xsd_builder"
+path = "fuzz_targets/fuzz_xsd_builder.rs"
+test = false
+doc = false
+bench = false
