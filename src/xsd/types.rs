@@ -362,12 +362,22 @@ pub(crate) enum MaxOccurs {
 #[derive(Debug, Clone)]
 pub(crate) struct AttributeDecl {
     pub(super) name: String,
+    pub(super) namespace: Option<String>,
     pub(super) type_ref: TypeRef,
     pub(super) required: bool,
     /// Default value (parsed for spec completeness; not yet enforced during validation).
     #[allow(dead_code)]
     pub(super) default: Option<String>,
     pub(super) prohibited: bool,
+    /// Whether this use came from `ref=` (a global attribute reference). Under
+    /// chameleon include, ref'd no-namespace attributes move to the including
+    /// schema's target namespace while local unqualified ones stay unqualified.
+    pub(super) is_ref: bool,
+    /// Whether a local (`name=`) use was namespace-qualified via
+    /// `form="qualified"` or `attributeFormDefault="qualified"`. Persisted so
+    /// chameleon include can move qualified local uses of a no-namespace
+    /// module into the including schema's target namespace.
+    pub(super) qualified: bool,
 }
 
 /// A simple type definition.

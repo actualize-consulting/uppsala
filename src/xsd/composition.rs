@@ -35,7 +35,8 @@ use super::parser::{
     parse_attribute_group_def, parse_complex_type, parse_model_group_def, parse_simple_type,
 };
 use super::types::{
-    ContentModel, ElementDecl, Particle, ParticleKind, TypeDef, TypeRef, XsdValidator,
+    AttributeDecl, ContentModel, ElementDecl, Particle, ParticleKind, TypeDef, TypeRef,
+    XsdValidator,
 };
 use super::XS_NAMESPACE;
 
@@ -481,18 +482,25 @@ fn merge_external_declarations(validator: &mut XsdValidator, ext: &XsdValidator,
 
     for (key, attr) in &ext.global_attributes {
         let new_key = rekey(key);
+        let mut new_attr = attr.clone();
+        // Chameleon: global attributes take on the including schema's target
+        // namespace, matching their re-keyed lookup entry.
+        if chameleon && new_attr.namespace.is_none() {
+            new_attr.namespace = target_ns.clone();
+        }
         validator
             .global_attributes
             .entry(new_key)
-            .or_insert(attr.clone());
+            .or_insert(new_attr);
     }
 
     for (key, ag) in &ext.attribute_groups {
         let new_key = rekey(key);
-        validator
-            .attribute_groups
-            .entry(new_key)
-            .or_insert(ag.clone());
+        let mut new_ag = ag.clone();
+        if chameleon {
+            chameleon_fixup_attribute_decls(&mut new_ag.attributes, &target_ns);
+        }
+        validator.attribute_groups.entry(new_key).or_insert(new_ag);
     }
 
     for (key, mg) in &ext.model_groups {
@@ -531,7 +539,8 @@ fn chameleon_fixup_type_ref(type_ref: &mut TypeRef, target_ns: &Option<String>) 
 }
 
 /// Fix up a type definition for chameleon include.
-/// For complex types, fixes the `base_type` reference and recurses into the content model.
+/// For complex types, fixes the `base_type` reference, the attribute uses,
+/// and recurses into the content model.
 fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
     match td {
         TypeDef::Complex(ref mut ct) => {
@@ -541,10 +550,25 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
                     *ns = target_ns.clone();
                 }
             }
+            chameleon_fixup_attribute_decls(&mut ct.attributes, target_ns);
             chameleon_fixup_content_model(&mut ct.content, target_ns);
         }
         TypeDef::Simple(_) => {
             // Simple types don't reference namespaced components that need fixing
+        }
+    }
+}
+
+/// Fix up attribute uses for chameleon include: references to the module's
+/// global attributes follow those globals into the including schema's target
+/// namespace, and local uses qualified via `form`/`attributeFormDefault`
+/// (whose namespace was None because the module had no targetNamespace) take
+/// the target namespace as well. Local unqualified declarations stay in no
+/// namespace.
+fn chameleon_fixup_attribute_decls(attributes: &mut [AttributeDecl], target_ns: &Option<String>) {
+    for attr in attributes {
+        if (attr.is_ref || attr.qualified) && attr.namespace.is_none() {
+            attr.namespace = target_ns.clone();
         }
     }
 }

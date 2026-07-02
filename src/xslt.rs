@@ -178,6 +178,42 @@ fn collect_rtf_text(node: &ResultNode, out: &mut String) {
     }
 }
 
+fn sanitize_comment_text(text: String) -> XmlResult<String> {
+    if text.contains("--") || text.ends_with('-') {
+        return Err(XmlError::validation(
+            "xsl:comment content must not contain '--' or end with '-'",
+        ));
+    }
+    Ok(text)
+}
+
+fn validate_pi_target(target: &str) -> XmlResult<()> {
+    // Reuse the serializer's full-Unicode NCName check so XSLT construction and
+    // serialization agree on which targets are valid (the ASCII-only check here
+    // previously rejected legal non-ASCII names). NCName already excludes ':'
+    // and whitespace; only the reserved "xml" target needs a separate guard.
+    if !crate::writer::is_valid_xml_ncname(target) {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction target is not a valid NCName",
+        ));
+    }
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction target must not be the reserved name 'xml'",
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_pi_data(data: String) -> XmlResult<String> {
+    if data.contains("?>") {
+        return Err(XmlError::validation(
+            "xsl:processing-instruction data must not contain '?>'",
+        ));
+    }
+    Ok(data)
+}
+
 // ─── Output options (xsl:output) ──────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1416,13 +1452,14 @@ impl<'a, 'b> Engine<'a, 'b> {
             }
             Instruction::Comment { body } => {
                 let items = self.execute_sequence(body, focus)?;
-                let text = rtf_string_value(&items_to_nodes(items));
+                let text = sanitize_comment_text(rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Comment(text)));
             }
             Instruction::Pi { name, body } => {
                 let target = self.eval_avt(name, focus)?;
+                validate_pi_target(&target)?;
                 let items = self.execute_sequence(body, focus)?;
-                let data = rtf_string_value(&items_to_nodes(items));
+                let data = sanitize_pi_data(rtf_string_value(&items_to_nodes(items)))?;
                 out.push(ResultItem::Node(ResultNode::Pi { target, data }));
             }
             Instruction::CallTemplate { name, params } => {

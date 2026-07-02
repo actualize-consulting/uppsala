@@ -25,6 +25,11 @@ use super::types::*;
 use super::wildcard::wildcard_allows_namespace;
 use super::{XSI_NAMESPACE, XS_NAMESPACE};
 
+fn attr_decl_matches(attr: &crate::dom::Attribute<'_>, decl: &AttributeDecl) -> bool {
+    attr.name.local_name == decl.name
+        && attr.name.namespace_uri.as_deref() == decl.namespace.as_deref()
+}
+
 /// Result of resolving an `xsi:type` attribute on an element.
 ///
 /// When an instance element carries `xsi:type`, the validator resolves it to one of:
@@ -504,12 +509,18 @@ impl XsdValidator {
             return ct.attributes.clone();
         }
 
+        // Attribute declarations are namespace-aware: merge and override by
+        // expanded name, not local name, so declarations that share a local
+        // name across namespaces are kept distinct.
+        let same_expanded_name =
+            |a: &AttributeDecl, b: &AttributeDecl| a.name == b.name && a.namespace == b.namespace;
+
         match ct.derived_by_extension {
             Some(true) => {
                 // Extension: base attributes + derived attributes
                 let mut result = base_attrs;
                 for attr in &ct.attributes {
-                    if !result.iter().any(|a| a.name == attr.name) {
+                    if !result.iter().any(|a| same_expanded_name(a, attr)) {
                         result.push(attr.clone());
                     }
                 }
@@ -522,7 +533,10 @@ impl XsdValidator {
                 let mut result = Vec::new();
                 for base_attr in &base_attrs {
                     // Check if the restriction overrides or prohibits this attribute
-                    let override_attr = ct.attributes.iter().find(|a| a.name == base_attr.name);
+                    let override_attr = ct
+                        .attributes
+                        .iter()
+                        .find(|a| same_expanded_name(a, base_attr));
                     if let Some(oa) = override_attr {
                         // Use the overridden version (but check if prohibited)
                         if !oa.prohibited {
@@ -537,7 +551,7 @@ impl XsdValidator {
                 // Also add any new attributes from restriction that aren't in base
                 // (unusual but technically possible)
                 for attr in &ct.attributes {
-                    if !attr.prohibited && !result.iter().any(|a| a.name == attr.name) {
+                    if !attr.prohibited && !result.iter().any(|a| same_expanded_name(a, attr)) {
                         result.push(attr.clone());
                     }
                 }
@@ -648,7 +662,17 @@ impl XsdValidator {
                 self.validate_element(doc, node, &resolved, errors);
                 return;
             }
-            // Fall through with the ref decl's AnyType if global not found
+            let display = decl
+                .namespace
+                .as_ref()
+                .map(|uri| format!("{{{}}}{}", uri, decl.name))
+                .unwrap_or_else(|| decl.name.clone());
+            errors.push(ValidationError {
+                message: format!("Element reference '{}' not found", display),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+            return;
         }
 
         // Reject abstract elements: they cannot appear directly in instances
@@ -994,10 +1018,15 @@ impl XsdValidator {
                     let found = elem
                         .attributes
                         .iter()
-                        .any(|a| a.name.local_name == attr_decl.name);
+                        .any(|a| attr_decl_matches(a, attr_decl));
                     if !found {
+                        let display = attr_decl
+                            .namespace
+                            .as_ref()
+                            .map(|uri| format!("{{{}}}{}", uri, attr_decl.name))
+                            .unwrap_or_else(|| attr_decl.name.clone());
                         errors.push(ValidationError {
-                            message: format!("Required attribute '{}' is missing", attr_decl.name),
+                            message: format!("Required attribute '{}' is missing", display),
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
                         });
@@ -1015,7 +1044,7 @@ impl XsdValidator {
                 if let Some(attr) = elem
                     .attributes
                     .iter()
-                    .find(|a| a.name.local_name == attr_decl.name)
+                    .find(|a| attr_decl_matches(a, attr_decl))
                 {
                     let value = &attr.value;
                     debug_log!(
@@ -1049,9 +1078,8 @@ impl XsdValidator {
                         continue;
                     }
                     // Skip if already matched by an explicit attribute declaration
-                    let already_declared = effective_attrs
-                        .iter()
-                        .any(|ad| ad.name == attr.name.local_name);
+                    let already_declared =
+                        effective_attrs.iter().any(|ad| attr_decl_matches(attr, ad));
                     if already_declared {
                         continue;
                     }
@@ -1080,13 +1108,7 @@ impl XsdValidator {
                         ProcessContents::Lax | ProcessContents::Strict => {
                             // Look up in global attribute declarations
                             let key = (attr_ns_str.clone(), attr.name.local_name.to_string());
-                            let global_decl = self.global_attributes.get(&key).or_else(|| {
-                                let key2 = (
-                                    self.target_namespace.clone(),
-                                    attr.name.local_name.to_string(),
-                                );
-                                self.global_attributes.get(&key2)
-                            });
+                            let global_decl = self.global_attributes.get(&key);
                             match global_decl {
                                 Some(decl) => {
                                     // Validate attribute value against its declared type
@@ -1134,9 +1156,8 @@ impl XsdValidator {
                         continue;
                     }
                     // Check if declared
-                    let already_declared = effective_attrs
-                        .iter()
-                        .any(|ad| ad.name == attr.name.local_name);
+                    let already_declared =
+                        effective_attrs.iter().any(|ad| attr_decl_matches(attr, ad));
                     if !already_declared {
                         errors.push(ValidationError {
                             message: format!(

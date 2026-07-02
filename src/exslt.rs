@@ -24,6 +24,8 @@ use crate::dom::{Document, NodeId};
 use crate::error::XmlResult;
 use crate::xpath::{string_value_of_node, XPathValue};
 
+pub(crate) const MAX_EXSLT_PADDING_LENGTH: usize = 1_000_000;
+
 /// Resolve an EXSLT `prefix:local(args)` call. Returns `None` to fall through to
 /// the engine's "unknown function" handling. `date:date-time()` resolves
 /// regardless of `enabled`; everything else requires `enabled == true`.
@@ -209,6 +211,12 @@ fn str_fn(doc: &Document<'_>, name: &str, args: &[XPathValue]) -> Option<XmlResu
             } else {
                 0
             };
+            if len > MAX_EXSLT_PADDING_LENGTH {
+                return Some(Err(crate::error::XmlError::xpath(format!(
+                    "EXSLT str:padding length {} exceeds maximum {}",
+                    len, MAX_EXSLT_PADDING_LENGTH
+                ))));
+            }
             let pad = args
                 .get(1)
                 .map(|v| v.to_string_value(doc))

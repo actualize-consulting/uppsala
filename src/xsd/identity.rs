@@ -60,17 +60,22 @@ impl XsdValidator {
                         .unwrap_or(&constraint.namespaces);
                     let (value, match_count, source_node) =
                         idc_evaluate_field(doc, sel_node, field_xpath, field_namespaces);
-                    // For xs:key (and xs:unique), if a field selects more than one node,
-                    // that's an error per XSD spec §3.11.4
-                    if match_count > 1 && constraint.kind == IdentityConstraintKind::Key {
+                    // For xs:key and xs:unique, if a field selects more than one node,
+                    // that's an error per XSD spec §3.11.4.
+                    if match_count > 1 {
                         let elem_name = doc
                             .element(sel_node)
                             .map(|e| &*e.name.local_name)
                             .unwrap_or("?");
+                        let kind_str = match constraint.kind {
+                            IdentityConstraintKind::Key => "Key",
+                            IdentityConstraintKind::Unique => "Unique",
+                            _ => "Constraint",
+                        };
                         errors.push(ValidationError {
                             message: format!(
-                                "Key '{}': field '{}' selects {} nodes for element '{}' (must select at most one)",
-                                constraint.name, field_xpath, match_count, elem_name
+                                "{} '{}': field '{}' selects {} nodes for element '{}' (must select at most one)",
+                                kind_str, constraint.name, field_xpath, match_count, elem_name
                             ),
                             line: Some(doc.node_line(sel_node)),
                             column: Some(doc.node_column(sel_node)),
@@ -206,8 +211,24 @@ impl XsdValidator {
                         .field_namespaces
                         .get(field_index)
                         .unwrap_or(&constraint.namespaces);
-                    let (value, _match_count, source_node) =
+                    let (value, match_count, source_node) =
                         idc_evaluate_field(doc, sel_node, field_xpath, field_namespaces);
+                    if match_count > 1 {
+                        let elem_name = doc
+                            .element(sel_node)
+                            .map(|e| &*e.name.local_name)
+                            .unwrap_or("?");
+                        errors.push(ValidationError {
+                            message: format!(
+                                "KeyRef '{}': field '{}' selects {} nodes for element '{}' (must select at most one)",
+                                constraint.name, field_xpath, match_count, elem_name
+                            ),
+                            line: Some(doc.node_line(sel_node)),
+                            column: Some(doc.node_column(sel_node)),
+                        });
+                        all_present = false;
+                        break;
+                    }
                     if value.is_none() {
                         all_present = false;
                     }

@@ -47,6 +47,352 @@ fn is_valid_xml_name(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
+/// Whether a type carries an XSD timezone/fractional-second lexical form whose
+/// enumeration values must be normalized before comparison (e.g. `...+00:00`
+/// vs `...Z`). All XSD date/time types are timezone-bearing; non-temporal types
+/// (string, etc.) must keep their lexical value so a string that merely looks
+/// like a timestamp is not silently normalized.
+fn is_temporal_type(base_type: &BuiltInType) -> bool {
+    matches!(
+        base_type,
+        BuiltInType::DateTime
+            | BuiltInType::Time
+            | BuiltInType::Date
+            | BuiltInType::GYear
+            | BuiltInType::GYearMonth
+            | BuiltInType::GMonth
+            | BuiltInType::GMonthDay
+            | BuiltInType::GDay
+    )
+}
+
+/// Range-validate a value against a date-like temporal base type, so an invalid
+/// facet bound (e.g. `--99` gMonth) is rejected instead of compared lexically.
+fn is_valid_date_like(s: &str, base_type: &BuiltInType) -> bool {
+    match base_type {
+        BuiltInType::Date => is_valid_date(s),
+        BuiltInType::GYear => is_valid_gyear(s),
+        BuiltInType::GYearMonth => is_valid_gyearmonth(s),
+        BuiltInType::GMonth => is_valid_gmonth(s),
+        BuiltInType::GMonthDay => is_valid_gmonthday(s),
+        BuiltInType::GDay => is_valid_gday(s),
+        _ => true,
+    }
+}
+
+/// A temporal value placed on the timeline: `seconds` is UTC-normalized when
+/// the lexical form carries a timezone, otherwise local. Local vs UTC-normalized
+/// instants are only partially ordered (see `compare_temporal_instants`).
+struct TemporalInstant {
+    seconds: i128,
+    fraction: String,
+    has_tz: bool,
+}
+
+/// Maximum timezone offset (14:00) in seconds. Per the XSD order relation on
+/// dateTime (Part 2 section 3.2.7.4), a timezone-less value compared against a
+/// timezoned one is determinate only when they are more than this far apart.
+const MAX_TZ_OFFSET_SECONDS: i128 = 14 * 3_600;
+
+/// Reference year used to place the recurring gMonth/gMonthDay/gDay types on
+/// the timeline for comparison (a leap year, so --02-29 is representable),
+/// mirroring the XSD 1.1 timeline mapping.
+const G_TYPE_REFERENCE_YEAR: i128 = 1972;
+
+fn compare_facet_values(
+    value: &str,
+    facet_value: &str,
+    base_type: &BuiltInType,
+) -> Option<Ordering> {
+    match base_type {
+        BuiltInType::DateTime => compare_datetime_values(value, facet_value),
+        BuiltInType::Time => compare_time_values(value, facet_value),
+        BuiltInType::Date
+        | BuiltInType::GYear
+        | BuiltInType::GYearMonth
+        | BuiltInType::GMonth
+        | BuiltInType::GMonthDay
+        | BuiltInType::GDay => {
+            // Fail closed on lexically-parseable but out-of-range operands, as
+            // compare_datetime_values/compare_time_values do. A raw comparison of
+            // an invalid facet bound would otherwise silently accept instances.
+            if !is_valid_date_like(value, base_type) || !is_valid_date_like(facet_value, base_type)
+            {
+                return None;
+            }
+            let left = date_like_to_instant(value, base_type)?;
+            let right = date_like_to_instant(facet_value, base_type)?;
+            compare_temporal_instants(&left, &right)
+        }
+        _ => Some(compare_values(value, facet_value)),
+    }
+}
+
+fn compare_datetime_values(value: &str, facet_value: &str) -> Option<Ordering> {
+    // Fail closed on lexically-parseable but out-of-range values (e.g. year 0000,
+    // month 99, hour 99). Facet values are stored as raw strings and are not
+    // otherwise range-checked, so an invalid minInclusive/maxInclusive must not
+    // yield a comparable ordering.
+    if !is_valid_datetime(value) || !is_valid_datetime(facet_value) {
+        return None;
+    }
+    let left = datetime_to_instant(value)?;
+    let right = datetime_to_instant(facet_value)?;
+    compare_temporal_instants(&left, &right)
+}
+
+fn compare_time_values(value: &str, facet_value: &str) -> Option<Ordering> {
+    // Fail closed on out-of-range time strings (e.g. 99:99:99Z); see
+    // compare_datetime_values for the rationale.
+    if !is_valid_time(value) || !is_valid_time(facet_value) {
+        return None;
+    }
+    let left = time_to_instant(value)?;
+    let right = time_to_instant(facet_value)?;
+    compare_temporal_instants(&left, &right)
+}
+
+fn datetime_to_instant(value: &str) -> Option<TemporalInstant> {
+    let (date, time) = value.split_once('T')?;
+    let (year, month, day) = parse_xsd_date_parts(date)?;
+    let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(time)?;
+    let days = days_from_civil(year, month, day);
+    let local_seconds =
+        days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    Some(TemporalInstant {
+        seconds: local_seconds - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: normalize_fraction(&fraction),
+        has_tz: offset_minutes.is_some(),
+    })
+}
+
+fn time_to_instant(value: &str) -> Option<TemporalInstant> {
+    let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(value)?;
+    let local_seconds = i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    Some(TemporalInstant {
+        seconds: local_seconds - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: normalize_fraction(&fraction),
+        has_tz: offset_minutes.is_some(),
+    })
+}
+
+/// Map a date-like temporal value (date, gYear, gYearMonth, gMonth, gMonthDay,
+/// gDay) onto the timeline as the starting instant of its period, so ordering
+/// honors timezone offsets and numeric years instead of lexical form.
+fn date_like_to_instant(value: &str, base_type: &BuiltInType) -> Option<TemporalInstant> {
+    let (body, offset_minutes) = split_tz_suffix(value);
+    let (year, month, day) = match base_type {
+        BuiltInType::Date => parse_xsd_date_parts(body)?,
+        BuiltInType::GYear => (body.parse().ok()?, 1, 1),
+        BuiltInType::GYearMonth => {
+            let (year, month) = body.rsplit_once('-')?;
+            (year.parse().ok()?, month.parse().ok()?, 1)
+        }
+        BuiltInType::GMonth => {
+            // Accept --MM and the XSD 1.0 legacy --MM-- form.
+            let month = body.strip_prefix("--")?.trim_end_matches("--");
+            (G_TYPE_REFERENCE_YEAR, month.parse().ok()?, 1)
+        }
+        BuiltInType::GMonthDay => {
+            let (month, day) = body.strip_prefix("--")?.split_once('-')?;
+            (
+                G_TYPE_REFERENCE_YEAR,
+                month.parse().ok()?,
+                day.parse().ok()?,
+            )
+        }
+        BuiltInType::GDay => (
+            G_TYPE_REFERENCE_YEAR,
+            1,
+            body.strip_prefix("---")?.parse().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(TemporalInstant {
+        seconds: days_from_civil(year, month, day) * 86_400
+            - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        fraction: String::new(),
+        has_tz: offset_minutes.is_some(),
+    })
+}
+
+/// Compare two timeline instants per XSD's partial order: values that both
+/// carry (or both omit) a timezone are totally ordered; a timezone-less value
+/// against a timezoned one is determinate only when more than 14 hours apart.
+/// Indeterminate comparisons return None, which the facet checks report as an
+/// error (fail closed) instead of assuming UTC.
+fn compare_temporal_instants(left: &TemporalInstant, right: &TemporalInstant) -> Option<Ordering> {
+    match (left.has_tz, right.has_tz) {
+        (true, true) | (false, false) => Some(compare_instant_parts(
+            left.seconds,
+            &left.fraction,
+            right.seconds,
+            &right.fraction,
+        )),
+        (false, true) => {
+            // Timezone-less left could lie anywhere in [-14:00, +14:00]:
+            // left < right only if even its latest interpretation is earlier,
+            // and left > right only if even its earliest one is later.
+            if compare_instant_parts(
+                left.seconds + MAX_TZ_OFFSET_SECONDS,
+                &left.fraction,
+                right.seconds,
+                &right.fraction,
+            ) == Ordering::Less
+            {
+                Some(Ordering::Less)
+            } else if compare_instant_parts(
+                left.seconds - MAX_TZ_OFFSET_SECONDS,
+                &left.fraction,
+                right.seconds,
+                &right.fraction,
+            ) == Ordering::Greater
+            {
+                Some(Ordering::Greater)
+            } else {
+                None
+            }
+        }
+        (true, false) => compare_temporal_instants(right, left).map(Ordering::reverse),
+    }
+}
+
+fn compare_instant_parts(
+    left_seconds: i128,
+    left_fraction: &str,
+    right_seconds: i128,
+    right_fraction: &str,
+) -> Ordering {
+    match left_seconds.cmp(&right_seconds) {
+        Ordering::Equal => compare_fraction(left_fraction, right_fraction),
+        ord => ord,
+    }
+}
+
+fn normalize_fraction(fraction: &str) -> String {
+    fraction.trim_end_matches('0').to_string()
+}
+
+fn compare_fraction(left: &str, right: &str) -> Ordering {
+    // Digit-wise comparison with an implied '0' past the shorter end. The
+    // fractional part is attacker-sized (validation allows any number of
+    // digits), so nothing is allocated: the shared prefix is an ordered byte
+    // slice comparison (lowered to SIMD-optimized memcmp) and the leftover
+    // tail only decides the ordering if it contains a non-zero digit. Both
+    // strings are ASCII digits by the time they reach a comparison.
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let shared = left.len().min(right.len());
+    match left[..shared].cmp(&right[..shared]) {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+    if left[shared..].iter().any(|&b| b != b'0') {
+        Ordering::Greater
+    } else if right[shared..].iter().any(|&b| b != b'0') {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
+}
+
+fn parse_xsd_date_parts(date: &str) -> Option<(i128, u32, u32)> {
+    let (negative, rest) = date
+        .strip_prefix('-')
+        .map(|s| (true, s))
+        .unwrap_or((false, date));
+    let mut parts = rest.split('-');
+    let year_str = parts.next()?;
+    let month_str = parts.next()?;
+    let day_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let year: i128 = year_str.parse().ok()?;
+    let month: u32 = month_str.parse().ok()?;
+    let day: u32 = day_str.parse().ok()?;
+    Some((if negative { -year } else { year }, month, day))
+}
+
+fn parse_xsd_time_parts(time: &str) -> Option<(u32, u32, u32, String, Option<i32>)> {
+    let (time, offset_minutes) = split_tz_suffix(time);
+    let mut parts = time.split(':');
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (second_str, frac_str) = second_part.split_once('.').unwrap_or((second_part, ""));
+    let second: u32 = second_str.parse().ok()?;
+    if !frac_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((hour, minute, second, frac_str.to_string(), offset_minutes))
+}
+
+/// Split an optional trailing timezone (`Z` or `+hh:mm`/`-hh:mm`) from a
+/// temporal lexical form. Returns the remaining body and the offset in
+/// minutes; a missing timezone is `None`, not UTC. Unrecognized suffixes are
+/// left in the body, where the callers' numeric parsing fails closed (the
+/// overall lexical form is range-validated separately before comparison).
+fn split_tz_suffix(s: &str) -> (&str, Option<i32>) {
+    if let Some(stripped) = s.strip_suffix('Z') {
+        return (stripped, Some(0));
+    }
+    if s.len() >= 6 {
+        let tz_start = s.len() - 6;
+        let tz = &s.as_bytes()[tz_start..];
+        if !tz.is_ascii() {
+            return (s, None);
+        }
+        let sign = match tz[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return (s, None),
+        };
+        if tz[3] != b':' {
+            return (s, None);
+        }
+        if let (Ok(hours), Ok(minutes)) = (
+            s[tz_start + 1..tz_start + 3].parse::<i32>(),
+            s[tz_start + 4..].parse::<i32>(),
+        ) {
+            return (&s[..tz_start], Some(sign * (hours * 60 + minutes)));
+        }
+    }
+    (s, None)
+}
+
+fn days_from_civil(year: i128, month: u32, day: u32) -> i128 {
+    let mut y = year;
+    let m = i128::from(month);
+    y -= i128::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i128::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn push_facet_compare_error(
+    facet_name: &str,
+    value: &str,
+    facet_value: &str,
+    doc: &Document,
+    node: NodeId,
+    errors: &mut Vec<ValidationError>,
+) {
+    errors.push(ValidationError {
+        message: format!(
+            "Cannot compare value '{}' with {} {} for this datatype",
+            value, facet_name, facet_value
+        ),
+        line: Some(doc.node_line(node)),
+        column: Some(doc.node_column(node)),
+    });
+}
+
 /// Check if a string is a valid QName (prefix:localname or just localname).
 /// Both prefix and localname must be valid NCNames.
 /// Covers MS tests: QName001/004/005/007/008/010/011
@@ -679,6 +1025,16 @@ pub(crate) fn validate_builtin_value(
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
+            } else if let Some(colon_pos) = v.find(':') {
+                let prefix = &v[..colon_pos];
+                let resolver = build_resolver_for_node(doc, node);
+                if resolver.resolve(prefix).is_none() {
+                    errors.push(ValidationError {
+                        message: format!("QName prefix '{}' is not bound", prefix),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
             }
         }
     }
@@ -738,14 +1094,20 @@ pub(crate) fn validate_list_facet(
         }
         Facet::Pattern(pattern) => {
             // Pattern facets on lists apply to the whole collapsed space-separated value
-            if let Ok(re) = XsdRegex::compile(pattern) {
-                if !re.is_match(text) {
+            match XsdRegex::compile(pattern) {
+                Ok(re) if !re.is_match(text) => {
                     errors.push(ValidationError {
                         message: format!("Value '{}' does not match pattern '{}'", text, pattern),
                         line: Some(doc.node_line(node)),
                         column: Some(doc.node_column(node)),
                     });
                 }
+                Ok(_) => {}
+                Err(e) => errors.push(ValidationError {
+                    message: format!("Pattern facet '{}' could not be compiled: {}", pattern, e),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                }),
             }
         }
         Facet::WhiteSpace(_) => {}
@@ -864,9 +1226,17 @@ pub(crate) fn validate_facet(
             }
         }
         Facet::Enumeration(values) => {
-            let text_normalized = normalize_datetime_tz(text.trim());
+            let text_normalized = if is_temporal_type(base_type) {
+                normalize_datetime_tz(text.trim())
+            } else {
+                text.trim().to_string()
+            };
             let match_found = values.iter().any(|v| {
-                let v_normalized = normalize_datetime_tz(v.trim());
+                let v_normalized = if is_temporal_type(base_type) {
+                    normalize_datetime_tz(v.trim())
+                } else {
+                    v.trim().to_string()
+                };
                 v_normalized == text_normalized
             });
             if !match_found {
@@ -877,27 +1247,30 @@ pub(crate) fn validate_facet(
                 });
             }
         }
-        Facet::MinInclusive(min) => {
-            if compare_values(text.trim(), min) == Ordering::Less {
+        Facet::MinInclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
+            Some(Ordering::Less) => {
                 errors.push(ValidationError {
                     message: format!("Value '{}' is less than minInclusive {}", text.trim(), min),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MaxInclusive(max) => {
-            if compare_values(text.trim(), max) == Ordering::Greater {
+            Some(_) => {}
+            None => push_facet_compare_error("minInclusive", text.trim(), min, doc, node, errors),
+        },
+        Facet::MaxInclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
+            Some(Ordering::Greater) => {
                 errors.push(ValidationError {
                     message: format!("Value '{}' exceeds maxInclusive {}", text.trim(), max),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MinExclusive(min) => {
-            let cmp = compare_values(text.trim(), min);
-            if cmp == Ordering::Less || cmp == Ordering::Equal {
+            Some(_) => {}
+            None => push_facet_compare_error("maxInclusive", text.trim(), max, doc, node, errors),
+        },
+        Facet::MinExclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
+            Some(Ordering::Less | Ordering::Equal) => {
                 errors.push(ValidationError {
                     message: format!(
                         "Value '{}' is not greater than minExclusive {}",
@@ -908,10 +1281,11 @@ pub(crate) fn validate_facet(
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
-        Facet::MaxExclusive(max) => {
-            let cmp = compare_values(text.trim(), max);
-            if cmp == Ordering::Greater || cmp == Ordering::Equal {
+            Some(_) => {}
+            None => push_facet_compare_error("minExclusive", text.trim(), min, doc, node, errors),
+        },
+        Facet::MaxExclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
+            Some(Ordering::Greater | Ordering::Equal) => {
                 errors.push(ValidationError {
                     message: format!(
                         "Value '{}' is not less than maxExclusive {}",
@@ -922,7 +1296,9 @@ pub(crate) fn validate_facet(
                     column: Some(doc.node_column(node)),
                 });
             }
-        }
+            Some(_) => {}
+            None => push_facet_compare_error("maxExclusive", text.trim(), max, doc, node, errors),
+        },
         Facet::TotalDigits(max_digits) => {
             let digits: String = text.trim().chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.len() > *max_digits {
@@ -953,19 +1329,21 @@ pub(crate) fn validate_facet(
                 }
             }
         }
-        Facet::Pattern(pattern) => {
-            if let Ok(re) = XsdRegex::compile(pattern) {
-                if !re.is_match(text) {
-                    errors.push(ValidationError {
-                        message: format!("Value '{}' does not match pattern '{}'", text, pattern),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
+        Facet::Pattern(pattern) => match XsdRegex::compile(pattern) {
+            Ok(re) if !re.is_match(text) => {
+                errors.push(ValidationError {
+                    message: format!("Value '{}' does not match pattern '{}'", text, pattern),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
             }
-            // If the pattern fails to compile, we silently accept
-            // (graceful degradation for unsupported regex features)
-        }
+            Ok(_) => {}
+            Err(e) => errors.push(ValidationError {
+                message: format!("Pattern facet '{}' could not be compiled: {}", pattern, e),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            }),
+        },
         Facet::WhiteSpace(_) => {
             // White space normalization is applied during parsing
         }

@@ -352,7 +352,7 @@ pub(crate) fn is_valid_date(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     // Handle negative years
     if s.starts_with('-') {
-        if parts.len() < 4 {
+        if parts.len() != 4 {
             return false;
         }
         // parts[0] is empty, parts[1] is year, parts[2] month, parts[3] day
