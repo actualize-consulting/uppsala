@@ -1760,15 +1760,18 @@ impl<'a> Document<'a> {
                     } else {
                         let safe = crate::writer::safe_xml_ncname(prefix).into_owned();
                         let mut candidate = safe.clone();
+                        // Build the full `xmlns:<candidate>` name once per suffix
+                        // attempt and reuse it for the membership test and the
+                        // final push, rather than re-`format!`ing it inside the
+                        // predicate for every entry already in `seen_attrs`.
+                        let mut full = format!("xmlns:{}", candidate);
                         let mut suffix = 1usize;
-                        while seen_attrs
-                            .iter()
-                            .any(|name| *name == format!("xmlns:{}", candidate))
-                        {
+                        while seen_attrs.iter().any(|name| name.as_ref() == full) {
                             candidate = format!("{}_{}", safe, suffix);
+                            full = format!("xmlns:{}", candidate);
                             suffix += 1;
                         }
-                        seen_attrs.push(Cow::Owned(format!("xmlns:{}", candidate)));
+                        seen_attrs.push(Cow::Owned(full));
                         out.write_str(" xmlns:")?;
                         out.write_str(&candidate)?;
                         out.write_str("=\"")?;

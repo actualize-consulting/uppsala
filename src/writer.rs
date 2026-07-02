@@ -528,7 +528,7 @@ pub(crate) fn unique_safe_xml_qname<'a>(s: &'a str, seen: &mut Vec<Cow<'a, str>>
     let mut suffix = 1usize;
     loop {
         let candidate = format!("{}_{}", base, suffix);
-        if !seen.iter().any(|n| *n == candidate) {
+        if !seen.iter().any(|n| n.as_ref() == candidate) {
             seen.push(Cow::Owned(candidate.clone()));
             return Cow::Owned(candidate);
         }
@@ -546,7 +546,7 @@ pub(crate) fn unique_safe_xml_qname_owned(s: String, seen: &mut Vec<Cow<'_, str>
     } else {
         "_".to_string()
     };
-    if !seen.iter().any(|n| *n == base) {
+    if !seen.iter().any(|n| n.as_ref() == base) {
         seen.push(Cow::Owned(base.clone()));
         return base;
     }
@@ -554,7 +554,7 @@ pub(crate) fn unique_safe_xml_qname_owned(s: String, seen: &mut Vec<Cow<'_, str>
     let mut suffix = 1usize;
     loop {
         let candidate = format!("{}_{}", base, suffix);
-        if !seen.iter().any(|n| *n == candidate) {
+        if !seen.iter().any(|n| n.as_ref() == candidate) {
             seen.push(Cow::Owned(candidate.clone()));
             return candidate;
         }
