@@ -516,6 +516,31 @@ fn function_substring() {
 }
 
 #[test]
+fn function_substring_spec_edge_cases() {
+    // XPath 1.0 §4.2 examples, plus the fuzz_xpath overflow regression: a
+    // huge-negative or -inf start argument previously evaluated
+    // `round() as i64 - 1`, whose saturated cast overflowed (`i64::MIN - 1`,
+    // a panic under debug overflow checks). Bounds are now compared in f64.
+    for (expr, expected) in [
+        ("substring('12345', 1.5, 2.6)", "234"),
+        ("substring('12345', 0, 3)", "12"),
+        ("substring('12345', 0 div 0, 3)", ""),
+        ("substring('12345', 1, 0 div 0)", ""),
+        ("substring('12345', -42, 1 div 0)", "12345"),
+        ("substring('12345', -1 div 0, 1 div 0)", ""),
+        ("substring('12345', -1 div 0)", "12345"),
+        ("substring('12345', 0 div 0)", ""),
+        ("substring('12345', -100000000000000000000)", "12345"),
+        ("substring('12345', -100000000000000000000, 3)", ""),
+    ] {
+        match parse_and_eval("<r/>", expr) {
+            XPathValue::String(s) => assert_eq!(s, expected, "{expr}"),
+            _ => panic!("Expected string for {expr}"),
+        }
+    }
+}
+
+#[test]
 fn function_substring_before() {
     let val = parse_and_eval("<r/>", "substring-before('1999/04/01', '/')");
     match val {
