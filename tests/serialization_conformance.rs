@@ -1243,3 +1243,43 @@ fn declare_namespace_upserts_existing_prefix() {
     let txt = doc.create_text("x");
     assert!(!doc.declare_namespace(txt, Some("p"), "urn:x"));
 }
+
+#[test]
+fn ns_reserved_prefix_strip_undeclares_default_namespace() {
+    // Regression (fuzz_roundtrip, ADR 0017): stripping a reserved `xml`/`xmlns`
+    // prefix leaves an unprefixed name in no namespace. If a non-empty default
+    // namespace is in scope, the bare name must be emitted with `xmlns=""`;
+    // otherwise the re-parse captures it into the default namespace, silently
+    // changing the element's namespace (and, when the default was the XML
+    // namespace, breaking the byte-level fixpoint via `xml:` re-prefixing).
+    let input = r#"<r xmlns="urn:x"><xmlns:c/></r>"#;
+    let out1 = uppsala::parse(input).unwrap().to_xml();
+    assert!(
+        out1.contains(r#"<c xmlns=""/>"#),
+        "stripped name must undeclare the default namespace: {out1}"
+    );
+    let doc2 = uppsala::parse(&out1).unwrap();
+    assert_eq!(out1, doc2.to_xml(), "not a one-pass fixpoint: {out1}");
+    let root = doc2.document_element().unwrap();
+    let child = doc2.children_iter(root).next().unwrap();
+    assert_eq!(
+        doc2.element(child).unwrap().name.namespace_uri.as_deref(),
+        None,
+        "stripped element must stay in no namespace: {out1}"
+    );
+}
+
+#[test]
+fn ns_default_declaration_of_xml_namespace_is_never_emitted() {
+    use uppsala::{Document, QName};
+    // A programmatic default-namespace binding to the XML namespace is not
+    // representable (the parser rejects `xmlns="...XML/1998/namespace"`), so
+    // the serializer drops it rather than emit output that does not re-parse.
+    let mut doc = Document::new();
+    let el = doc.create_element(QName::local("r"));
+    doc.append_child(doc.root(), el);
+    doc.declare_namespace(el, None, "http://www.w3.org/XML/1998/namespace");
+    let out = doc.to_xml();
+    assert_eq!(out, "<r/>", "forbidden default declaration must be dropped");
+    uppsala::parse(&out).expect("output must re-parse");
+}

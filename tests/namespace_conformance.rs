@@ -283,3 +283,64 @@ fn error_undeclared_prefix_on_attribute() {
         "Undeclared prefix on attribute should be an error"
     );
 }
+
+#[test]
+fn error_reserved_namespace_as_default() {
+    // Namespaces in XML 1.0 §3: the XML and XMLNS namespace names must not be
+    // declared as the default namespace. Regression (fuzz_roundtrip, ADR 0017):
+    // accepting the binding made unprefixed child elements resolve into the XML
+    // namespace, which the serializer can only represent by re-prefixing with
+    // `xml:`, breaking the parse->serialize fixpoint.
+    for xml in [
+        r#"<r xmlns="http://www.w3.org/XML/1998/namespace"/>"#,
+        r#"<r xmlns="http://www.w3.org/2000/xmlns/"/>"#,
+    ] {
+        assert!(
+            uppsala::parse(xml).is_err(),
+            "reserved namespace as default must be rejected: {xml}"
+        );
+    }
+}
+
+#[test]
+fn error_xml_namespace_bound_to_other_prefix() {
+    // §3: no prefix other than `xml` may be bound to the XML namespace, and the
+    // XMLNS namespace may not be bound to any prefix.
+    for xml in [
+        r#"<r xmlns:foo="http://www.w3.org/XML/1998/namespace"/>"#,
+        r#"<r xmlns:foo="http://www.w3.org/2000/xmlns/"/>"#,
+    ] {
+        assert!(
+            uppsala::parse(xml).is_err(),
+            "reserved namespace bound to a prefix must be rejected: {xml}"
+        );
+    }
+}
+
+#[test]
+fn error_xmlns_declaration_prefix_must_be_ncname() {
+    // The prefix in an `xmlns:*` declaration must be an NCName. Regression
+    // (fuzz_roundtrip, ADR 0017): `xmlns:=` (empty prefix) was silently treated
+    // as a *default* namespace declaration, and `xmlns:a:b=` declared the
+    // multi-colon prefix `a:b`.
+    for xml in [r#"<r xmlns:="urn:x"/>"#, r#"<r xmlns:a:b="urn:x"/>"#] {
+        assert!(
+            uppsala::parse(xml).is_err(),
+            "non-NCName declaration prefix must be rejected: {xml}"
+        );
+    }
+}
+
+#[test]
+fn xml_prefix_may_be_declared_with_its_own_uri() {
+    // §3: the `xml` prefix MAY be (redundantly) declared when bound to the XML
+    // namespace; the stricter reserved-binding checks must not reject it.
+    let xml = r#"<r xmlns:xml="http://www.w3.org/XML/1998/namespace"><xml:a/></r>"#;
+    let doc = uppsala::parse(xml).expect("redundant xml declaration is legal");
+    let root = doc.document_element().unwrap();
+    let child = doc.children_iter(root).next().unwrap();
+    assert_eq!(
+        doc.element(child).unwrap().name.namespace_uri.as_deref(),
+        Some("http://www.w3.org/XML/1998/namespace")
+    );
+}

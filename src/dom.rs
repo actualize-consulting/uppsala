@@ -2090,6 +2090,24 @@ fn ensure_binding<'e>(
     Some(prefix_for_or_alloc(scope, child_local, uri))
 }
 
+/// If a non-empty default namespace is in scope (inherited or declared on this
+/// element), record an `xmlns=""` undeclaration so an unprefixed element name
+/// emitted here is not captured by that default namespace on re-parse. Used for
+/// elements in no namespace and for elements whose reserved/unrepresentable
+/// prefix the planner strips down to a bare local name (ADR 0017).
+fn undeclare_default_ns(scope: &NsScope, child_local: &mut Vec<NsDecl<'_>>) {
+    let default_ns_set = {
+        let cur = NsScope {
+            parent: Some(scope),
+            local: child_local,
+        };
+        cur.resolve("").is_some_and(|d| !d.is_empty())
+    };
+    if default_ns_set {
+        child_local.push((Cow::Borrowed(""), Cow::Borrowed("")));
+    }
+}
+
 /// Compute the namespace bindings a serialized element introduces so its own
 /// QName and its attributes' QNames resolve correctly under the inherited
 /// `scope`. Returns:
@@ -2116,15 +2134,18 @@ fn plan_element_namespaces<'e>(
     let xmlns_ns = crate::namespace::XMLNS_NAMESPACE;
     // Borrow the stored declarations, but drop the reserved bindings the parser's
     // `NamespaceResolver::declare` ignores (namespace.rs): the `xmlns` prefix can
-    // never be declared, the `xml` prefix may only bind the XML namespace, and no
-    // prefix may bind the XMLNS namespace. Emitting them (e.g. `xmlns:xmlns=...`)
-    // would produce namespace-not-well-formed output.
+    // never be declared, the `xml` prefix may only bind the XML namespace, the
+    // XML namespace may only be bound to the `xml` prefix (in particular never
+    // as the default namespace), and no prefix may bind the XMLNS namespace.
+    // Emitting them (e.g. `xmlns:xmlns=...`) would produce
+    // namespace-not-well-formed output.
     let mut child_local: Vec<NsDecl<'e>> = elem
         .namespace_declarations
         .iter()
         .filter(|(p, u)| {
             p.as_ref() != "xmlns"
                 && !(p.as_ref() == "xml" && u.as_ref() != xml_ns)
+                && !(u.as_ref() == xml_ns && p.as_ref() != "xml")
                 && u.as_ref() != xmlns_ns
         })
         .map(|(p, u)| (Cow::Borrowed(p.as_ref()), Cow::Borrowed(u.as_ref())))
@@ -2139,16 +2160,7 @@ fn plan_element_namespaces<'e>(
             // Unprefixed element in no namespace: if a non-empty default
             // namespace is in scope it would otherwise capture this element, so
             // undeclare it with `xmlns=""`.
-            let default_ns = {
-                let cur = NsScope {
-                    parent: Some(scope),
-                    local: &child_local,
-                };
-                cur.resolve("").map(|s| s.to_string())
-            };
-            if matches!(default_ns.as_deref(), Some(d) if !d.is_empty()) {
-                child_local.push((Cow::Borrowed(""), Cow::Borrowed("")));
-            }
+            undeclare_default_ns(scope, &mut child_local);
             None
         }
         // A reserved prefix with no namespace URI must still be stripped: `xml`
@@ -2159,7 +2171,11 @@ fn plan_element_namespaces<'e>(
         // name (`xmlns:xmlns:C` → local `xmlns:C`), and emitting that verbatim
         // would re-parse as a *new* `xmlns`-prefixed element, so serialization
         // would strip one layer per round instead of being a one-pass fixpoint.
+        // The stripped name is unprefixed and in no namespace, so like the
+        // `(None, None)` arm it must not be captured by an in-scope default
+        // namespace (ADR 0017).
         (Some("xml"), None) | (Some("xmlns"), None) => {
+            undeclare_default_ns(scope, &mut child_local);
             Some(crate::writer::safe_xml_ncname(&elem.name.local_name).into_owned())
         }
         (Some(_), None) => None, // prefixed but no URI: leave the name as-is
@@ -2175,8 +2191,11 @@ fn plan_element_namespaces<'e>(
         // The namespace is unrepresentable, so drop it and serialize the bare
         // local name (never emitting an `xmlns`/`xmlns:*` name). NCName-sanitize
         // it so a multi-colon local name cannot re-form a prefixed name on
-        // re-parse (see the reserved-prefix arm above).
+        // re-parse (see the reserved-prefix arm above), and undeclare any
+        // in-scope default namespace so the bare name is not captured by it
+        // (ADR 0017).
         (_, Some(u)) if u == xmlns_ns => {
+            undeclare_default_ns(scope, &mut child_local);
             Some(crate::writer::safe_xml_ncname(&elem.name.local_name).into_owned())
         }
         // The reserved `xml`/`xmlns` prefixes bound to any *other* (representable)
