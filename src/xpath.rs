@@ -2135,6 +2135,26 @@ fn matches_node_test(
     }
 }
 
+/// XPath 1.0 §4.4 `round()`: the nearest integer, with a half-way value
+/// rounded toward positive infinity — `round(-2.5)` is `-2`, where
+/// `f64::round` (ties away from zero) gives `-3`. The two agree everywhere
+/// else, so only negative exact halves are corrected. NaN and ±inf pass
+/// through, and `round(-0.5)` keeps the negative-zero sign the spec assigns.
+fn xpath_round(n: f64) -> f64 {
+    let r = n.round();
+    if n - r == 0.5 {
+        // Away-from-zero took a negative exact half down; ties go up.
+        let up = r + 1.0;
+        if up == 0.0 {
+            -0.0
+        } else {
+            up
+        }
+    } else {
+        r
+    }
+}
+
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<XPathValue> {
     match name {
         "last" => Ok(XPathValue::Number(ctx.size as f64)),
@@ -2261,22 +2281,32 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
                 return Err(XmlError::xpath("substring() takes 2 or 3 arguments"));
             }
             let s = evaluate_expr(&args[0], ctx)?.to_string_value(ctx.doc);
-            let start = evaluate_expr(&args[1], ctx)?.to_number(ctx.doc).round() as i64 - 1;
-            let chars: Vec<char> = s.chars().collect();
-            let start = start.max(0) as usize;
-            if args.len() == 3 {
-                let len = evaluate_expr(&args[2], ctx)?.to_number(ctx.doc).round() as usize;
-                let begin = start.min(chars.len());
-                // `saturating_add` avoids the usize overflow that a huge/`inf`
-                // length argument would otherwise cause (debug panic / release
-                // wrap into an out-of-order slice).
-                let end = start.saturating_add(len).min(chars.len()).max(begin);
-                let result: String = chars[begin..end].iter().collect();
-                Ok(XPathValue::String(result))
+            // XPath 1.0 §4.2: character positions are 1-based and selected by
+            // numeric comparison — position >= round(start) and, in the 3-arg
+            // form, position < round(start) + round(length), with `round` the
+            // XPath ties-toward-+inf rounding (`xpath_round`, shared with the
+            // round() function so `substring(s, -2.5)` and
+            // `substring(s, round(-2.5))` agree). Comparing in f64 keeps the
+            // spec's NaN/infinity semantics (a NaN bound selects nothing, an
+            // infinite length everything after start) and has no integer
+            // casts, whose saturation previously overflowed on a
+            // huge-negative or -inf start (`i64::MIN - 1`, fuzz_xpath).
+            let start = xpath_round(evaluate_expr(&args[1], ctx)?.to_number(ctx.doc));
+            let end = if args.len() == 3 {
+                start + xpath_round(evaluate_expr(&args[2], ctx)?.to_number(ctx.doc))
             } else {
-                let result: String = chars[start.min(chars.len())..].iter().collect();
-                Ok(XPathValue::String(result))
-            }
+                f64::INFINITY
+            };
+            let result: String = s
+                .chars()
+                .enumerate()
+                .filter(|(i, _)| {
+                    let p = (i + 1) as f64;
+                    p >= start && p < end
+                })
+                .map(|(_, c)| c)
+                .collect();
+            Ok(XPathValue::String(result))
         }
         "substring-before" => {
             if args.len() != 2 {
@@ -2406,7 +2436,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
                 return Err(XmlError::xpath("round() takes exactly 1 argument"));
             }
             let n = evaluate_expr(&args[0], ctx)?.to_number(ctx.doc);
-            Ok(XPathValue::Number(n.round()))
+            Ok(XPathValue::Number(xpath_round(n)))
         }
         "id" => {
             if args.len() != 1 {

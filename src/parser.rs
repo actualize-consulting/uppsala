@@ -2496,6 +2496,20 @@ fn parse_element<'a>(
                     cursor.column(),
                 ));
             }
+            // Namespaces in XML 1.0 §3: the XML and XMLNS namespace names must
+            // not be declared as the default namespace. Accepting them makes
+            // unprefixed names resolve to a reserved namespace, which the
+            // serializer can only represent by re-prefixing (`xml:`) — breaking
+            // the parse→serialize fixpoint (ADR 0017).
+            if &*attr_value == crate::namespace::XML_NAMESPACE
+                || &*attr_value == crate::namespace::XMLNS_NAMESPACE
+            {
+                return Err(XmlError::namespace(
+                    "Reserved namespace must not be declared as the default namespace",
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
             ns_decls.push((Cow::Borrowed(""), attr_value));
         } else if let Some(prefix) = attr_name.strip_prefix("xmlns:") {
             if prefix == "xmlns" {
@@ -2505,9 +2519,35 @@ fn parse_element<'a>(
                     cursor.column(),
                 ));
             }
-            if prefix == "xml" && &*attr_value != "http://www.w3.org/XML/1998/namespace" {
+            // The declared prefix must be an NCName: rejects the empty prefix
+            // (`xmlns:=`, which would otherwise masquerade as a default
+            // declaration) and multi-colon names (`xmlns:a:b=`).
+            if !crate::writer::is_valid_xml_ncname(prefix) {
+                return Err(XmlError::namespace(
+                    format!("Invalid namespace declaration name: {}", attr_name),
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
+            if prefix == "xml" && &*attr_value != crate::namespace::XML_NAMESPACE {
                 return Err(XmlError::namespace(
                     "The prefix 'xml' must not be bound to any other namespace",
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
+            // §3 again: no other prefix may bind the XML namespace, and the
+            // XMLNS namespace may not be bound at all.
+            if prefix != "xml" && &*attr_value == crate::namespace::XML_NAMESPACE {
+                return Err(XmlError::namespace(
+                    "The XML namespace must not be bound to another prefix",
+                    cursor.line(),
+                    cursor.column(),
+                ));
+            }
+            if &*attr_value == crate::namespace::XMLNS_NAMESPACE {
+                return Err(XmlError::namespace(
+                    "The xmlns namespace must not be declared",
                     cursor.line(),
                     cursor.column(),
                 ));

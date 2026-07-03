@@ -89,12 +89,17 @@ impl<'a> NamespaceResolver<'a> {
     /// * the prefix `xml` bound to anything other than
     ///   `http://www.w3.org/XML/1998/namespace`
     /// * the prefix `xmlns` (may never be declared)
+    /// * any prefix other than `xml` — including the default namespace —
+    ///   bound to `http://www.w3.org/XML/1998/namespace`
     /// * any prefix bound to `http://www.w3.org/2000/xmlns/`
     pub fn declare(&mut self, prefix: Cow<'a, str>, uri: Cow<'a, str>) {
         if &*prefix == "xmlns" {
             return;
         }
         if &*prefix == "xml" && &*uri != XML_NAMESPACE {
+            return;
+        }
+        if &*uri == XML_NAMESPACE && &*prefix != "xml" {
             return;
         }
         if &*uri == XMLNS_NAMESPACE {
