@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-03
+
+### Added
+
+- In-repo cargo-fuzz / libFuzzer harness suite (`audit/fuzz/`, ADR 0014) with
+  eleven targets covering the untrusted-input surfaces: the parser (`&str` and
+  bytes/UTF-16 entry points), a parse→serialize→reparse round-trip fixpoint
+  oracle, arbitrary-DOM serialization, DOM mutation + `prepare_xpath()`, XPath,
+  XSLT transforms, the XSD builder, the XSD regex engine, and two differential
+  harnesses that assert the `unsafe` SSE2 SIMD scanners return byte-identical
+  results to their scalar references. The harness crate is a detached workspace,
+  so the library keeps its zero-dependency guarantee; a fuzz-only `fuzzing`
+  feature (off by default, no dependencies) exposes the internal scan halves via
+  `uppsala::fuzz_exports`. Crash inputs found and fixed during the campaign are
+  preserved as tracked regression seeds under `audit/fuzz/seeds/`.
+
+### Changed
+
+- The parser now enforces the reserved namespace-binding rules of Namespaces in
+  XML 1.0 (Third Edition) §3 and rejects: the XML or XMLNS namespace declared as
+  the default namespace, the XML namespace bound to any prefix other than `xml`,
+  any binding of the XMLNS namespace, and `xmlns:*` declarations whose prefix is
+  not an NCName (`xmlns:=`, `xmlns:a:b=`). Such documents were never
+  namespace-well-formed (conformant parsers reject them) but were previously
+  accepted, which made serialization non-idempotent. The redundant, legal
+  `xmlns:xml="http://www.w3.org/XML/1998/namespace"` is still accepted. See
+  ADR 0017. W3C conformance is unchanged (xmlconf and XSTS suites at 100%).
+- `NamespaceResolver::declare` now also ignores a binding of the XML namespace
+  to any prefix other than `xml` (including the default namespace), and the
+  serializer never emits such a stored declaration.
+- Serializer performance: element and attribute QNames are written piecewise
+  (no per-name join allocation), seen attribute names are tracked as borrows,
+  children are walked through sibling links instead of a per-element `Vec`, the
+  `fmt::Write` escape path is run-based and SIMD-accelerated, and
+  `is_valid_xml_ncname` validates ASCII names in a single SIMD pass
+  (`scan_ncname_continuation`, with the scalar/SSE2 pair under differential
+  fuzz + unit-test guard). Output is byte-identical.
+- `xsd_regex` internals avoid `unwrap()` in `Result`-returning parse functions
+  (no functional change).
+
+### Fixed
+
+- `prepare_xpath()` no longer grows the node arena on every re-preparation:
+  superseded virtual attribute slots are recycled in place, keeping arena size
+  flat across mutate→query→mutate rounds (previously quadratic growth, observed
+  as a multi-GB blowup under pyFF-style workloads).
+- Attribute `NodeId`s remain stable across `prepare_xpath()` re-preparation for
+  elements whose attribute list did not change shape; a cached attribute handle
+  can no longer silently alias a different element's attribute after an
+  unrelated mutation. The invalidation rule is documented on
+  `get_attribute_nodes`/`prepare_xpath`.
+- DOM tree mutators (`append_child`, `detach`, `remove_child`, `insert_before`,
+  `insert_after`, `replace_child`) reject virtual attribute nodes and the
+  document node as operands instead of corrupting the owner element's child
+  list (e.g. `append_child` with an attribute node could silently drop all of
+  an element's real children).
+- The SSE2 content/attribute scanners' `needs_validation` flag is now
+  byte-identical to the scalar reference: it previously accumulated over bytes
+  past the first delimiter (a benign over-report that only caused redundant
+  validation, confirmed by 3M differential trials, but a real cross-path
+  divergence).
+- Serialization is a one-pass parse→serialize fixpoint for the reserved-prefix
+  family, closing all 129 `fuzz_roundtrip` findings: a stripped reserved
+  `xml:`/`xmlns:` prefix leaves an NCName-sanitized local name (multi-colon
+  names collapse to `_` instead of shedding one prefix layer per round, ADR
+  0015), and the bare name is emitted with an `xmlns=""` undeclaration when a
+  non-empty default namespace is in scope, so re-parsing no longer captures it
+  into that namespace (ADR 0017).
+- XPath `substring()` follows XPath 1.0 §4.2 exactly: bounds are compared as
+  f64 character positions, so a huge-negative or `-inf` start argument can no
+  longer overflow an integer cast (a panic in builds with overflow checks,
+  found by `fuzz_xpath`), and the spec's NaN/infinity examples all hold
+  (`substring('12345', 0, 3)` = `'12'`, `substring('12345', 0 div 0)` = `''`,
+  `substring('12345', -42, 1 div 0)` = `'12345'`).
+- XPath `round()` rounds half-way values toward positive infinity per XPath 1.0
+  §4.4 (`round(-2.5)` = `-2`, `round(-0.5)` = negative zero) instead of away
+  from zero, and `substring()` uses the same rounding for its bounds so the two
+  stay consistent.
+
 ## [0.7.1] - 2026-07-02
 
 ### Security
