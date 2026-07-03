@@ -2135,6 +2135,26 @@ fn matches_node_test(
     }
 }
 
+/// XPath 1.0 §4.4 `round()`: the nearest integer, with a half-way value
+/// rounded toward positive infinity — `round(-2.5)` is `-2`, where
+/// `f64::round` (ties away from zero) gives `-3`. The two agree everywhere
+/// else, so only negative exact halves are corrected. NaN and ±inf pass
+/// through, and `round(-0.5)` keeps the negative-zero sign the spec assigns.
+fn xpath_round(n: f64) -> f64 {
+    let r = n.round();
+    if n - r == 0.5 {
+        // Away-from-zero took a negative exact half down; ties go up.
+        let up = r + 1.0;
+        if up == 0.0 {
+            -0.0
+        } else {
+            up
+        }
+    } else {
+        r
+    }
+}
+
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<XPathValue> {
     match name {
         "last" => Ok(XPathValue::Number(ctx.size as f64)),
@@ -2263,14 +2283,17 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
             let s = evaluate_expr(&args[0], ctx)?.to_string_value(ctx.doc);
             // XPath 1.0 §4.2: character positions are 1-based and selected by
             // numeric comparison — position >= round(start) and, in the 3-arg
-            // form, position < round(start) + round(length). Comparing in f64
-            // keeps the spec's NaN/infinity semantics (a NaN bound selects
-            // nothing, an infinite length everything after start) and has no
-            // integer casts, whose saturation previously overflowed on a
+            // form, position < round(start) + round(length), with `round` the
+            // XPath ties-toward-+inf rounding (`xpath_round`, shared with the
+            // round() function so `substring(s, -2.5)` and
+            // `substring(s, round(-2.5))` agree). Comparing in f64 keeps the
+            // spec's NaN/infinity semantics (a NaN bound selects nothing, an
+            // infinite length everything after start) and has no integer
+            // casts, whose saturation previously overflowed on a
             // huge-negative or -inf start (`i64::MIN - 1`, fuzz_xpath).
-            let start = evaluate_expr(&args[1], ctx)?.to_number(ctx.doc).round();
+            let start = xpath_round(evaluate_expr(&args[1], ctx)?.to_number(ctx.doc));
             let end = if args.len() == 3 {
-                start + evaluate_expr(&args[2], ctx)?.to_number(ctx.doc).round()
+                start + xpath_round(evaluate_expr(&args[2], ctx)?.to_number(ctx.doc))
             } else {
                 f64::INFINITY
             };
@@ -2413,7 +2436,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext) -> XmlResult<
                 return Err(XmlError::xpath("round() takes exactly 1 argument"));
             }
             let n = evaluate_expr(&args[0], ctx)?.to_number(ctx.doc);
-            Ok(XPathValue::Number(n.round()))
+            Ok(XPathValue::Number(xpath_round(n)))
         }
         "id" => {
             if args.len() != 1 {

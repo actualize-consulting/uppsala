@@ -532,6 +532,10 @@ fn function_substring_spec_edge_cases() {
         ("substring('12345', 0 div 0)", ""),
         ("substring('12345', -100000000000000000000)", "12345"),
         ("substring('12345', -100000000000000000000, 3)", ""),
+        // Ties round toward +inf: start -2.5 -> -2, so end is -2+5 = 3.
+        ("substring('12345', -2.5, 5)", "12"),
+        // And bounds agree with an explicit round() of the same argument.
+        ("substring('12345', round(-2.5), 5)", "12"),
     ] {
         match parse_and_eval("<r/>", expr) {
             XPathValue::String(s) => assert_eq!(s, expected, "{expr}"),
@@ -648,6 +652,37 @@ fn function_round() {
     let val = parse_and_eval("<r/>", "round(2.4)");
     match val {
         XPathValue::Number(n) => assert!((n - 2.0).abs() < f64::EPSILON),
+        _ => panic!("Expected number"),
+    }
+}
+
+#[test]
+fn function_round_ties_toward_positive_infinity() {
+    // XPath 1.0 §4.4: a half-way value rounds toward +inf, unlike
+    // `f64::round`'s away-from-zero — round(-2.5) is -2, not -3.
+    for (expr, expected) in [
+        ("round(-2.5)", -2.0),
+        ("round(-2.6)", -3.0),
+        ("round(-2.4)", -2.0),
+        ("round(1.5)", 2.0),
+    ] {
+        match parse_and_eval("<r/>", expr) {
+            XPathValue::Number(n) => assert_eq!(n, expected, "{expr}"),
+            _ => panic!("Expected number for {expr}"),
+        }
+    }
+    // round(-0.5) is negative zero: observable as 1 div round(-0.5) = -inf.
+    match parse_and_eval("<r/>", "1 div round(-0.5)") {
+        XPathValue::Number(n) => assert_eq!(n, f64::NEG_INFINITY),
+        _ => panic!("Expected number"),
+    }
+    // NaN and infinities pass through.
+    match parse_and_eval("<r/>", "round(0 div 0)") {
+        XPathValue::Number(n) => assert!(n.is_nan()),
+        _ => panic!("Expected number"),
+    }
+    match parse_and_eval("<r/>", "round(-1 div 0)") {
+        XPathValue::Number(n) => assert_eq!(n, f64::NEG_INFINITY),
         _ => panic!("Expected number"),
     }
 }
