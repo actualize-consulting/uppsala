@@ -451,12 +451,6 @@ fn is_ascii_name_start(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'_' | b':')
 }
 
-/// Check if a byte is a valid ASCII XML name character.
-#[inline(always)]
-fn is_ascii_name_char(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b':' | b'-' | b'.')
-}
-
 /// Parse an XML Name. Returns a borrowed slice (names never contain entities).
 /// Uses fast ASCII byte scanning with fallback to Unicode for non-ASCII.
 fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
@@ -489,22 +483,19 @@ fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
         start + c.len_utf8()
     };
 
-    // Scan remaining characters (ASCII fast path)
-    while pos < bytes.len() {
-        let b = bytes[pos];
-        if b < 0x80 {
-            if is_ascii_name_char(b) {
-                pos += 1;
-            } else {
-                break;
-            }
+    // Scan ASCII name continuation bytes in bulk, falling back only when a
+    // non-ASCII byte may start a Unicode NameChar.
+    loop {
+        pos += crate::simd::scan_name_continuation(&bytes[pos..]);
+        if pos >= bytes.len() || bytes[pos] < 0x80 {
+            break;
+        }
+
+        let c = cursor.input[pos..].chars().next().unwrap();
+        if is_name_char(c) {
+            pos += c.len_utf8();
         } else {
-            let c = cursor.input[pos..].chars().next().unwrap();
-            if is_name_char(c) {
-                pos += c.len_utf8();
-            } else {
-                break;
-            }
+            break;
         }
     }
 

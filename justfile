@@ -79,12 +79,50 @@ build:
 build-perf:
     cargo build --release --manifest-path performance-harness/Cargo.toml
 
+# Build libxml2 + native harness, then print the full libxml2 comparison table
+bench-libxml2 samples="301":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    libxml2_dir="${LIBXML2_DIR:-../libxml2}"
+    if [[ ! -d "$libxml2_dir" ]]; then
+        echo "missing libxml2 checkout at $libxml2_dir" >&2
+        echo "set LIBXML2_DIR=/path/to/libxml2 to use a different checkout" >&2
+        exit 1
+    fi
+    libxml2_dir="$(cd "$libxml2_dir" && pwd)"
+    libxml2_build="${LIBXML2_LIB_DIR:-$libxml2_dir/build-uppsala-release}"
+    case "$libxml2_build" in
+      /*) ;;
+      *) libxml2_build="$(pwd)/$libxml2_build" ;;
+    esac
+    export LIBXML2_DIR="$libxml2_dir"
+    export LIBXML2_LIB_DIR="$libxml2_build"
+    cmake -S "$libxml2_dir" -B "$libxml2_build" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DLIBXML2_WITH_PROGRAMS=OFF \
+      -DLIBXML2_WITH_TESTS=OFF \
+      -DLIBXML2_WITH_ZLIB=OFF \
+      -DLIBXML2_WITH_ICONV=OFF \
+      -DLIBXML2_WITH_ICU=OFF \
+      -DLIBXML2_WITH_MODULES=OFF \
+      -DLIBXML2_WITH_PYTHON=OFF \
+      -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG -fno-semantic-interposition -march=native' >&2
+    cmake --build "$libxml2_build" >&2
+    RUSTFLAGS='-C target-cpu=native' CARGO_TARGET_DIR=target/perf-native \
+      cargo build --release --manifest-path performance-harness/Cargo.toml >&2
+    if command -v taskset >/dev/null 2>&1; then
+        taskset -c 0 target/perf-native/release/uppsala-performance-harness libxml2-report {{samples}}
+    else
+        target/perf-native/release/uppsala-performance-harness libxml2-report {{samples}}
+    fi
+
 # Run generated SAML-shaped parser comparison inputs
 perf-saml samples="101":
     cargo run --release --manifest-path performance-harness/Cargo.toml -- saml {{samples}}
 
-# Run roxmltree's benchmark input suite; expects ../roxmltree by default
-perf-suite dir="../roxmltree/benches" samples="101":
+# Run the fixed benchmark input suite from a directory
+perf-suite dir samples="101":
     cargo run --release --manifest-path performance-harness/Cargo.toml -- suite {{dir}} {{samples}}
 
 # Run one XML file through the performance comparison harness
