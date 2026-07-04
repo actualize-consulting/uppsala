@@ -10,6 +10,7 @@
 /// Returns `(bytes_advanced, needs_validation)` where `needs_validation` is true
 /// if any non-ASCII byte (>= 0x80) or illegal control character (< 0x20 except
 /// TAB, LF) was encountered in the scanned range.
+#[inline(always)]
 pub(crate) fn scan_content_delimiters(data: &[u8]) -> (usize, bool) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -26,6 +27,7 @@ pub(crate) fn scan_content_delimiters(data: &[u8]) -> (usize, bool) {
 ///
 /// Returns `(bytes_advanced, needs_validation)` where `needs_validation` is true
 /// if any non-ASCII byte or illegal control character was encountered.
+#[inline(always)]
 pub(crate) fn scan_attr_delimiters(data: &[u8], quote: u8) -> (usize, bool) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -39,9 +41,17 @@ pub(crate) fn scan_attr_delimiters(data: &[u8], quote: u8) -> (usize, bool) {
 }
 
 /// Find a single byte without adding a dependency.
-#[inline]
+#[inline(always)]
 pub(crate) fn find_byte(data: &[u8], byte: u8) -> Option<usize> {
-    data.iter().position(|&b| b == byte)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is guaranteed on all x86_64 processors.
+        unsafe { find_byte_sse2(data, byte) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        find_byte_scalar(data, byte)
+    }
 }
 
 /// Length of the prefix of `data` that the serializer's escaper can copy
@@ -50,6 +60,7 @@ pub(crate) fn find_byte(data: &[u8], byte: u8) -> Option<usize> {
 /// start of a multi-byte sequence (>= 0x80, which needs char-level XML
 /// validity checking). The serializer bulk-copies this run and handles the
 /// single following special byte individually.
+#[inline(always)]
 pub(crate) fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -71,25 +82,45 @@ pub(crate) fn scan_escape_run(data: &[u8], is_attr: bool) -> usize {
 /// "all valid ASCII" (offset == len), an "invalid ASCII name" (offset byte
 /// `< 0x80`), and "fall through to the Unicode `NameChar` production" (offset
 /// byte `>= 0x80`, the start of a multi-byte character).
+#[inline(always)]
 pub(crate) fn scan_ncname_continuation(data: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: SSE2 is guaranteed on all x86_64 processors.
-        unsafe { scan_ncname_continuation_sse2(data) }
+        unsafe { scan_name_like_continuation_sse2::<false>(data) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        scan_ncname_continuation_scalar(data)
+        scan_name_like_continuation_scalar::<false>(data)
     }
 }
 
-/// Scalar fallback / tail scan for [`scan_ncname_continuation`]. The byte
-/// classification is the reference the SSE2 path must match exactly.
-fn scan_ncname_continuation_scalar(data: &[u8]) -> usize {
+/// Length of the leading run of ASCII XML Name continuation characters
+/// (`[0-9A-Za-z_.:-]`). Non-ASCII bytes stop the run so the parser can fall
+/// through to the full Unicode `NameChar` production.
+#[inline(always)]
+pub(crate) fn scan_name_continuation(data: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is guaranteed on all x86_64 processors.
+        unsafe { scan_name_like_continuation_sse2::<true>(data) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        scan_name_like_continuation_scalar::<true>(data)
+    }
+}
+
+/// Scalar fallback / tail scan for XML name-like continuation scanners. The
+/// byte classification is the reference the SSE2 path must match exactly.
+fn scan_name_like_continuation_scalar<const ALLOW_COLON: bool>(data: &[u8]) -> usize {
     let mut pos = 0;
     while pos < data.len() {
         let b = data[pos];
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+        if !(b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'-' | b'.')
+            || (ALLOW_COLON && b == b':'))
+        {
             break;
         }
         pos += 1;
@@ -99,11 +130,11 @@ fn scan_ncname_continuation_scalar(data: &[u8]) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
+unsafe fn scan_name_like_continuation_sse2<const ALLOW_COLON: bool>(data: &[u8]) -> usize {
     use std::arch::x86_64::*;
 
     let mut pos = 0;
-    // Range bounds and the three standalone characters `_ - .`.
+    // Range bounds and standalone XML-name punctuation.
     let v_0 = _mm_set1_epi8(b'0' as i8);
     let v_9 = _mm_set1_epi8(b'9' as i8);
     let v_ua = _mm_set1_epi8(b'A' as i8);
@@ -113,6 +144,7 @@ unsafe fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
     let v_us = _mm_set1_epi8(b'_' as i8);
     let v_hy = _mm_set1_epi8(b'-' as i8);
     let v_dot = _mm_set1_epi8(b'.' as i8);
+    let v_colon = _mm_set1_epi8(b':' as i8);
 
     while pos + 16 <= data.len() {
         let chunk = _mm_loadu_si128(data.as_ptr().add(pos) as *const __m128i);
@@ -130,6 +162,11 @@ unsafe fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
             _mm_cmpeq_epi8(chunk, v_us),
             _mm_or_si128(_mm_cmpeq_epi8(chunk, v_hy), _mm_cmpeq_epi8(chunk, v_dot)),
         );
+        let singles = if ALLOW_COLON {
+            _mm_or_si128(singles, _mm_cmpeq_epi8(chunk, v_colon))
+        } else {
+            singles
+        };
         let valid = _mm_or_si128(
             _mm_or_si128(in_range(v_0, v_9), in_range(v_ua, v_uz)),
             _mm_or_si128(in_range(v_la, v_lz), singles),
@@ -144,7 +181,29 @@ unsafe fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
         pos += 16;
     }
 
-    pos + scan_ncname_continuation_scalar(&data[pos..])
+    pos + scan_name_like_continuation_scalar::<ALLOW_COLON>(&data[pos..])
+}
+
+fn find_byte_scalar(data: &[u8], byte: u8) -> Option<usize> {
+    data.iter().position(|&b| b == byte)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn find_byte_sse2(data: &[u8], byte: u8) -> Option<usize> {
+    use std::arch::x86_64::*;
+
+    let mut pos = 0;
+    let needle = _mm_set1_epi8(byte as i8);
+    while pos + 16 <= data.len() {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(pos) as *const __m128i);
+        let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle)) as u32;
+        if mask != 0 {
+            return Some(pos + mask.trailing_zeros() as usize);
+        }
+        pos += 16;
+    }
+    find_byte_scalar(&data[pos..], byte).map(|tail| pos + tail)
 }
 
 /// Scalar fallback / tail scan for [`scan_escape_run`]. The byte
@@ -579,6 +638,17 @@ mod tests {
     }
 
     #[test]
+    fn name_continuation_allows_colon() {
+        // Parser XML Names allow ':'; serializer NCNames intentionally do not.
+        assert_eq!(scan_name_continuation(b"abc:def-1.2_z"), 13);
+        assert_eq!(scan_ncname_continuation(b"abc:def-1.2_z"), 3);
+        assert_eq!(scan_name_continuation(b"abc def"), 3);
+        assert_eq!(scan_name_continuation("abc\u{e9}".as_bytes()), 3);
+        assert_eq!(scan_name_continuation(b"aaaaaaaaaaaaaaaaaa"), 18);
+        assert_eq!(scan_name_continuation(b"aaaaaaaaaaaaaaaaa/"), 17);
+    }
+
+    #[test]
     fn ncname_continuation_sse2_matches_scalar() {
         // Differential spot-check (the exhaustive check lives in the fuzz
         // harness fuzz_simd_differential): every stop byte at every position
@@ -590,10 +660,44 @@ mod tests {
                     d[p] = sp;
                     assert_eq!(
                         scan_ncname_continuation(&d),
-                        scan_ncname_continuation_scalar(&d),
+                        scan_name_like_continuation_scalar::<false>(&d),
                         "len={len} pos={p} byte={sp:#04x}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn name_continuation_sse2_matches_scalar() {
+        for len in 0..40usize {
+            for p in 0..len {
+                for &sp in &[b' ', b'/', 0x00u8, 0x80u8, 0xFFu8] {
+                    let mut d = vec![b'a'; len];
+                    d[p] = sp;
+                    assert_eq!(
+                        scan_name_continuation(&d),
+                        scan_name_like_continuation_scalar::<true>(&d),
+                        "len={len} pos={p} byte={sp:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_byte_matches_scalar() {
+        for len in 0..40usize {
+            for p in 0..=len {
+                let mut d = vec![b'a'; len];
+                if p < len {
+                    d[p] = b';';
+                }
+                assert_eq!(
+                    find_byte(&d, b';'),
+                    find_byte_scalar(&d, b';'),
+                    "len={len} pos={p}"
+                );
             }
         }
     }
@@ -643,6 +747,12 @@ pub mod fuzz_exports {
     pub fn scan_ncname_continuation(data: &[u8]) -> usize {
         super::scan_ncname_continuation(data)
     }
+    pub fn scan_name_continuation(data: &[u8]) -> usize {
+        super::scan_name_continuation(data)
+    }
+    pub fn find_byte(data: &[u8], byte: u8) -> Option<usize> {
+        super::find_byte(data, byte)
+    }
 
     /// Scalar references — the ground truth, available on every architecture.
     pub fn scan_content_scalar(data: &[u8]) -> (usize, bool) {
@@ -655,7 +765,13 @@ pub mod fuzz_exports {
         super::scan_escape_scalar(data, is_attr)
     }
     pub fn scan_ncname_continuation_scalar(data: &[u8]) -> usize {
-        super::scan_ncname_continuation_scalar(data)
+        super::scan_name_like_continuation_scalar::<false>(data)
+    }
+    pub fn scan_name_continuation_scalar(data: &[u8]) -> usize {
+        super::scan_name_like_continuation_scalar::<true>(data)
+    }
+    pub fn find_byte_scalar(data: &[u8], byte: u8) -> Option<usize> {
+        super::find_byte_scalar(data, byte)
     }
 
     /// SSE2 implementations (x86_64 only). Safe wrappers: SSE2 is guaranteed on
@@ -674,7 +790,15 @@ pub mod fuzz_exports {
     }
     #[cfg(target_arch = "x86_64")]
     pub fn scan_ncname_continuation_sse2(data: &[u8]) -> usize {
-        unsafe { super::scan_ncname_continuation_sse2(data) }
+        unsafe { super::scan_name_like_continuation_sse2::<false>(data) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn scan_name_continuation_sse2(data: &[u8]) -> usize {
+        unsafe { super::scan_name_like_continuation_sse2::<true>(data) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn find_byte_sse2(data: &[u8], byte: u8) -> Option<usize> {
+        unsafe { super::find_byte_sse2(data, byte) }
     }
 
     /// Escape `s` through the real serializer escaper (`write_escaped_run_dyn`),

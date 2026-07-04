@@ -1,115 +1,163 @@
 # Performance
 
-Uppsala uses accelerated byte scanning for text content and attribute values:
-SSE2 SIMD on x86_64 (16 bytes per iteration) and a one-pass scalar delimiter
-scanner elsewhere. Parsing throughput depends heavily on document shape: long
-plain-text spans and large attribute values are favorable, while very small
-documents are dominated by fixed parser overhead.
+Uppsala uses accelerated byte scanning for parser hot loops:
 
-## Results
+- SSE2 delimiter scanning on x86_64 for text content and attribute values.
+- SSE2 ASCII XML-name continuation scanning for element and attribute names.
+- SSE2 single-byte search for reference parsing.
+- Scalar reference implementations on non-x86_64 and for SIMD tail bytes.
 
-The tables below compare release builds (`cargo run --release`, no extra
-profile overrides) of Uppsala 0.5.2 against a local checkout of roxmltree
-0.21.1. Results are median parse times from 101 samples on x86_64 (the SSE2
-scanner path). The `Ratio` column is
-`roxmltree / Uppsala`; values above 1.0 mean Uppsala parsed faster.
+Parsing throughput depends heavily on document shape. Long plain-text spans,
+large attribute values, and ASCII-heavy names favor the bulk scanners. Very
+small documents are dominated by fixed parser and allocation overhead.
 
-### roxmltree benchmark inputs
+## Current libxml2 comparison
 
-| File | Size | Uppsala | roxmltree | Ratio |
-|------|------|---------|-----------|-------|
-| fonts.conf | 429 B | 2.9 us | 4.0 us | 1.38x |
-| medium.svg | 155 KB | 306 us | 489 us | 1.60x |
-| large.plist | 321 KB | 1.72 ms | 2.39 ms | 1.39x |
-| huge.xml | 835 KB | 3.69 ms | 4.80 ms | 1.30x |
-| gigantic.svg | 1.34 MB | 411 us | 1.94 ms | 4.73x |
-| cdata.xml | 102 KB | 215 us | 252 us | 1.17x |
-| text.xml | 129 KB | 650 us | 5.96 ms | 9.17x |
-| attributes.xml | 271 KB | 1.48 ms | 5.24 ms | 3.55x |
+The tables below compare a native x86_64 server build of Uppsala against a
+local sibling checkout of libxml2, called directly through `xmlReadMemory`.
+The harness reports median parse time from in-memory strings; file I/O and
+process startup are not included.
 
-### SAML-shaped inputs
+Build setup used for these numbers (`just bench-libxml2 101`):
 
-The main production target is SAML: namespace-heavy documents in the 3-30 KB
-range with signed assertions. On generated SAML-shaped inputs, default
-namespace-aware parsing is consistently faster than roxmltree.
+- Uppsala: `RUSTFLAGS='-C target-cpu=native' cargo build --release`
+- libxml2: static release library from `../libxml2`, built with
+  `-O3 -DNDEBUG -fno-semantic-interposition -march=native`
+- CPU pinning: `taskset -c 0`
 
-| File | Size | Uppsala | roxmltree | Ratio |
-|------|------|---------|-----------|-------|
-| SAML small | 3.5 KB | 7.7 us | 13.3 us | 1.74x |
-| SAML medium | 9.1 KB | 25.1 us | 29.0 us | 1.16x |
-| SAML large | 27.8 KB | 62.7 us | 92.1 us | 1.47x |
+The `Ratio` column is `libxml2 / Uppsala`; values above `1.0` mean Uppsala
+parsed faster.
 
-Disabling namespace resolution improves some ordinary XML inputs further, but
-SAML users should usually keep namespace-aware parsing enabled.
+### Full libxml2 report
 
-## Running the performance test
+The report includes SAML-shaped request/response documents, larger generated
+real-life-shaped XML documents, one local pyFF metadata fixture, and two larger
+fixtures from the libxml2 checkout.
+
+| Input | Size | Uppsala ns | Uppsala no-ns | libxml2 | Ratio ns | Ratio no-ns |
+|---|---:|---:|---:|---:|---:|---:|
+| SAML small | 3.4 KB | 9.494 us | 6.053 us | 23.435 us | 2.47x | 3.87x |
+| SAML medium | 8.9 KB | 16.169 us | 19.331 us | 75.494 us | 4.67x | 3.91x |
+| SAML large | 27.2 KB | 64.384 us | 39.515 us | 161.087 us | 2.50x | 4.08x |
+| SAML metadata aggregate | 666.3 KB | 2.000 ms | 1.794 ms | 4.506 ms | 2.25x | 2.51x |
+| Atom feed archive | 848.2 KB | 3.573 ms | 3.342 ms | 6.310 ms | 1.77x | 1.89x |
+| SOAP invoice batch | 715.2 KB | 3.568 ms | 3.350 ms | 5.753 ms | 1.61x | 1.72x |
+| pyFF sample metadata | 3.5 KB | 12.178 us | 10.712 us | 37.922 us | 3.11x | 3.54x |
+| libxml2 `nvdcve_0.xml` | 287.4 KB | 1.442 ms | 1.385 ms | 2.571 ms | 1.78x | 1.86x |
+| libxml2 `comps_0.xml` | 607.9 KB | 2.990 ms | 2.996 ms | 5.658 ms | 1.89x | 1.89x |
+
+These are local measurements, not a universal claim. Re-run the harness on the
+target server class before making capacity decisions.
+
+## Running the performance harness
 
 The comparison harness is checked into the repo under `performance-harness/`.
 It is kept outside the main crate's targets so normal library builds and tests
-do not depend on roxmltree.
+do not depend on libxml2.
 
-### Prerequisites
+### One-command libxml2 benchmark
 
-The harness expects a sibling checkout of roxmltree next to the Uppsala repo:
+With libxml2 checked out at the default `../libxml2` location, run:
+
+```bash
+just bench-libxml2
+```
+
+This configures/builds libxml2 as a local static release library, builds the
+Uppsala harness with `RUSTFLAGS='-C target-cpu=native'`, pins the run to CPU 0
+when `taskset` is available, and prints one final Markdown table containing
+the SAML-shaped inputs, larger generated XML shapes, and representative
+local/libxml2 XML fixtures.
+
+The default sample count is `301`. Use a larger count for steadier medians:
+
+```bash
+just bench-libxml2 1001
+```
+
+To use a different libxml2 checkout:
+
+```bash
+LIBXML2_DIR=/path/to/libxml2 just bench-libxml2
+```
+
+### Manual setup
+
+By default, the harness expects a sibling libxml2 checkout next to the Uppsala
+repo:
 
 ```text
 code/
   uppsala/
     performance-harness/
-  roxmltree/
+  libxml2/
 ```
 
-Because Uppsala's hand-written SSE2 scanner only runs on x86_64, run the harness
-on an x86_64 machine to reproduce the SIMD numbers above. On aarch64 / Apple
-Silicon it exercises the scalar fallback instead.
-
-### Run roxmltree's benchmark inputs
+Build libxml2 locally:
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  suite ../roxmltree/benches 101
+cmake -S ../libxml2 -B ../libxml2/build-uppsala-release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLIBXML2_WITH_PROGRAMS=OFF \
+  -DLIBXML2_WITH_TESTS=OFF \
+  -DLIBXML2_WITH_ZLIB=OFF \
+  -DLIBXML2_WITH_ICONV=OFF \
+  -DLIBXML2_WITH_ICU=OFF \
+  -DLIBXML2_WITH_MODULES=OFF \
+  -DLIBXML2_WITH_PYTHON=OFF \
+  -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG -fno-semantic-interposition -march=native'
+cmake --build ../libxml2/build-uppsala-release
 ```
 
-### Run the SAML-shaped inputs
+The harness build script links `$LIBXML2_DIR/build-uppsala-release/libxml2.a`,
+defaulting `LIBXML2_DIR` to `../libxml2`. Override the source checkout with
+`LIBXML2_DIR=/path/to/libxml2`; override only the build-output directory with
+`LIBXML2_LIB_DIR=/path/to/build` if needed.
+
+### Run SAML-shaped inputs manually
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  saml 101
+RUSTFLAGS='-C target-cpu=native' cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- saml 1001
 ```
 
-### Run a single file
+### Run a single file manually
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  file ../roxmltree/benches/large.plist 101
+RUSTFLAGS='-C target-cpu=native' cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- \
+  file test-data/pyff-xslt/sample-metadata.xml 1001
 ```
 
 The trailing number is the sample count (default `31`). Each run does a short
-warmup, then reports medians in microseconds. Output is tab-separated with
-columns for both namespace-aware and namespace-disabled Uppsala timings:
+warmup, then reports medians in microseconds. Output is tab-separated:
 
 ```text
-file  bytes  uppsala_ns_us  uppsala_no_ns_us  roxmltree_us  ratio_ns  ratio_no_ns
+file  bytes  uppsala_ns_us  uppsala_no_ns_us  libxml2_us  ratio_ns  ratio_no_ns
 ```
 
-The `ratio_ns` column corresponds to the default namespace-aware mode used in
-the tables above; `ratio_no_ns` is Uppsala with namespace resolution disabled.
+The `ratio_ns` column corresponds to the default namespace-aware mode; SAML
+users should usually care about this column. `ratio_no_ns` is Uppsala with
+namespace resolution disabled.
 
-See [`performance-harness/README.md`](../performance-harness/README.md) for
-additional notes.
-
-## Profiling with `perf`
+## Profiling
 
 To find hot functions when optimizing the parser, build the harness and record
-a profile (Linux, `perf` installed):
+a profile on Linux:
 
 ```bash
-cargo build --release --manifest-path performance-harness/Cargo.toml
-perf record -g --call-graph dwarf \
-  ./target/release/uppsala-performance-harness suite ../roxmltree/benches 101
-perf report --no-children --sort=dso,symbol
+RUSTFLAGS='-C target-cpu=native' cargo build --release \
+  --manifest-path performance-harness/Cargo.toml
+sudo perf record -g --call-graph dwarf \
+  performance-harness/target/release/uppsala-performance-harness saml 1001
+sudo perf report --no-children --sort=dso,symbol
 ```
 
-Focus on self-time (`--no-children`) to identify the real bottleneck rather than
-its callers, and use `perf annotate --symbol=<fn>` to drill into a hot loop's
+Focus on self-time (`--no-children`) to identify the real bottleneck rather
+than its callers, and use `perf annotate --symbol=<fn>` to inspect a hot loop's
 per-instruction sample counts.
+
+On this container, hardware counters such as `branch-misses` and `cycles` were
+reported as unsupported even under `sudo perf stat`; use a host with PMU access
+for branch-prediction measurements.

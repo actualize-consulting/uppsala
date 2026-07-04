@@ -1,58 +1,79 @@
 # Uppsala Performance Harness
 
 This is a local comparison harness for Uppsala's XML parser against a sibling
-checkout of `roxmltree`.
+checkout of `libxml2`.
 
-It is intentionally checked into the repo so the same commands can be run later
-on an x86_64 machine. That matters because Uppsala's hand-written SSE2 scanner
-only runs on x86_64; Apple Silicon and other non-x86_64 targets use the scalar
-fallback.
+The harness measures parse-only time from in-memory strings. It calls libxml2
+directly through `xmlReadMemory` and frees each parsed `xmlDoc`, so timings do
+not include `xmllint` process startup or file I/O.
 
-Expected layout:
+Default layout:
 
 ```text
 code/
   uppsala/
     performance-harness/
-  roxmltree/
+  libxml2/
 ```
 
-The harness measures parse-only time. It reports medians in microseconds after a
-small warmup. The `Ratio` column is `roxmltree / Uppsala`; values above `1.0`
-mean Uppsala parsed faster.
+Set `LIBXML2_DIR=/path/to/libxml2` to use a different checkout.
 
-## Run One File
+## Build libxml2
+
+Build a local release static library before running the harness. The default
+source checkout is `../libxml2`; substitute `$LIBXML2_DIR` when using a custom
+checkout:
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  file ../roxmltree/benches/large.plist 101
+cmake -S ../libxml2 -B ../libxml2/build-uppsala-release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLIBXML2_WITH_PROGRAMS=OFF \
+  -DLIBXML2_WITH_TESTS=OFF \
+  -DLIBXML2_WITH_ZLIB=OFF \
+  -DLIBXML2_WITH_ICONV=OFF \
+  -DLIBXML2_WITH_ICU=OFF \
+  -DLIBXML2_WITH_MODULES=OFF \
+  -DLIBXML2_WITH_PYTHON=OFF \
+  -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG -fno-semantic-interposition -march=native'
+cmake --build ../libxml2/build-uppsala-release
 ```
 
-The final argument is the sample count. If omitted, it defaults to `31`.
-
-## Run roxmltree's Benchmark Inputs
+The harness build script looks for
+`${LIBXML2_DIR:-../libxml2}/build-uppsala-release/libxml2.a` by default. To use
+another build directory:
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  suite ../roxmltree/benches 101
+LIBXML2_LIB_DIR=/path/to/libxml2/build cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- saml 101
 ```
 
-This runs:
+## One-Command Report
 
-- `fonts.conf`
-- `medium.svg`
-- `large.plist`
-- `huge.xml`
-- `gigantic.svg`
-- `cdata.xml`
-- `text.xml`
-- `attributes.xml`
+From the repository root:
+
+```bash
+just bench-libxml2
+```
+
+This builds libxml2 and the native Uppsala harness, then prints one final table
+with:
+
+- SAML-shaped response documents
+- a larger generated SAML metadata aggregate
+- a larger generated Atom feed archive
+- a larger generated SOAP invoice batch
+- a local pyFF metadata fixture
+- larger XML fixtures from the libxml2 checkout
+
+Use `LIBXML2_DIR=/path/to/libxml2 just bench-libxml2` for a non-default
+checkout.
 
 ## Run SAML-Shaped Inputs
 
 ```bash
-cargo run --release --manifest-path performance-harness/Cargo.toml -- \
-  saml 101
+RUSTFLAGS='-C target-cpu=native' cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- saml 101
 ```
 
 This generates three namespace-heavy SAML-like responses in memory:
@@ -64,12 +85,48 @@ This generates three namespace-heavy SAML-like responses in memory:
 These are synthetic parser fixtures, not security or interoperability test
 vectors.
 
-## Notes
+## Run One File
 
-- Uppsala is benchmarked twice: namespace-aware default mode and
-  namespace-disabled mode.
-- SAML users should usually care about the namespace-aware column.
-- On x86_64, this harness exercises Uppsala's SSE2 delimiter scanner. On
-  aarch64/Apple Silicon, it exercises the scalar fallback.
-- The harness intentionally lives outside the main crate's `[[bench]]` targets
-  so normal library builds and tests do not depend on `roxmltree`.
+```bash
+RUSTFLAGS='-C target-cpu=native' cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- \
+  file test-data/pyff-xslt/sample-metadata.xml 101
+```
+
+The final argument is the sample count. If omitted, it defaults to `31`.
+
+## Run A Fixed File Suite
+
+```bash
+RUSTFLAGS='-C target-cpu=native' cargo run --release \
+  --manifest-path performance-harness/Cargo.toml -- \
+  suite /path/to/benchmark-files 101
+```
+
+The suite directory must contain:
+
+- `fonts.conf`
+- `medium.svg`
+- `large.plist`
+- `huge.xml`
+- `gigantic.svg`
+- `cdata.xml`
+- `text.xml`
+- `attributes.xml`
+
+## Output
+
+Output is tab-separated:
+
+```text
+file  bytes  uppsala_ns_us  uppsala_no_ns_us  libxml2_us  ratio_ns  ratio_no_ns
+```
+
+The `Ratio` columns are `libxml2 / Uppsala`; values above `1.0` mean Uppsala
+parsed faster. Uppsala is benchmarked twice: namespace-aware default mode and
+namespace-disabled mode. SAML users should usually care about the
+namespace-aware column.
+
+On x86_64, this harness exercises Uppsala's SSE2 scanners. For server
+deployment benchmarking, prefer `RUSTFLAGS='-C target-cpu=native'` so LLVM can
+use the host CPU's scheduling model and baseline extensions where applicable.
