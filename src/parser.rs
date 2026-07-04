@@ -472,7 +472,10 @@ fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
         }
         start + 1
     } else {
-        let c = cursor.input[start..].chars().next().unwrap();
+        let c = cursor.input[start..]
+            .chars()
+            .next()
+            .ok_or_else(|| XmlError::parse("Expected XML name", cursor.line(), cursor.column()))?;
         if !is_name_start_char(c) {
             return Err(XmlError::parse(
                 "Expected XML name",
@@ -491,7 +494,10 @@ fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
             break;
         }
 
-        let c = cursor.input[pos..].chars().next().unwrap();
+        let c = cursor.input[pos..]
+            .chars()
+            .next()
+            .ok_or_else(|| XmlError::parse("Expected XML name", cursor.line(), cursor.column()))?;
         if is_name_char(c) {
             pos += c.len_utf8();
         } else {
@@ -1144,7 +1150,7 @@ fn expand_entity_value(
             }
         } else {
             // Regular character - just advance
-            let c = value[pos..].chars().next().unwrap();
+            let c = value[pos..].chars().next().ok_or(XmlError::UnexpectedEof)?;
             charge_entity_budget(budget, c.len_utf8(), line, col)?;
             result.push(c);
             pos += c.len_utf8();
@@ -1238,7 +1244,7 @@ fn expand_entity_value_no_builtins(
                 pos += 1;
             }
         } else {
-            let c = value[pos..].chars().next().unwrap();
+            let c = value[pos..].chars().next().ok_or(XmlError::UnexpectedEof)?;
             charge_entity_budget(budget, c.len_utf8(), line, col)?;
             result.push(c);
             pos += c.len_utf8();

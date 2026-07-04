@@ -31,8 +31,13 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=LIBXML2_DIR");
     println!("cargo:rerun-if-env-changed=LIBXML2_LIB_DIR");
-    println!("cargo:rerun-if-changed={}", lib_dir.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        lib_dir.join("libxml2.a").display()
+    );
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=xml2");
-    println!("cargo:rustc-link-lib=m");
+    if env::var_os("CARGO_CFG_UNIX").is_some() {
+        println!("cargo:rustc-link-lib=m");
+    }
 }
