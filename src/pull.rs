@@ -520,12 +520,18 @@ impl<'a> PullParser<'a> {
                     // scanner's delimiter set ever grows and this consumer is
                     // missed, an `unreachable!()` here would turn every affected
                     // document into a process-killing panic (a DoS on hostile
-                    // input). Degrade gracefully instead — validate and append
+                    // input). Degrade gracefully instead: validate and append
                     // one whole character as ordinary content, then advance.
-                    let ch = self.cursor.input[self.cursor.pos..]
-                        .chars()
-                        .next()
-                        .expect("cursor.pos < input.len() checked above");
+                    let Some(tail) = self.cursor.input.get(self.cursor.pos..) else {
+                        return Err(XmlError::well_formedness(
+                            "Parser stopped at a non-character boundary while scanning text",
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        ));
+                    };
+                    let Some(ch) = tail.chars().next() else {
+                        return Err(XmlError::UnexpectedEof);
+                    };
                     if !is_xml_char(ch) {
                         return Err(XmlError::well_formedness(
                             format!("Invalid XML character U+{:04X}", ch as u32),
@@ -690,10 +696,9 @@ impl<'a> PullParser<'a> {
                 Ok(parts) => parts,
                 Err(err) => {
                     if pushed_ns_scope {
-                        self.ns_resolver
-                            .as_mut()
-                            .expect("namespace resolver exists")
-                            .pop_scope();
+                        if let Some(resolver) = self.ns_resolver.as_mut() {
+                            resolver.pop_scope();
+                        }
                     }
                     return Err(err);
                 }
@@ -729,11 +734,9 @@ impl<'a> PullParser<'a> {
                 depth,
             });
             if pushed_ns_scope {
-                let resolver = self
-                    .ns_resolver
-                    .as_mut()
-                    .expect("namespace resolver exists");
-                resolver.pop_scope();
+                if let Some(resolver) = self.ns_resolver.as_mut() {
+                    resolver.pop_scope();
+                }
             }
             if self.namespace_aware {
                 for _ in 0..ns_decls.len() {
@@ -867,11 +870,9 @@ impl<'a> PullParser<'a> {
             depth: open.depth,
         });
         if open.pushed_ns_scope {
-            let resolver = self
-                .ns_resolver
-                .as_mut()
-                .expect("namespace resolver exists");
-            resolver.pop_scope();
+            if let Some(resolver) = self.ns_resolver.as_mut() {
+                resolver.pop_scope();
+            }
         }
         if self.namespace_aware {
             for _ in 0..open.namespace_count {
@@ -916,6 +917,13 @@ pub fn document_from_pull<'a>(
     let root = doc.root();
     let mut stack = vec![root];
 
+    fn current_parent(stack: &[crate::dom::NodeId]) -> XmlResult<crate::dom::NodeId> {
+        stack
+            .last()
+            .copied()
+            .ok_or_else(|| XmlError::well_formedness("DOM builder stack unexpectedly empty", 0, 0))
+    }
+
     while let Some(event) = parser.next_event()? {
         match event {
             PullEvent::XmlDeclaration(decl) => doc.xml_declaration = Some(decl),
@@ -936,7 +944,7 @@ pub fn document_from_pull<'a>(
                     }),
                     byte_start,
                 );
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
                 stack.push(id);
             }
@@ -953,7 +961,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::Text(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::CData {
@@ -963,7 +971,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::CData(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::Comment {
@@ -973,7 +981,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::Comment(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::ProcessingInstruction {
@@ -984,7 +992,7 @@ pub fn document_from_pull<'a>(
                 let id =
                     doc.alloc_node(crate::dom::NodeKind::ProcessingInstruction(pi), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
         }

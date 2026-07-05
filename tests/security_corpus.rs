@@ -28,10 +28,11 @@ use uppsala::parse;
 /// *termination* (the entity/length caps fail closed), not raw speed: a genuine
 /// billion-laughs hang would run for minutes or never. The bound is generous
 /// because these run in an unoptimized `cargo test` (debug) build, where the
-/// legitimately O(n²) quadratic-blowup payloads (`lol_long_name`/`lol_long_value`)
-/// take several seconds before the cap fires — a tight bound flakes under load
-/// without catching any real regression a looser one would miss.
-const PARSE_CEILING: Duration = Duration::from_secs(30);
+/// legitimately O(n²) quadratic-blowup payloads (`lol_long_name` in particular)
+/// take about 5-6 seconds before the cap fires on local runs. Ten seconds gives
+/// enough slack for debug/CI noise while still catching hangs much faster than a
+/// broad 30-second ceiling.
+const PARSE_CEILING: Duration = Duration::from_secs(10);
 
 fn corpus_dir() -> Option<PathBuf> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
