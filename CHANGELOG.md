@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - XSD identity constraint validation now indexes normalized key/unique/keyref
   tuples instead of linearly scanning prior tuples, removing quadratic duplicate
   and keyref lookup paths while preserving decimal-equivalent comparisons.
+- XSD schema building now rejects duplicate top-level `xs:group` and
+  `xs:attributeGroup` definitions before parsing replacement bodies, preventing
+  overwrite-and-clone model group expansion from exhausting memory.
+- XSLT stylesheets can now opt into materialized result-tree and serialized
+  output byte caps with `Stylesheet::set_max_result_tree_bytes` and
+  `Stylesheet::set_max_output_bytes`, letting fuzz and hostile-input callers
+  bound legal output-amplification cases without changing the default
+  unbounded transform API.
 - `parse_bytes()` now normalizes any retained XML declaration encoding to
   `UTF-8`, so string serialization cannot emit stale metadata such as UTF-8
   bytes declaring `UTF-16`.

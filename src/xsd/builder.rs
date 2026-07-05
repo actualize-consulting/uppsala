@@ -307,6 +307,17 @@ impl XsdValidator {
                 if elem.name.local_name == "attributeGroup" {
                     if let Some(ag_elem) = schema_doc.element(child) {
                         if let Some(name) = ag_elem.get_attribute("name") {
+                            let key = (validator.target_namespace.clone(), name.to_string());
+                            // Top-level attribute-group names are unique within
+                            // a schema namespace. Reject duplicates before
+                            // parsing the replacement body so a later duplicate
+                            // cannot clone or expand the earlier definition.
+                            if validator.attribute_groups.contains_key(&key) {
+                                return Err(XmlError::validation(format!(
+                                    "Duplicate attributeGroup definition: {}",
+                                    name
+                                )));
+                            }
                             let ag_def = parse_attribute_group_def(
                                 schema_doc,
                                 child,
@@ -314,7 +325,6 @@ impl XsdValidator {
                                 &validator.global_attributes,
                                 &validator.attribute_groups,
                             )?;
-                            let key = (validator.target_namespace.clone(), name.to_string());
                             validator.attribute_groups.insert(key, ag_def);
                         }
                     }
@@ -322,6 +332,18 @@ impl XsdValidator {
                 if elem.name.local_name == "group" {
                     if let Some(g_elem) = schema_doc.element(child) {
                         if let Some(name) = g_elem.get_attribute("name") {
+                            let key = (validator.target_namespace.clone(), name.to_string());
+                            // Top-level model-group names are unique within a
+                            // schema namespace. Fuzzing found that overwriting a
+                            // group after parsing refs to the previous version
+                            // could amplify Particle clones before the final map
+                            // insert. Fail closed before parsing the duplicate.
+                            if validator.model_groups.contains_key(&key) {
+                                return Err(XmlError::validation(format!(
+                                    "Duplicate model group definition: {}",
+                                    name
+                                )));
+                            }
                             let mg_def = parse_model_group_def(
                                 schema_doc,
                                 child,
@@ -332,7 +354,6 @@ impl XsdValidator {
                                 validator.block_default_extension,
                                 validator.block_default_restriction,
                             )?;
-                            let key = (validator.target_namespace.clone(), name.to_string());
                             validator.model_groups.insert(key, mg_def);
                         }
                     }

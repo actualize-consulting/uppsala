@@ -638,6 +638,69 @@ fn namespaced_root_does_not_fall_back_to_no_namespace_declaration() {
 }
 
 #[test]
+fn xsd_duplicate_model_groups_fail_before_recursive_expansion() {
+    // Fuzz found that repeatedly redefining the same top-level model group with
+    // refs to the previous definition caused exponential Particle cloning during
+    // schema build. Duplicate top-level group names are invalid, so fail before
+    // parsing the replacement body.
+    let mut schema = String::from(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:group name="name">
+    <xs:choice>
+      <xs:element name="leaf" type="xs:string"/>
+    </xs:choice>
+  </xs:group>
+"#,
+    );
+    for _ in 0..24 {
+        schema.push_str(
+            r#"  <xs:group name="name">
+    <xs:choice>
+      <xs:group ref="name"/>
+      <xs:group ref="name"/>
+      <xs:group ref="name"/>
+    </xs:choice>
+  </xs:group>
+"#,
+        );
+    }
+    schema.push_str("</xs:schema>");
+
+    let schema_doc = parse(&schema).expect("parse schema");
+    let err = match XsdValidator::from_schema(&schema_doc) {
+        Ok(_) => panic!("duplicate model groups must fail closed"),
+        Err(err) => err,
+    };
+    assert!(err
+        .to_string()
+        .contains("Duplicate model group definition: name"));
+}
+
+#[test]
+fn xsd_duplicate_attribute_groups_fail_closed() {
+    // The same overwrite pattern applies to top-level attribute groups. Reject
+    // duplicates instead of replacing an earlier definition after it may have
+    // been referenced by later schema components.
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:attributeGroup name="attrs">
+    <xs:attribute name="a" type="xs:string"/>
+  </xs:attributeGroup>
+  <xs:attributeGroup name="attrs">
+    <xs:attribute name="b" type="xs:string"/>
+  </xs:attributeGroup>
+</xs:schema>"#;
+
+    let schema_doc = parse(schema).expect("parse schema");
+    let err = match XsdValidator::from_schema(&schema_doc) {
+        Ok(_) => panic!("duplicate attribute groups must fail closed"),
+        Err(err) => err,
+    };
+    assert!(err
+        .to_string()
+        .contains("Duplicate attributeGroup definition: attrs"));
+}
+
+#[test]
 fn prefixed_xsd_type_qnames_resolve_to_imported_namespace() {
     // Prefixed `type` QNames in schemas are resolved through in-scope namespace
     // declarations. This keeps imported types precise and prevents local-name
