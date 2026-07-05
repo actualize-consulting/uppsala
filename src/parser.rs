@@ -14,11 +14,11 @@ use crate::error::{XmlError, XmlResult};
 use crate::namespace::NamespaceResolver;
 
 /// A map of general entity names to their replacement text.
-type EntityMap = HashMap<String, String>;
+pub(crate) type EntityMap = HashMap<String, String>;
 
 /// Cache of already-validated entity expansion results.
 /// Key: entity name, Value: expanded text.
-type EntityCache = HashMap<String, String>;
+pub(crate) type EntityCache = HashMap<String, String>;
 
 /// Default maximum element-nesting depth.
 ///
@@ -128,132 +128,17 @@ impl Parser {
 
     /// Parse an XML string into a [`Document`].
     pub fn parse<'a>(&self, input: &'a str) -> XmlResult<Document<'a>> {
-        let mut cursor = Cursor::new(input);
-        let mut doc = Document::new();
-        doc.input = input;
-
-        // Pre-allocate based on input size. Markup-heavy documents such as
-        // plist files can be closer to 14 bytes per node once whitespace text
-        // nodes are included, so larger inputs use a denser estimate to avoid
-        // repeated arena growth during parsing.
-        //
-        // Use `try_reserve` (not `reserve`) so a hostile or simply huge input
-        // cannot trigger an aborting upfront allocation via the global
-        // allocation-error handler. The reservation is only a hint: if the
-        // dense estimate fails on a memory-constrained host, fall back to the
-        // sparser estimate, and if that also fails just proceed — parsing still
-        // succeeds by regrowing the arena on demand.
-        let dense = if input.len() >= 256 * 1024 {
-            input.len() / 14
+        let mut pull = if self.namespace_aware {
+            crate::pull::PullParser::new(input)
         } else {
-            input.len() / 40
+            crate::pull::PullParser::with_namespace_aware(input, false)
         };
-        let sparse = input.len() / 40;
-        if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
-            let _ = doc.nodes.try_reserve(sparse);
-        }
-        let mut ns_resolver = if self.namespace_aware {
-            Some(NamespaceResolver::new())
-        } else {
-            None
-        };
-        let mut entities = EntityMap::new();
-        let mut entity_cache = EntityCache::new();
-        // Shared byte-budget for all entity expansion over this parse call.
-        // Decremented on every byte appended to an expansion buffer and on
-        // every `entity_cache` hit; returns a parse error on underflow.
-        let mut entity_budget: usize = self.max_entity_expansion;
-
-        // Skip BOM if present
-        cursor.skip_bom();
-
-        // Parse optional XML declaration (must be at very start, after BOM)
-        if cursor.starts_with("<?xml ")
-            || cursor.starts_with("<?xml\t")
-            || cursor.starts_with("<?xml\r")
-            || cursor.starts_with("<?xml\n")
-        {
-            let decl = parse_xml_declaration(&mut cursor)?;
-            doc.xml_declaration = Some(decl);
-        }
-
-        // Parse prolog content (comments, PIs, whitespace, DOCTYPE).
-        // The document-level `entity_budget` is threaded through DOCTYPE/
-        // internal-subset parsing so ATTLIST default values charge against
-        // the same cap as document content (closes the M-1 bypass).
-        let root_id = doc.root();
-        parse_misc(
-            &mut cursor,
-            &mut doc,
-            root_id,
-            &mut entities,
-            &mut entity_budget,
-            self.forbid_dtd,
-            self.forbid_entities,
-            self.max_depth,
-        )?;
-
-        // Parse document element and trailing misc
-        let mut found_root = false;
-        while !cursor.is_eof() {
-            cursor.skip_whitespace();
-            if cursor.is_eof() {
-                break;
-            }
-            if cursor.starts_with("<!--") {
-                let start = cursor.pos;
-                let comment = parse_comment(&mut cursor)?;
-                let id = doc.alloc_node(NodeKind::Comment(comment), start);
-                doc.set_byte_end_pos(id, cursor.pos);
-                doc.append_child_unchecked(root_id, id);
-            } else if cursor.starts_with("<?") {
-                let start = cursor.pos;
-                let pi = parse_pi(&mut cursor)?;
-                let id = doc.alloc_node(NodeKind::ProcessingInstruction(pi), start);
-                doc.set_byte_end_pos(id, cursor.pos);
-                doc.append_child_unchecked(root_id, id);
-            } else if cursor.starts_with("<") {
-                if found_root {
-                    return Err(XmlError::well_formedness(
-                        "Only one root element is allowed",
-                        cursor.line(),
-                        cursor.column(),
-                    ));
-                }
-                parse_element(
-                    &mut cursor,
-                    &mut doc,
-                    root_id,
-                    &mut ns_resolver,
-                    &entities,
-                    &mut entity_cache,
-                    &mut entity_budget,
-                    0,
-                    self.max_depth,
-                )?;
-                found_root = true;
-            } else {
-                // Non-whitespace text outside root element
-                return Err(XmlError::well_formedness(
-                    "Content found outside of root element",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-        }
-
-        if !found_root {
-            return Err(XmlError::well_formedness(
-                "Document must have a root element",
-                0,
-                0,
-            ));
-        }
-
-        // Set document node end position to end of input
-        doc.set_byte_end_pos(root_id, input.len());
-
-        Ok(doc)
+        pull = pull
+            .with_max_depth(self.max_depth)
+            .with_max_entity_expansion(self.max_entity_expansion)
+            .with_forbid_dtd(self.forbid_dtd)
+            .with_forbid_entities(self.forbid_entities);
+        crate::pull::document_from_pull(input, pull)
     }
 }
 
@@ -268,20 +153,20 @@ impl Default for Parser {
 /// A cursor over the input string that tracks byte position.
 /// Line/column are computed lazily from the byte position when needed
 /// (error reporting, node creation) to avoid scanning every byte for newlines.
-struct Cursor<'a> {
-    input: &'a str,
-    pos: usize,
+pub(crate) struct Cursor<'a> {
+    pub(crate) input: &'a str,
+    pub(crate) pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Cursor { input, pos: 0 }
     }
 
     /// Compute line number (1-based) from current byte position.
     /// Only called in error paths and node allocation, not in the hot parse loop.
     #[inline(never)]
-    fn line(&self) -> usize {
+    pub(crate) fn line(&self) -> usize {
         self.input.as_bytes()[..self.pos]
             .iter()
             .filter(|&&b| b == b'\n')
@@ -291,7 +176,7 @@ impl<'a> Cursor<'a> {
 
     /// Compute column number (1-based) from current byte position.
     #[inline(never)]
-    fn column(&self) -> usize {
+    pub(crate) fn column(&self) -> usize {
         let bytes = &self.input.as_bytes()[..self.pos];
         match bytes.iter().rposition(|&b| b == b'\n') {
             Some(nl_pos) => self.pos - nl_pos,
@@ -299,54 +184,54 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn is_eof(&self) -> bool {
+    pub(crate) fn is_eof(&self) -> bool {
         self.pos >= self.input.len()
     }
 
-    fn remaining(&self) -> &'a str {
+    pub(crate) fn remaining(&self) -> &'a str {
         &self.input[self.pos..]
     }
 
-    fn peek(&self) -> Option<char> {
+    pub(crate) fn peek(&self) -> Option<char> {
         self.remaining().chars().next()
     }
 
     /// Peek at the current byte without creating a char iterator.
     /// Much faster than peek() for ASCII-dominated XML content.
     #[inline(always)]
-    fn peek_byte(&self) -> Option<u8> {
+    pub(crate) fn peek_byte(&self) -> Option<u8> {
         self.input.as_bytes().get(self.pos).copied()
     }
 
-    fn starts_with(&self, prefix: &str) -> bool {
+    pub(crate) fn starts_with(&self, prefix: &str) -> bool {
         self.remaining().starts_with(prefix)
     }
 
     /// Advance by n bytes.
     #[inline(always)]
-    fn advance(&mut self, n: usize) {
+    pub(crate) fn advance(&mut self, n: usize) {
         self.pos += n;
     }
 
     /// Advance by n bytes (alias for advance, kept for compatibility).
     #[inline(always)]
-    fn advance_no_newlines(&mut self, n: usize) {
+    pub(crate) fn advance_no_newlines(&mut self, n: usize) {
         self.pos += n;
     }
 
-    fn advance_char(&mut self) -> Option<char> {
+    pub(crate) fn advance_char(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.pos += c.len_utf8();
         Some(c)
     }
 
-    fn skip_bom(&mut self) {
+    pub(crate) fn skip_bom(&mut self) {
         if self.remaining().starts_with('\u{FEFF}') {
             self.pos += '\u{FEFF}'.len_utf8();
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    pub(crate) fn skip_whitespace(&mut self) {
         let bytes = &self.input.as_bytes()[self.pos..];
         let mut i = 0;
         while i < bytes.len() {
@@ -358,7 +243,7 @@ impl<'a> Cursor<'a> {
         self.pos += i;
     }
 
-    fn expect(&mut self, expected: &str) -> XmlResult<()> {
+    pub(crate) fn expect(&mut self, expected: &str) -> XmlResult<()> {
         if self.starts_with(expected) {
             // Most expected strings are short ASCII with no newlines (e.g. "<", ">", "/>", "=")
             self.advance_no_newlines(expected.len());
@@ -374,7 +259,7 @@ impl<'a> Cursor<'a> {
 
     /// Read until the given delimiter is found. Returns the text before the delimiter
     /// as a borrowed slice. The delimiter is consumed.
-    fn read_until(&mut self, delimiter: &str) -> XmlResult<Cow<'a, str>> {
+    pub(crate) fn read_until(&mut self, delimiter: &str) -> XmlResult<Cow<'a, str>> {
         if let Some(idx) = self.remaining().find(delimiter) {
             let text = &self.input[self.pos..self.pos + idx];
             self.advance(idx + delimiter.len());
@@ -390,7 +275,7 @@ impl<'a> Cursor<'a> {
 
     /// Read until the given delimiter is found. Returns owned String.
     /// Used for DTD parsing where we don't need zero-copy.
-    fn read_until_owned(&mut self, delimiter: &str) -> XmlResult<String> {
+    pub(crate) fn read_until_owned(&mut self, delimiter: &str) -> XmlResult<String> {
         if let Some(idx) = self.remaining().find(delimiter) {
             let text = self.remaining()[..idx].to_string();
             self.advance(idx + delimiter.len());
@@ -407,7 +292,7 @@ impl<'a> Cursor<'a> {
 
 // ─── Character classifications (XML 1.0 Fifth Edition) ──
 
-fn is_xml_whitespace(c: char) -> bool {
+pub(crate) fn is_xml_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n')
 }
 
@@ -434,7 +319,7 @@ fn is_name_char(c: char) -> bool {
 }
 
 /// Check if a character is valid in XML 1.0 content.
-fn is_xml_char(c: char) -> bool {
+pub(crate) fn is_xml_char(c: char) -> bool {
     matches!(c,
         '\u{9}' | '\u{A}' | '\u{D}' |
         '\u{20}'..='\u{D7FF}' |
@@ -453,7 +338,7 @@ fn is_ascii_name_start(b: u8) -> bool {
 
 /// Parse an XML Name. Returns a borrowed slice (names never contain entities).
 /// Uses fast ASCII byte scanning with fallback to Unicode for non-ASCII.
-fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     let start = cursor.pos;
     let bytes = cursor.input.as_bytes();
 
@@ -513,7 +398,7 @@ fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 /// Convert a substring slice of a Cow into a Cow.
 /// If the source is Borrowed, the result is Borrowed; otherwise Owned.
 #[inline]
-fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
+pub(crate) fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
     match source {
         Cow::Borrowed(s) => {
             // slice is a sub-slice of s, so we can compute the offset
@@ -525,7 +410,7 @@ fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
 }
 
 /// Split a name into prefix and local parts.
-fn split_qname(name: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_qname(name: &str) -> (Option<&str>, &str) {
     if let Some(colon_pos) = name.find(':') {
         let prefix = &name[..colon_pos];
         let local = &name[colon_pos + 1..];
@@ -541,7 +426,7 @@ fn split_qname(name: &str) -> (Option<&str>, &str) {
 }
 
 /// Parse an XML declaration (`<?xml ... ?>`).
-fn parse_xml_declaration<'a>(cursor: &mut Cursor<'a>) -> XmlResult<XmlDeclaration<'a>> {
+pub(crate) fn parse_xml_declaration<'a>(cursor: &mut Cursor<'a>) -> XmlResult<XmlDeclaration<'a>> {
     cursor.expect("<?xml")?;
 
     // Must have whitespace after "<?xml"
@@ -734,7 +619,7 @@ fn parse_quoted_value<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 /// Parse a quoted attribute value with entity resolution.
 /// Returns Cow::Borrowed when no entity/char references are encountered,
 /// Cow::Owned when allocation is needed.
-fn parse_quoted_value_with_entities<'a>(
+pub(crate) fn parse_quoted_value_with_entities<'a>(
     cursor: &mut Cursor<'a>,
     entities: &EntityMap,
     entity_cache: &mut EntityCache,
@@ -848,7 +733,7 @@ fn parse_reference(cursor: &mut Cursor) -> XmlResult<String> {
 }
 
 /// Parse a character or entity reference with custom entity resolution.
-fn parse_reference_with_entities(
+pub(crate) fn parse_reference_with_entities(
     cursor: &mut Cursor,
     entities: &EntityMap,
     entity_cache: &mut EntityCache,
@@ -1274,7 +1159,7 @@ fn validate_entity_as_content(
 }
 
 /// Parse a comment (`<!-- ... -->`).
-fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     cursor.expect("<!--")?;
     let content = cursor.read_until("-->")?;
     // Well-formedness: comments must not contain "--"
@@ -1307,7 +1192,7 @@ fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 }
 
 /// Parse a processing instruction (`<?target data?>`).
-fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>> {
+pub(crate) fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>> {
     cursor.expect("<?")?;
     let target = parse_name(cursor)?;
     // Well-formedness: target must not be "xml" (case-insensitive)
@@ -1358,6 +1243,7 @@ fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>>
 /// processing ATTLIST default values charges against the same cap as document
 /// content.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn parse_misc<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
@@ -1413,7 +1299,7 @@ fn parse_misc<'a>(
 /// `entity_budget` is the shared document-level expansion budget. It is
 /// threaded into the internal-subset parser so ATTLIST default values
 /// charge against the same cap as document content.
-fn parse_doctype<'a>(
+pub(crate) fn parse_doctype<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
     entities: &mut EntityMap,
@@ -2442,6 +2328,7 @@ fn parse_notation_decl(cursor: &mut Cursor) -> XmlResult<()> {
 /// instead of recursing further — this prevents stack overflow on maliciously
 /// deep input.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn parse_element<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
@@ -2730,6 +2617,7 @@ fn parse_element<'a>(
 /// `depth` is the depth of the *parent* element; any child element parsed here
 /// will be at `depth + 1` and is checked against `max_depth`.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn parse_content<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
@@ -2958,7 +2846,7 @@ fn parse_content<'a>(
 }
 
 /// Parse a CDATA section. Returns borrowed slice (CDATA never has entity expansion).
-fn parse_cdata<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_cdata<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     cursor.expect("<![CDATA[")?;
     let content = cursor.read_until("]]>")?;
     // Validate all characters are valid XML chars

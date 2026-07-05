@@ -109,6 +109,8 @@ mod exslt;
 pub mod namespace;
 /// XML 1.0 (Fifth Edition) recursive-descent parser.
 pub mod parser;
+/// XML pull parser event stream.
+pub mod pull;
 /// Accelerated byte scanning for parser hot loops.
 mod simd;
 
@@ -138,6 +140,7 @@ pub use error::{
 };
 pub use namespace::NamespaceResolver;
 pub use parser::Parser;
+pub use pull::{NamespaceDeclaration, PullEvent, PullParser};
 pub use writer::XmlWriter;
 pub use xpath::{XPathEvaluator, XPathValue};
 pub use xsd::{XsdValidator, XSI_NAMESPACE, XS_NAMESPACE};

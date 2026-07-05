@@ -67,7 +67,8 @@ This configures/builds libxml2 as a local static release library, builds the
 Uppsala harness with `RUSTFLAGS='-C target-cpu=native'`, pins the run to CPU 0
 when `taskset` is available, and prints one final Markdown table containing
 the SAML-shaped inputs, larger generated XML shapes, and representative
-local/libxml2 XML fixtures.
+local/libxml2 XML fixtures. The report includes namespace-aware DOM,
+namespace-disabled DOM, pull scan-only, and explicit pull-to-DOM timings.
 
 The default sample count is `301`. Use a larger count for steadier medians:
 
@@ -134,12 +135,13 @@ The trailing number is the sample count (default `31`). Each run does a short
 warmup, then reports medians in microseconds. Output is tab-separated:
 
 ```text
-file  bytes  uppsala_ns_us  uppsala_no_ns_us  libxml2_us  ratio_ns  ratio_no_ns
+file  bytes  uppsala_ns_us  uppsala_no_ns_us  uppsala_pull_scan_us  uppsala_pull_dom_us  libxml2_us  ratio_ns  ratio_no_ns  ratio_pull_scan  ratio_pull_dom
 ```
 
 The `ratio_ns` column corresponds to the default namespace-aware mode; SAML
 users should usually care about this column. `ratio_no_ns` is Uppsala with
-namespace resolution disabled.
+namespace resolution disabled. `ratio_pull_scan` is the direct pull event stream
+without DOM allocation, and `ratio_pull_dom` is the explicit pull-to-DOM builder.
 
 ## Profiling
 

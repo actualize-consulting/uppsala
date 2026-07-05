@@ -56,8 +56,10 @@ From the repository root:
 just bench-libxml2
 ```
 
-This builds libxml2 and the native Uppsala harness, then prints one final table
-with:
+This builds libxml2 and the native Uppsala harness, then prints one final table.
+Uppsala is measured through the stable DOM API, namespace-disabled DOM API,
+pull scan-only API, and explicit pull-to-DOM API, alongside libxml2. The report
+includes:
 
 - SAML-shaped response documents
 - a larger generated SAML metadata aggregate
@@ -119,13 +121,14 @@ The suite directory must contain:
 Output is tab-separated:
 
 ```text
-file  bytes  uppsala_ns_us  uppsala_no_ns_us  libxml2_us  ratio_ns  ratio_no_ns
+file  bytes  uppsala_ns_us  uppsala_no_ns_us  uppsala_pull_scan_us  uppsala_pull_dom_us  libxml2_us  ratio_ns  ratio_no_ns  ratio_pull_scan  ratio_pull_dom
 ```
 
 The `Ratio` columns are `libxml2 / Uppsala`; values above `1.0` mean Uppsala
-parsed faster. Uppsala is benchmarked twice: namespace-aware default mode and
-namespace-disabled mode. SAML users should usually care about the
-namespace-aware column.
+parsed faster. `uppsala_ns_us` is the namespace-aware DOM parser,
+`uppsala_no_ns_us` disables namespace resolution, `uppsala_pull_scan_us` drains
+the pull event stream without materializing a DOM, and `uppsala_pull_dom_us`
+builds a DOM directly from pull events.
 
 On x86_64, this harness exercises Uppsala's SSE2 scanners. For server
 deployment benchmarking, prefer `RUSTFLAGS='-C target-cpu=native'` so LLVM can

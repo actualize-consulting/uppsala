@@ -57,6 +57,8 @@ struct Row {
     bytes: usize,
     uppsala_ns: Duration,
     uppsala_no_ns: Duration,
+    uppsala_pull_scan: Duration,
+    uppsala_pull_dom: Duration,
     libxml2: Duration,
 }
 
@@ -88,6 +90,8 @@ fn bench_text(name: impl Into<String>, text: &str, samples: usize) -> Row {
 
     let mut uppsala_ns = bench_one(|| parser_ns.parse(text).unwrap(), samples);
     let mut uppsala_no_ns = bench_one(|| parser_no_ns.parse(text).unwrap(), samples);
+    let mut uppsala_pull_scan = bench_one(|| parse_pull_scan(text), samples);
+    let mut uppsala_pull_dom = bench_one(|| parse_pull_dom(text), samples);
     let mut libxml2 = bench_one(|| parse_libxml2(text), samples);
 
     Row {
@@ -95,27 +99,35 @@ fn bench_text(name: impl Into<String>, text: &str, samples: usize) -> Row {
         bytes: text.len(),
         uppsala_ns: median(&mut uppsala_ns),
         uppsala_no_ns: median(&mut uppsala_no_ns),
+        uppsala_pull_scan: median(&mut uppsala_pull_scan),
+        uppsala_pull_dom: median(&mut uppsala_pull_dom),
         libxml2: median(&mut libxml2),
     }
 }
 
 fn print_header() {
-    println!("file\tbytes\tuppsala_ns_us\tuppsala_no_ns_us\tlibxml2_us\tratio_ns\tratio_no_ns");
+    println!("file\tbytes\tuppsala_ns_us\tuppsala_no_ns_us\tuppsala_pull_scan_us\tuppsala_pull_dom_us\tlibxml2_us\tratio_ns\tratio_no_ns\tratio_pull_scan\tratio_pull_dom");
 }
 
 fn print_row(row: &Row) {
     let u_ns = micros(row.uppsala_ns);
     let u_no_ns = micros(row.uppsala_no_ns);
+    let u_pull_scan = micros(row.uppsala_pull_scan);
+    let u_pull_dom = micros(row.uppsala_pull_dom);
     let l = micros(row.libxml2);
     println!(
-        "{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+        "{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
         row.name,
         row.bytes,
         u_ns,
         u_no_ns,
+        u_pull_scan,
+        u_pull_dom,
         l,
         row.libxml2.as_secs_f64() / row.uppsala_ns.as_secs_f64(),
-        row.libxml2.as_secs_f64() / row.uppsala_no_ns.as_secs_f64()
+        row.libxml2.as_secs_f64() / row.uppsala_no_ns.as_secs_f64(),
+        row.libxml2.as_secs_f64() / row.uppsala_pull_scan.as_secs_f64(),
+        row.libxml2.as_secs_f64() / row.uppsala_pull_dom.as_secs_f64()
     );
 }
 
@@ -159,6 +171,18 @@ fn parse_libxml2(text: &str) {
     unsafe {
         xmlFreeDoc(doc);
     }
+}
+
+fn parse_pull_scan(text: &str) {
+    let mut parser = uppsala::PullParser::new(text);
+    while let Some(event) = parser.next_event().unwrap() {
+        black_box(event);
+    }
+}
+
+fn parse_pull_dom(text: &str) {
+    let doc = uppsala::pull::document_from_pull(text, uppsala::PullParser::new(text)).unwrap();
+    black_box(doc);
 }
 
 fn run_file(path: &Path, samples: usize) {
@@ -251,18 +275,22 @@ fn run_libxml2_report(samples: usize) {
         rows.push(bench_text(name, &text, samples));
     }
 
-    println!("| Input | Size | Uppsala ns | Uppsala no-ns | libxml2 | Ratio ns | Ratio no-ns |");
-    println!("|---|---:|---:|---:|---:|---:|---:|");
+    println!("| Input | Size | Uppsala ns | Uppsala no-ns | Pull scan | Pull DOM | libxml2 | Ratio ns | Ratio no-ns | Ratio pull scan | Ratio pull DOM |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {:.2}x | {:.2}x |",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.2}x | {:.2}x | {:.2}x | {:.2}x |",
             row.name,
             format_size(row.bytes),
             format_duration(row.uppsala_ns),
             format_duration(row.uppsala_no_ns),
+            format_duration(row.uppsala_pull_scan),
+            format_duration(row.uppsala_pull_dom),
             format_duration(row.libxml2),
             row.libxml2.as_secs_f64() / row.uppsala_ns.as_secs_f64(),
             row.libxml2.as_secs_f64() / row.uppsala_no_ns.as_secs_f64(),
+            row.libxml2.as_secs_f64() / row.uppsala_pull_scan.as_secs_f64(),
+            row.libxml2.as_secs_f64() / row.uppsala_pull_dom.as_secs_f64(),
         );
     }
 }
