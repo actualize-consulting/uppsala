@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-05
+
 ### Security
 
 - Hardened the pull parser fail-closed contract: direct `PullParser::next_event()`
@@ -32,11 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct pull error fusion, computed XSLT QName injection attempts, XPath
   trailing-token and flat-chain depth checks, XSD identity tuple lookup, and
   stale encoding declarations in `parse_bytes()`.
-
-## [0.8.1] - 2026-07-05
-
-### Added
-
 - Pull-based XML event parser (`uppsala::pull`, ADR 0018): `PullParser`
   iterates `PullEvent`s — XML declaration, DOCTYPE, start/end namespace,
   start/end element (with resolved QNames, attributes, depth, and byte

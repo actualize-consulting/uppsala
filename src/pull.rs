@@ -512,7 +512,37 @@ impl<'a> PullParser<'a> {
                     }
                     self.cursor.advance_no_newlines(1);
                 }
-                _ => unreachable!(),
+                _ => {
+                    // `scan_content_delimiters` (src/simd.rs) is contracted to
+                    // stop only at `<`, `&`, `\r`, or `]`, so the arms above are
+                    // exhaustive for the current scanner. Don't encode that
+                    // cross-module invariant as `unreachable!()`: if the
+                    // scanner's delimiter set ever grows and this consumer is
+                    // missed, an `unreachable!()` here would turn every affected
+                    // document into a process-killing panic (a DoS on hostile
+                    // input). Degrade gracefully instead: validate and append
+                    // one whole character as ordinary content, then advance.
+                    let Some(tail) = self.cursor.input.get(self.cursor.pos..) else {
+                        return Err(XmlError::well_formedness(
+                            "Parser stopped at a non-character boundary while scanning text",
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        ));
+                    };
+                    let Some(ch) = tail.chars().next() else {
+                        return Err(XmlError::UnexpectedEof);
+                    };
+                    if !is_xml_char(ch) {
+                        return Err(XmlError::well_formedness(
+                            format!("Invalid XML character U+{:04X}", ch as u32),
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        ));
+                    }
+                    let before_pos = self.cursor.pos;
+                    self.cursor.advance_no_newlines(ch.len_utf8());
+                    text_buf.push_char(self.cursor.input, before_pos, ch);
+                }
             }
         }
     }
@@ -654,7 +684,90 @@ impl<'a> PullParser<'a> {
             }
         }
 
-        let (prefix, local_name) = split_qname(&tag_name);
+        // Resolve names and consume the tag close. Every step here is fallible
+        // (undeclared prefix, duplicate attribute, missing `>`), and we have
+        // already pushed a namespace scope above — so any error must unwind
+        // that scope to keep `push_scope`/`pop_scope` balanced. `next_event`
+        // fuses the parser to `Done` on error today, which hides an unbalanced
+        // resolver, but the balance must not depend on that: keep it correct so
+        // the resolver stays reusable and the parser could become resumable.
+        let (qname, resolved_attrs, self_closing, byte_end) =
+            match self.resolve_and_close_start_tag(&tag_name, raw_attrs) {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if pushed_ns_scope {
+                        if let Some(resolver) = self.ns_resolver.as_mut() {
+                            resolver.pop_scope();
+                        }
+                    }
+                    return Err(err);
+                }
+            };
+
+        if self.namespace_aware {
+            for (prefix, uri) in &ns_decls {
+                self.pending.push_back(PullEvent::StartNamespace {
+                    prefix: if prefix.is_empty() {
+                        None
+                    } else {
+                        Some(prefix.clone())
+                    },
+                    uri: uri.clone(),
+                });
+            }
+        }
+
+        self.pending.push_back(PullEvent::StartElement {
+            name: qname.clone(),
+            attributes: resolved_attrs,
+            namespace_declarations: ns_decls.clone(),
+            byte_start: start_pos,
+            byte_end,
+            depth,
+        });
+
+        if self_closing {
+            self.pending.push_back(PullEvent::EndElement {
+                name: qname,
+                byte_start: start_pos,
+                byte_end,
+                depth,
+            });
+            if pushed_ns_scope {
+                if let Some(resolver) = self.ns_resolver.as_mut() {
+                    resolver.pop_scope();
+                }
+            }
+            if self.namespace_aware {
+                for _ in 0..ns_decls.len() {
+                    self.pending.push_back(PullEvent::EndNamespace);
+                }
+            }
+        } else {
+            self.stack.push(OpenElement {
+                raw_name: tag_name,
+                name: qname,
+                pushed_ns_scope,
+                namespace_count: ns_decls.len(),
+                depth,
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the element and attribute QNames against the current namespace
+    /// scope and consume the tag's `>` or `/>`. Split out from
+    /// [`Self::parse_start_element`] so its single caller can unwind a
+    /// just-pushed namespace scope on any error (see the call site). Returns
+    /// the resolved name, resolved attributes, whether the tag self-closes, and
+    /// the byte offset immediately after the close.
+    #[allow(clippy::type_complexity)]
+    fn resolve_and_close_start_tag(
+        &mut self,
+        tag_name: &Cow<'a, str>,
+        raw_attrs: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> XmlResult<(QName<'a>, Vec<Attribute<'a>>, bool, usize)> {
+        let (prefix, local_name) = split_qname(tag_name);
         let qname = if let Some(resolver) = self.ns_resolver.as_ref() {
             let ns: Option<Cow<'a, str>> = if let Some(p) = prefix {
                 let uri = resolver.resolve(p).ok_or_else(|| {
@@ -670,8 +783,8 @@ impl<'a> PullParser<'a> {
             };
             QName {
                 namespace_uri: ns,
-                prefix: prefix.map(|s| borrow_from_cow(&tag_name, s)),
-                local_name: borrow_from_cow(&tag_name, local_name),
+                prefix: prefix.map(|s| borrow_from_cow(tag_name, s)),
+                local_name: borrow_from_cow(tag_name, local_name),
             }
         } else {
             QName::local(tag_name.clone())
@@ -723,58 +836,7 @@ impl<'a> PullParser<'a> {
             self.cursor.expect(">")?;
         }
         let byte_end = self.cursor.pos;
-
-        if self.namespace_aware {
-            for (prefix, uri) in &ns_decls {
-                self.pending.push_back(PullEvent::StartNamespace {
-                    prefix: if prefix.is_empty() {
-                        None
-                    } else {
-                        Some(prefix.clone())
-                    },
-                    uri: uri.clone(),
-                });
-            }
-        }
-
-        self.pending.push_back(PullEvent::StartElement {
-            name: qname.clone(),
-            attributes: resolved_attrs,
-            namespace_declarations: ns_decls.clone(),
-            byte_start: start_pos,
-            byte_end,
-            depth,
-        });
-
-        if self_closing {
-            self.pending.push_back(PullEvent::EndElement {
-                name: qname,
-                byte_start: start_pos,
-                byte_end,
-                depth,
-            });
-            if pushed_ns_scope {
-                let resolver = self
-                    .ns_resolver
-                    .as_mut()
-                    .expect("namespace resolver exists");
-                resolver.pop_scope();
-            }
-            if self.namespace_aware {
-                for _ in 0..ns_decls.len() {
-                    self.pending.push_back(PullEvent::EndNamespace);
-                }
-            }
-        } else {
-            self.stack.push(OpenElement {
-                raw_name: tag_name,
-                name: qname,
-                pushed_ns_scope,
-                namespace_count: ns_decls.len(),
-                depth,
-            });
-        }
-        Ok(())
+        Ok((qname, resolved_attrs, self_closing, byte_end))
     }
 
     fn parse_end_element(&mut self) -> XmlResult<()> {
@@ -808,11 +870,9 @@ impl<'a> PullParser<'a> {
             depth: open.depth,
         });
         if open.pushed_ns_scope {
-            let resolver = self
-                .ns_resolver
-                .as_mut()
-                .expect("namespace resolver exists");
-            resolver.pop_scope();
+            if let Some(resolver) = self.ns_resolver.as_mut() {
+                resolver.pop_scope();
+            }
         }
         if self.namespace_aware {
             for _ in 0..open.namespace_count {
@@ -857,6 +917,13 @@ pub fn document_from_pull<'a>(
     let root = doc.root();
     let mut stack = vec![root];
 
+    fn current_parent(stack: &[crate::dom::NodeId]) -> XmlResult<crate::dom::NodeId> {
+        stack
+            .last()
+            .copied()
+            .ok_or_else(|| XmlError::well_formedness("DOM builder stack unexpectedly empty", 0, 0))
+    }
+
     while let Some(event) = parser.next_event()? {
         match event {
             PullEvent::XmlDeclaration(decl) => doc.xml_declaration = Some(decl),
@@ -877,7 +944,7 @@ pub fn document_from_pull<'a>(
                     }),
                     byte_start,
                 );
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
                 stack.push(id);
             }
@@ -894,7 +961,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::Text(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::CData {
@@ -904,7 +971,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::CData(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::Comment {
@@ -914,7 +981,7 @@ pub fn document_from_pull<'a>(
             } => {
                 let id = doc.alloc_node(crate::dom::NodeKind::Comment(content), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
             PullEvent::ProcessingInstruction {
@@ -925,7 +992,7 @@ pub fn document_from_pull<'a>(
                 let id =
                     doc.alloc_node(crate::dom::NodeKind::ProcessingInstruction(pi), byte_start);
                 doc.set_byte_end_pos(id, byte_end);
-                let parent = *stack.last().expect("document root is always present");
+                let parent = current_parent(&stack)?;
                 doc.append_child_unchecked(parent, id);
             }
         }
@@ -1026,6 +1093,33 @@ mod tests {
         assert_eq!(
             event_names(r#"<!DOCTYPE r [<!ENTITY e "">]><r>&e;</r>"#),
             vec!["doctype", "start", "end"]
+        );
+    }
+
+    #[test]
+    fn ns_scope_unwinds_on_resolution_error() {
+        // Regression (F-2): a start tag that pushes a namespace scope
+        // (`xmlns:a`) and then fails name resolution (undeclared prefix `b` on
+        // an attribute) must pop that scope before returning the error, keeping
+        // push_scope/pop_scope balanced. Before the fix the scope leaked
+        // (depth 2 instead of the baseline 1).
+        let mut p = PullParser::new(r#"<r xmlns:a="urn:a" b:k="v"/>"#);
+        let mut errored = false;
+        loop {
+            match p.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        assert!(errored, "undeclared attribute prefix should error");
+        assert_eq!(
+            p.ns_resolver.as_ref().unwrap().scope_depth(),
+            1,
+            "namespace scope leaked after a resolution error"
         );
     }
 

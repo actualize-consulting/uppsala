@@ -76,6 +76,14 @@ impl<'a> NamespaceResolver<'a> {
         }
     }
 
+    /// Number of active scopes, including the root scope (so a resolver with no
+    /// element open reports `1`). Used to assert `push_scope`/`pop_scope`
+    /// balance in tests.
+    #[cfg(test)]
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scopes.len()
+    }
+
     /// Declare a namespace binding in the current scope.
     ///
     /// `prefix` is the empty string for a default namespace declaration.

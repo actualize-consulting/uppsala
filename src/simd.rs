@@ -10,6 +10,15 @@
 /// Returns `(bytes_advanced, needs_validation)` where `needs_validation` is true
 /// if any non-ASCII byte (>= 0x80) or illegal control character (< 0x20 except
 /// TAB, LF) was encountered in the scanned range.
+///
+/// **Delimiter-set contract.** The stop set is exactly `{ '<', '&', '\r', ']' }`
+/// — all ASCII, so the returned offset is always on a UTF-8 char boundary. The
+/// sole production consumer is the pull parser (`pull::parse_text_event`), which
+/// dispatches on the byte this scanner stops at. If the stop set ever changes,
+/// update that consumer's match arms to match; it degrades gracefully (appends
+/// one UTF-8 character as content) rather than panicking on an unexpected stop
+/// byte, so a missed update is a correctness bug, not a crash -- keep it that
+/// way.
 #[inline(always)]
 pub(crate) fn scan_content_delimiters(data: &[u8]) -> (usize, bool) {
     #[cfg(target_arch = "x86_64")]
