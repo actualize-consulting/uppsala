@@ -10,6 +10,7 @@ ALL_TARGETS=(
   fuzz_escape_differential
   fuzz_parse
   fuzz_parse_bytes
+  fuzz_pull
   fuzz_roundtrip
   fuzz_serialize
   fuzz_dom_mutate

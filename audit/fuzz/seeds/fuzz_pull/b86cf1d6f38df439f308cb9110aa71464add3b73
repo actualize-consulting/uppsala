@@ -1,0 +1,14 @@
+<!DOCTYPE rz [
+
+
+<!ATTLIST a a ID #IMPLIED>
+
+
+
+
+
+
+
+<!ATTLIST a a IDR
+
+<!ATTLIST a a IDREFS #R

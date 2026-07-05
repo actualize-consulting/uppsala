@@ -169,6 +169,74 @@ fn is_xml10_5e(test: &W3cTestCase) -> bool {
     }
 }
 
+/// Differential sweep for the pull parser: for every catalog test file that
+/// decodes as UTF-8, driving the raw `PullParser` event stream to exhaustion
+/// must accept/reject the document exactly like the DOM parser, with the same
+/// error text on rejection. This is an internal-agreement check rather than a
+/// conformance verdict, so it covers every test type — including the tests the
+/// verdict-based runs below skip (non-standalone, `error`, other editions).
+#[test]
+fn w3c_pull_event_stream_agrees_with_dom_parser() {
+    let tests = load_all_tests();
+    if tests.is_empty() {
+        eprintln!("W3C test suite not found, skipping");
+        return;
+    }
+
+    let mut checked = 0;
+    let mut skipped = 0;
+    let mut divergences = Vec::new();
+
+    for test in &tests {
+        let file_path = test.base_dir.join(&test.uri);
+        let bytes = match fs::read(&file_path) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        // The pull parser is a &str surface; UTF-16 decoding happens upstream
+        // in parse_bytes and is out of scope here.
+        let s = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let dom_err = uppsala::parse(s).err().map(|e| e.to_string());
+        let mut scan_err = None;
+        for event in uppsala::PullParser::new(s) {
+            if let Err(err) = event {
+                scan_err = Some(err.to_string());
+                break;
+            }
+        }
+
+        checked += 1;
+        if dom_err != scan_err {
+            divergences.push(format!(
+                "  {} ({}): DOM parser {:?} vs pull scan {:?}",
+                test.id, test.uri, dom_err, scan_err
+            ));
+        }
+    }
+
+    eprintln!(
+        "W3C pull-vs-DOM agreement: {} checked, {} skipped, {} divergences",
+        checked,
+        skipped,
+        divergences.len()
+    );
+    assert!(
+        divergences.is_empty(),
+        "pull event stream diverged from the DOM parser:\n{}",
+        divergences.join("\n")
+    );
+}
+
 #[test]
 fn w3c_xmltest_not_well_formed_standalone() {
     let tests = load_all_tests();

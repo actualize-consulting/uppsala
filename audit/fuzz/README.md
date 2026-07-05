@@ -24,6 +24,7 @@ harnesses are chosen to drive every one of those routines with adversarial input
 | `fuzz_escape_differential` | **SSE2 vs scalar**, `scan_escape` + escaper safety | `scan_escape_sse2`; asserts no injectable byte survives escaping |
 | `fuzz_parse` | `parse(&str)` | `scan_content_sse2`, `scan_attr_sse2` |
 | `fuzz_parse_bytes` | `parse_bytes(&[u8])` | UTF-16/BOM decode + parser |
+| `fuzz_pull` | **pull vs DOM**, `PullParser` event stream (scan-only) | event-stream invariants (ADR 0018) + accept/reject agreement with `parse` |
 | `fuzz_roundtrip` | parse → serialize → reparse (fixpoint oracle) | `scan_escape_sse2`, sibling-walk serializer |
 | `fuzz_serialize` | **builds an arbitrary DOM** → serialize 3 ways | `scan_escape_sse2` at all alignments; name sanitizers |
 | `fuzz_dom_mutate` | arbitrary edit sequence + `prepare_xpath()` | attribute-node arena recycling; `is_linkable_node` guards |
@@ -74,9 +75,15 @@ can't masquerade as a library finding.
 
 ### Oracles
 
-Beyond "don't crash / don't trip ASan", two harnesses assert semantic
+Beyond "don't crash / don't trip ASan", three harnesses assert semantic
 invariants:
 
+- **`fuzz_pull`** — the scan-only `PullParser` event stream must satisfy the
+  ADR 0018 stream invariants (start/end element balance with matching names
+  and depths, namespace-event balance, in-bounds byte ranges, fused iterator
+  after an error) and must accept/reject the input exactly like the DOM
+  parser. This oracle class is what caught the empty-entity end-of-document
+  regression (W3C valid-sa-023) during the pull-parser bring-up.
 - **`fuzz_roundtrip`** — serialization is a fixpoint: `parse(s).to_xml()` must
   equal `parse(parse(s).to_xml()).to_xml()`. The assert only fires when both
   parses succeed, so parser resource limits never cause false positives.
@@ -189,6 +196,44 @@ just fuzz-coverage fuzz_roundtrip   # HTML report under audit/fuzz/coverage/<tar
 just fuzz-cmin fuzz_roundtrip       # drop redundant corpus entries
 ```
 
+### Extended corpus (from test-data/corpus)
+
+`scripts/fetch_corpus.sh` assembles a broader corpus under
+`test-data/corpus/` (libxml2 `test/recurse`, `test/schemas`, `test/XPath`,
+and fuzzer dictionaries at a pinned commit; dvyukov/go-fuzz-corpus if online;
+generated real-world dialect samples and XXE/round-trip payloads). Import it
+into the working set with:
+
+```bash
+just fetch-corpus        # assemble test-data/corpus/ (idempotent)
+just fuzz-seed-import    # copy into audit/fuzz/corpus/<target>/ + merge dicts
+```
+
+`fuzz-seed-import` (`scripts/seed-import.sh`) lands the large external inputs
+in the **git-ignored working corpus** (`corpus/<target>/`, not the tracked
+`seeds/`), so git stays lean, and folds the libxml2 `xml`/`xpath`/`schema`/
+`regexp` dictionary tokens into the tracked `dict/*.dict` (deduplicated). It
+is a no-op when the corpus has not been fetched.
+
+## Mapping to SECURITY_AUDIT findings
+
+The fuzz targets provide continuous coverage of the same surfaces the
+`SECURITY_AUDIT.md` findings (and `tests/security_audit.rs`,
+`tests/hardening_regressions.rs`, `tests/security_regressions.rs`,
+`tests/security_corpus.rs`) pin as regressions:
+
+| Finding area | Regression tests | Fuzz target(s) |
+|---|---|---|
+| Entity-expansion DoS (billion laughs, quadratic, parameter laughs) | `security_corpus::recurse_*`, `security_audit` F-01/F-02 | `fuzz_parse`, `fuzz_parse_bytes`, `fuzz_pull` (seeded from `security/recurse`) |
+| Pull/DOM parser agreement (`tests/pull_differential.rs`, `w3c_xmlconf` sweep) | `pull_differential::*`, `w3c_pull_event_stream_agrees_with_dom_parser` | `fuzz_pull` (stream invariants + accept/reject agreement) |
+| Deep-nesting stack safety (F-03) | `security_audit::deep_nesting_*` | `fuzz_parse` |
+| XXE / external-entity non-resolution | `security_corpus::xxe_*`, `security_corpus::recurse_external_*` | `fuzz_parse` (seeded from `security/xxe`) |
+| Round-trip smuggling (F-13/14/15) | `security_corpus::roundtrip_*`, `security_regressions` | `fuzz_roundtrip` (fixpoint oracle) |
+| UTF-16 / encoding decode | `encoding_matrix::*`, `security_audit` UTF-16 | `fuzz_parse_bytes` |
+| SIMD scalar/SSE2 divergence | `simd::tests::content_flag_matches_scalar_*` | `fuzz_simd_differential`, `fuzz_escape_differential` |
+| XSD regex ReDoS (F-04) | `hardening_regressions::xsd_regex_polynomial_redos` | `fuzz_xsd_regex` |
+| XPath axis budget (F-05) | `hardening_regressions::xpath_axis_expansion_is_budgeted` | `fuzz_xpath` |
+
 `fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`); it
 calls `llvm-cov` directly rather than the `cargo cov` wrapper, which panics on
 some `cargo-binutils`/clap combinations. `rustfilt` is optional — install it
@@ -210,7 +255,7 @@ cargo +nightly fuzz run   --fuzz-dir audit/fuzz fuzz_roundtrip -- -fork=$(nproc)
 ```
 audit/fuzz/
 ├── Cargo.toml              # detached fuzz crate (uppsala + libfuzzer-sys + arbitrary)
-├── fuzz_targets/*.rs       # the 11 harnesses (2 differential + 9 end-to-end)
+├── fuzz_targets/*.rs       # the 12 harnesses (3 differential + 9 end-to-end)
 ├── seeds/<target>/         # curated seed inputs (tracked)
 ├── dict/*.dict             # libFuzzer dictionaries
 └── scripts/

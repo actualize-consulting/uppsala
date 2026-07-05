@@ -5,7 +5,7 @@
 //! point and option wiring against the same regression-oriented corpus used by
 //! the normal parser tests.
 
-use uppsala::pull::{document_from_pull, PullParser};
+use uppsala::pull::{document_from_pull, PullEvent, PullParser};
 use uppsala::{Document, Parser, XmlResult, XmlWriteOptions};
 
 fn full_xml(doc: &Document<'_>) -> String {
@@ -30,9 +30,123 @@ fn unwrap_err_text<T>(result: XmlResult<T>, name: &str, path: &str) -> String {
     }
 }
 
-fn assert_pull_dom_matches_parser(name: &str, xml: &str, parser: Parser, pull: PullParser<'_>) {
+/// Drive the raw event stream (no DOM) to exhaustion, enforcing the stream
+/// invariants of ADR 0018 on every event: start/end element balance with
+/// matching names and depths, namespace-event balance, in-bounds byte ranges,
+/// and a fused iterator after an error. Returns `Ok(())` on clean exhaustion
+/// or the error text of the first failure.
+fn scan_events(mut pull: PullParser<'_>, input: &str, name: &str) -> Result<(), String> {
+    let mut open: Vec<(String, u32)> = Vec::new();
+    let mut ns_starts = 0usize;
+    let mut ns_ends = 0usize;
+
+    let check_range = |what: &str, byte_start: usize, byte_end: usize| {
+        assert!(
+            byte_start <= byte_end && byte_end <= input.len(),
+            "{name}: {what} byte range {byte_start}..{byte_end} out of bounds (len {})",
+            input.len()
+        );
+    };
+
+    while let Some(item) = pull.next() {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                assert!(
+                    pull.next().is_none(),
+                    "{name}: iterator not fused after error"
+                );
+                return Err(err.to_string());
+            }
+        };
+        match event {
+            PullEvent::StartElement {
+                name: qname,
+                byte_start,
+                byte_end,
+                depth,
+                ..
+            } => {
+                check_range("StartElement", byte_start, byte_end);
+                assert_eq!(
+                    depth as usize,
+                    open.len(),
+                    "{name}: StartElement depth mismatch"
+                );
+                open.push((qname.to_string(), depth));
+            }
+            PullEvent::EndElement {
+                name: qname,
+                byte_start,
+                byte_end,
+                depth,
+            } => {
+                check_range("EndElement", byte_start, byte_end);
+                let (open_name, open_depth) = open
+                    .pop()
+                    .unwrap_or_else(|| panic!("{name}: EndElement without matching start"));
+                assert_eq!(qname.to_string(), open_name, "{name}: EndElement name");
+                assert_eq!(depth, open_depth, "{name}: EndElement depth");
+            }
+            PullEvent::StartNamespace { .. } => ns_starts += 1,
+            PullEvent::EndNamespace => {
+                ns_ends += 1;
+                assert!(
+                    ns_ends <= ns_starts,
+                    "{name}: EndNamespace without matching start"
+                );
+            }
+            PullEvent::Text {
+                content,
+                byte_start,
+                byte_end,
+            } => {
+                check_range("Text", byte_start, byte_end);
+                assert!(!content.is_empty(), "{name}: empty Text event");
+            }
+            PullEvent::CData {
+                byte_start,
+                byte_end,
+                ..
+            } => check_range("CData", byte_start, byte_end),
+            PullEvent::Comment {
+                byte_start,
+                byte_end,
+                ..
+            } => check_range("Comment", byte_start, byte_end),
+            PullEvent::ProcessingInstruction {
+                byte_start,
+                byte_end,
+                ..
+            } => check_range("ProcessingInstruction", byte_start, byte_end),
+            PullEvent::XmlDeclaration(_) | PullEvent::Doctype(_) => {}
+        }
+    }
+
+    assert!(
+        open.is_empty(),
+        "{name}: {} elements left open after exhaustion",
+        open.len()
+    );
+    assert_eq!(
+        ns_starts, ns_ends,
+        "{name}: unbalanced namespace events after exhaustion"
+    );
+    Ok(())
+}
+
+fn assert_pull_dom_matches_parser<'a>(
+    name: &str,
+    xml: &'a str,
+    parser: Parser,
+    make_pull: impl Fn() -> PullParser<'a>,
+) {
     let normal = unwrap_doc(parser.parse(xml), name, "Parser::parse");
-    let from_pull = unwrap_doc(document_from_pull(xml, pull), name, "document_from_pull");
+    let from_pull = unwrap_doc(
+        document_from_pull(xml, make_pull()),
+        name,
+        "document_from_pull",
+    );
 
     assert_eq!(
         full_xml(&from_pull),
@@ -49,16 +163,34 @@ fn assert_pull_dom_matches_parser(name: &str, xml: &str, parser: Parser, pull: P
         root_range(&normal),
         "{name}: document-element source range differs"
     );
+
+    if let Err(err) = scan_events(make_pull(), xml, name) {
+        panic!("{name}: scan-only event stream failed: {err}");
+    }
 }
 
 fn assert_default_match(name: &str, xml: &str) {
-    assert_pull_dom_matches_parser(name, xml, Parser::new(), PullParser::new(xml));
+    assert_pull_dom_matches_parser(name, xml, Parser::new(), || PullParser::new(xml));
 }
 
-fn assert_same_failure(name: &str, xml: &str, parser: Parser, pull: PullParser<'_>) {
+fn assert_same_failure<'a>(
+    name: &str,
+    xml: &'a str,
+    parser: Parser,
+    make_pull: impl Fn() -> PullParser<'a>,
+) {
     let normal = unwrap_err_text(parser.parse(xml), name, "Parser::parse");
-    let from_pull = unwrap_err_text(document_from_pull(xml, pull), name, "document_from_pull");
+    let from_pull = unwrap_err_text(
+        document_from_pull(xml, make_pull()),
+        name,
+        "document_from_pull",
+    );
     assert_eq!(from_pull, normal, "{name}: error text differs");
+
+    let scan = scan_events(make_pull(), xml, name).expect_err(&format!(
+        "{name}: scan-only event stream unexpectedly succeeded"
+    ));
+    assert_eq!(scan, normal, "{name}: scan error text differs");
 }
 
 fn nested_document(depth: usize) -> String {
@@ -134,6 +266,14 @@ fn pull_dom_matches_parser_for_regression_corpus() {
         (
             "entity free dtd",
             r#"<!DOCTYPE r [ <!ELEMENT r EMPTY> <!ATTLIST r a CDATA #IMPLIED> ]><r/>"#,
+        ),
+        (
+            "entity expanding to nothing",
+            r#"<!DOCTYPE r [<!ENTITY e "">]><r>&e;</r>"#,
+        ),
+        (
+            "empty entity between elements",
+            r#"<!DOCTYPE r [<!ENTITY e "">]><r><a/>&e;<b/></r>"#,
         ),
         (
             "namespaced elements",
@@ -212,7 +352,7 @@ fn pull_dom_matches_parser_with_parser_options() {
         "namespace awareness disabled",
         namespace_disabled,
         Parser::with_namespace_aware(false),
-        PullParser::with_namespace_aware(namespace_disabled, false),
+        || PullParser::with_namespace_aware(namespace_disabled, false),
     );
 
     let dtd_free = "<r><a><b>text</b></a></r>";
@@ -220,7 +360,7 @@ fn pull_dom_matches_parser_with_parser_options() {
         "forbid_dtd on dtd-free document",
         dtd_free,
         Parser::new().with_forbid_dtd(true),
-        PullParser::new(dtd_free).with_forbid_dtd(true),
+        || PullParser::new(dtd_free).with_forbid_dtd(true),
     );
 
     let entity_free_dtd =
@@ -229,7 +369,7 @@ fn pull_dom_matches_parser_with_parser_options() {
         "forbid_entities allows entity-free dtd",
         entity_free_dtd,
         Parser::new().with_forbid_entities(true),
-        PullParser::new(entity_free_dtd).with_forbid_entities(true),
+        || PullParser::new(entity_free_dtd).with_forbid_entities(true),
     );
 
     let bounded_depth = nested_document(8);
@@ -237,7 +377,7 @@ fn pull_dom_matches_parser_with_parser_options() {
         "custom max depth accepts bounded document",
         &bounded_depth,
         Parser::new().with_max_depth(16),
-        PullParser::new(&bounded_depth).with_max_depth(16),
+        || PullParser::new(&bounded_depth).with_max_depth(16),
     );
 
     let bounded_entities = r#"<!DOCTYPE doc [<!ENTITY s "XXXXXXXXXXXXXXXX">]><doc>&s;&s;</doc>"#;
@@ -245,7 +385,7 @@ fn pull_dom_matches_parser_with_parser_options() {
         "custom entity budget accepts bounded expansion",
         bounded_entities,
         Parser::new().with_max_entity_expansion(1 << 16),
-        PullParser::new(bounded_entities).with_max_entity_expansion(1 << 16),
+        || PullParser::new(bounded_entities).with_max_entity_expansion(1 << 16),
     );
 }
 
@@ -297,40 +437,46 @@ fn pull_dom_fails_like_parser_for_invalid_regression_corpus() {
         ("undeclared element prefix", r#"<p:r/>"#),
         ("undeclared attribute prefix", r#"<r p:a="1"/>"#),
     ] {
-        assert_same_failure(name, xml, Parser::new(), PullParser::new(xml));
+        assert_same_failure(name, xml, Parser::new(), || PullParser::new(xml));
     }
 }
 
 #[test]
 fn pull_dom_fails_like_parser_for_option_regressions() {
-    for (name, xml, parser, pull) in [
+    type MakeParser = fn() -> Parser;
+    type MakePull = fn(&str) -> PullParser<'_>;
+    let forbid_dtd_parser: MakeParser = || Parser::new().with_forbid_dtd(true);
+    let forbid_dtd_pull: MakePull = |xml| PullParser::new(xml).with_forbid_dtd(true);
+    let forbid_entities_parser: MakeParser = || Parser::new().with_forbid_entities(true);
+    let forbid_entities_pull: MakePull = |xml| PullParser::new(xml).with_forbid_entities(true);
+
+    for (name, xml, make_parser, make_pull) in [
         (
             "forbid_dtd rejects external doctype",
             r#"<!DOCTYPE r SYSTEM "r.dtd"><r/>"#,
-            Parser::new().with_forbid_dtd(true),
-            PullParser::new(r#"<!DOCTYPE r SYSTEM "r.dtd"><r/>"#).with_forbid_dtd(true),
+            forbid_dtd_parser,
+            forbid_dtd_pull,
         ),
         (
             "forbid_dtd rejects internal subset",
             r#"<!DOCTYPE r [ <!ELEMENT r EMPTY> ]><r/>"#,
-            Parser::new().with_forbid_dtd(true),
-            PullParser::new(r#"<!DOCTYPE r [ <!ELEMENT r EMPTY> ]><r/>"#).with_forbid_dtd(true),
+            forbid_dtd_parser,
+            forbid_dtd_pull,
         ),
         (
             "forbid_entities rejects general entity",
             r#"<!DOCTYPE r [ <!ENTITY x "y"> ]><r/>"#,
-            Parser::new().with_forbid_entities(true),
-            PullParser::new(r#"<!DOCTYPE r [ <!ENTITY x "y"> ]><r/>"#).with_forbid_entities(true),
+            forbid_entities_parser,
+            forbid_entities_pull,
         ),
         (
             "forbid_entities rejects parameter entity",
             r#"<!DOCTYPE r [ <!ENTITY % p "<!ELEMENT r EMPTY>"> ]><r/>"#,
-            Parser::new().with_forbid_entities(true),
-            PullParser::new(r#"<!DOCTYPE r [ <!ENTITY % p "<!ELEMENT r EMPTY>"> ]><r/>"#)
-                .with_forbid_entities(true),
+            forbid_entities_parser,
+            forbid_entities_pull,
         ),
     ] {
-        assert_same_failure(name, xml, parser, pull);
+        assert_same_failure(name, xml, make_parser(), || make_pull(xml));
     }
 
     let too_deep = nested_document(8);
@@ -338,7 +484,7 @@ fn pull_dom_fails_like_parser_for_option_regressions() {
         "max depth rejects deep document",
         &too_deep,
         Parser::new().with_max_depth(4),
-        PullParser::new(&too_deep).with_max_depth(4),
+        || PullParser::new(&too_deep).with_max_depth(4),
     );
 
     let over_budget = r#"<!DOCTYPE doc [<!ENTITY s "XXXXXXXXXXXXXXXX">]><doc>&s;&s;&s;</doc>"#;
@@ -346,7 +492,7 @@ fn pull_dom_fails_like_parser_for_option_regressions() {
         "max entity expansion rejects over-budget expansion",
         over_budget,
         Parser::new().with_max_entity_expansion(32),
-        PullParser::new(over_budget).with_max_entity_expansion(32),
+        || PullParser::new(over_budget).with_max_entity_expansion(32),
     );
 
     let mut chain = String::from("<!DOCTYPE r [");
@@ -358,7 +504,7 @@ fn pull_dom_fails_like_parser_for_option_regressions() {
         "deep entity chain fails closed",
         &chain,
         Parser::new(),
-        PullParser::new(&chain),
+        || PullParser::new(&chain),
     );
 
     let content_model = format!("{}a{}", "(".repeat(10), ")".repeat(10));
@@ -368,6 +514,6 @@ fn pull_dom_fails_like_parser_for_option_regressions() {
         "dtd content model depth uses parser limit",
         &deep_dtd,
         Parser::new().with_max_depth(5),
-        PullParser::new(&deep_dtd).with_max_depth(5),
+        || PullParser::new(&deep_dtd).with_max_depth(5),
     );
 }

@@ -1,0 +1,11 @@
+<!DOCTYPE rz [
+
+
+<!ATTLIST a a ID #IMPLIED>
+<!ATTLIST a a ENTITY #FIXED
+
+
+
+
+<!ATTILS&a; a IDREFS #REQUIRED>TLIST a a >DATA #REQUIRED>
+< &

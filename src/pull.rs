@@ -281,7 +281,12 @@ impl<'a> PullParser<'a> {
                         self.parse_start_element()?;
                         continue;
                     }
-                    return self.parse_text_event();
+                    // A text run can produce no event (e.g. an entity that
+                    // expands to nothing); that is not end-of-document.
+                    match self.parse_text_event()? {
+                        Some(event) => return Ok(Some(event)),
+                        None => continue,
+                    }
                 }
                 Phase::Trailing => {
                     self.cursor.skip_whitespace();
@@ -987,6 +992,17 @@ mod tests {
         assert_eq!(
             event_names("<r>t<![CDATA[c]]><!--m--><?pi x?></r>"),
             vec!["start", "text", "cdata", "comment", "pi", "end"]
+        );
+    }
+
+    #[test]
+    fn empty_entity_expansion_is_not_end_of_document() {
+        // Regression: an entity expanding to nothing produced a text run with
+        // no event, which next_event misread as end-of-document (W3C
+        // valid-sa-023/085/086, rmt-e2e-15a).
+        assert_eq!(
+            event_names(r#"<!DOCTYPE r [<!ENTITY e "">]><r>&e;</r>"#),
+            vec!["doctype", "start", "end"]
         );
     }
 

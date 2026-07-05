@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-05
+
+### Added
+
+- Pull-based XML event parser (`uppsala::pull`, ADR 0018): `PullParser`
+  iterates `PullEvent`s — XML declaration, DOCTYPE, start/end namespace,
+  start/end element (with resolved QNames, attributes, depth, and byte
+  ranges), text, CDATA, comment, and processing instruction — over a decoded
+  string without building a DOM. It carries the same namespace awareness,
+  nesting-depth cap, entity-expansion budget, and `forbid_dtd` /
+  `forbid_entities` hardening switches as `Parser`, and
+  `pull::document_from_pull` / `pull::parse_document` materialize a DOM from
+  the event stream. `Parser::parse` is now layered on the pull parser, so the
+  two surfaces share one scanner and one set of well-formedness checks.
+- Pull-parser regression coverage at parity with the DOM parser.
+  `tests/pull_differential.rs` runs the accepted and invalid regression
+  corpora through both `Parser::parse` and `document_from_pull` (comparing
+  serialized output, XML declaration, DOCTYPE, source ranges, and exact error
+  text, across all parser options) and additionally drives the scan-only
+  event stream under the ADR 0018 stream invariants (element and namespace
+  balance, matching names and depths, in-bounds byte ranges, fused iterator
+  after an error). The W3C runner gained
+  `w3c_pull_event_stream_agrees_with_dom_parser`, which sweeps every UTF-8
+  conformance file (~2250) asserting the raw event stream accepts/rejects
+  with the same error text as the DOM parser. During bring-up this sweep
+  caught (and this release fixes, before it ever shipped) an empty-entity
+  end-of-document bug: `<!ENTITY e "">` expanded in content made
+  `Parser::parse` fail with `UnexpectedEof` on valid documents (W3C
+  valid-sa-023/085/086, rmt-e2e-15a), a divergence the suites' pass-rate
+  thresholds had let through.
+- New `fuzz_pull` libFuzzer harness (12th target): asserts the ADR 0018
+  event-stream invariants and the pull-vs-DOM accept/reject agreement on
+  arbitrary input. Wired into the fuzz scripts, dictionaries, seed import,
+  and the weekly CI fuzz smoke exactly like the existing parser targets, with
+  the empty-entity witness tracked as a regression seed.
+- `just bench-libxml2` now also reports pull scan-only and pull-to-DOM
+  timings alongside the DOM and libxml2 numbers.
+
 ## [0.8.0] - 2026-07-03
 
 ### Added

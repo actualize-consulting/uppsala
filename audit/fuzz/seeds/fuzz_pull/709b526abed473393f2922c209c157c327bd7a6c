@@ -1,0 +1,17 @@
+<!DOCTYPE rz [
+
+
+
+
+
+
+
+
+
+
+<!ATTLIST a a IDREFS #REQUIRED>
+
+
+
+<!ATTLIST a a CDATA #REQUIRED>
+< &
