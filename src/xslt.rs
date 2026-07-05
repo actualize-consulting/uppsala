@@ -69,6 +69,18 @@ pub const XSLT_NAMESPACE: &str = "http://www.w3.org/1999/XSL/Transform";
 /// by the parser and XPath layers.
 pub const DEFAULT_MAX_XSLT_DEPTH: u32 = 500;
 
+/// Conservative accounting overhead charged for each materialized result node.
+///
+/// The result-tree budget is intentionally approximate: it bounds amplification
+/// work before serialization, not exact allocator bytes. Payload string lengths
+/// dominate real attack cases, while a small fixed node charge also catches
+/// empty-node amplification.
+const RESULT_NODE_ACCOUNTING_BYTES: usize = 32;
+
+/// Conservative accounting overhead charged for each materialized result
+/// attribute or namespace declaration.
+const RESULT_ATTR_ACCOUNTING_BYTES: usize = 16;
+
 // ─── Result tree ──────────────────────────────────────────
 
 /// A node in the transformation result tree.
@@ -178,6 +190,52 @@ fn collect_rtf_text(node: &ResultNode, out: &mut String) {
     }
 }
 
+fn accounted_attr_bytes(attr: &ResultAttr) -> usize {
+    RESULT_ATTR_ACCOUNTING_BYTES
+        .saturating_add(attr.qname.len())
+        .saturating_add(attr.value.len())
+}
+
+fn accounted_ns_decls_bytes(ns_decls: &[(Option<String>, String)]) -> usize {
+    ns_decls.iter().fold(0usize, |acc, (prefix, uri)| {
+        acc.saturating_add(
+            RESULT_ATTR_ACCOUNTING_BYTES
+                .saturating_add(prefix.as_ref().map_or(0, String::len))
+                .saturating_add(uri.len()),
+        )
+    })
+}
+
+fn accounted_node_tree_bytes(node: &ResultNode) -> usize {
+    match node {
+        ResultNode::Element(el) => {
+            let attrs = el.attrs.iter().fold(0usize, |acc, attr| {
+                acc.saturating_add(accounted_attr_bytes(attr))
+            });
+            let children = el.children.iter().fold(0usize, |acc, child| {
+                acc.saturating_add(accounted_node_tree_bytes(child))
+            });
+            RESULT_NODE_ACCOUNTING_BYTES
+                .saturating_add(el.qname.len())
+                .saturating_add(accounted_ns_decls_bytes(&el.ns_decls))
+                .saturating_add(attrs)
+                .saturating_add(children)
+        }
+        ResultNode::Text { value, .. } | ResultNode::Comment(value) => {
+            RESULT_NODE_ACCOUNTING_BYTES.saturating_add(value.len())
+        }
+        ResultNode::Pi { target, data } => RESULT_NODE_ACCOUNTING_BYTES
+            .saturating_add(target.len())
+            .saturating_add(data.len()),
+    }
+}
+
+fn accounted_node_forest_bytes(nodes: &[ResultNode]) -> usize {
+    nodes.iter().fold(0usize, |acc, node| {
+        acc.saturating_add(accounted_node_tree_bytes(node))
+    })
+}
+
 fn sanitize_comment_text(text: String) -> XmlResult<String> {
     if text.contains("--") || text.ends_with('-') {
         return Err(XmlError::validation(
@@ -274,6 +332,15 @@ pub struct Stylesheet {
     /// [`DEFAULT_MAX_XSLT_DEPTH`]). Exceeding it aborts the transform with an
     /// error rather than overflowing the stack.
     max_depth: u32,
+    /// Optional cap for serialized transform output. `None` preserves the
+    /// historical unbounded behavior; fuzzing and other hostile-input callers can
+    /// set a ceiling to avoid small stylesheets expanding into huge output.
+    max_output_bytes: Option<usize>,
+    /// Optional cap for materialized result-tree work before serialization.
+    /// This is approximate and monotonic: it accounts for result nodes,
+    /// attributes, namespace declarations, and string payload bytes as they are
+    /// created, rather than trying to model exact live allocator usage.
+    max_result_tree_bytes: Option<usize>,
     /// Enables the broader opt-in EXSLT function library (`math:`/`str:`/`set:`/
     /// `exsl:`); see [`Stylesheet::with_exslt`]. `date:date-time()` is available
     /// regardless. Default `false`.
@@ -425,6 +492,39 @@ impl Stylesheet {
         self
     }
 
+    /// Cap the serialized transform output size in bytes.
+    ///
+    /// This is opt-in: the default remains unbounded for source compatibility.
+    /// It is useful when both the stylesheet and source are attacker-controlled,
+    /// because small inputs can legally expand to very large result documents.
+    ///
+    /// The limit is enforced while serializing the result tree, so an oversized
+    /// transform returns an error instead of allocating the final output string.
+    /// It is not a complete result-tree allocation budget: templates still run
+    /// and build their intermediate result before serialization starts. Use
+    /// [`Self::set_max_result_tree_bytes`] as the earlier materialization guard.
+    pub fn set_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = Some(max_output_bytes);
+        self
+    }
+
+    /// Cap materialized result-tree work before serialization.
+    ///
+    /// This is opt-in: the default remains unbounded for source compatibility.
+    /// It is intended for fuzzing and hostile-input callers that run untrusted
+    /// stylesheets, where legal XSLT constructs can allocate a very large result
+    /// tree before the serializer sees it.
+    ///
+    /// The cap is conservative rather than an exact heap limit. It charges each
+    /// result node, attribute, namespace declaration, and payload string as the
+    /// transform constructs them. Temporary result-tree fragments are counted
+    /// even if they are later dropped, so callers should choose a ceiling with
+    /// normal stylesheet behavior in mind.
+    pub fn set_max_result_tree_bytes(mut self, max_result_tree_bytes: usize) -> Self {
+        self.max_result_tree_bytes = Some(max_result_tree_bytes);
+        self
+    }
+
     /// Enable the opt-in EXSLT extension-function library (`math:`, `str:`,
     /// `set:`, `exsl:`) for this stylesheet's expressions. The stylesheet must
     /// bind the conventional EXSLT prefixes (e.g. `xmlns:str="http://exslt.org/
@@ -462,6 +562,8 @@ impl Stylesheet {
             locals: Vec::new(),
             depth: 0,
             max_depth: self.max_depth,
+            max_result_tree_bytes: self.max_result_tree_bytes,
+            result_tree_bytes_used: 0,
         };
         engine.init_globals()?;
         let root = source.root();
@@ -474,9 +576,9 @@ impl Stylesheet {
             &[],
         )?;
         let nodes = items_to_nodes(result);
-        let mut out = String::new();
-        serialize_result(&nodes, &mut out, &self.output);
-        Ok(out)
+        let mut out = LimitedOutput::new(self.max_output_bytes);
+        serialize_result(&nodes, &mut out, &self.output)?;
+        Ok(out.into_string())
     }
 }
 
@@ -572,6 +674,8 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
         strip_space_all,
         namespaces,
         max_depth: DEFAULT_MAX_XSLT_DEPTH,
+        max_output_bytes: None,
+        max_result_tree_bytes: None,
         exslt_enabled: false,
         param_overrides: Vec::new(),
     })
@@ -1058,6 +1162,13 @@ struct Engine<'a, 'b> {
     depth: u32,
     /// Recursion-depth ceiling (from [`Stylesheet::max_depth`]).
     max_depth: u32,
+    /// Optional result-tree construction budget copied from the stylesheet at
+    /// transform start.
+    max_result_tree_bytes: Option<usize>,
+    /// Monotonic accounting for result-tree materialization. It is not decremented
+    /// when temporary fragments are dropped; the budget limits work performed,
+    /// not exact live heap.
+    result_tree_bytes_used: usize,
 }
 
 /// Resolves `$variable` references against the engine's local then global scope.
@@ -1116,6 +1227,90 @@ struct Focus {
 }
 
 impl<'a, 'b> Engine<'a, 'b> {
+    /// Charge result-tree construction work against the optional transform
+    /// budget. The accounting is conservative and monotonic by design: fuzzing
+    /// and hostile-input callers need a cheap amplification guard, not an exact
+    /// allocator profiler.
+    fn charge_result_bytes(&mut self, bytes: usize) -> XmlResult<()> {
+        let next = self.result_tree_bytes_used.saturating_add(bytes);
+        if let Some(max_bytes) = self.max_result_tree_bytes {
+            if next > max_bytes {
+                return Err(XmlError::xpath(format!(
+                    "XSLT result tree exceeds maximum materialized size of {} bytes",
+                    max_bytes
+                )));
+            }
+        }
+        self.result_tree_bytes_used = next;
+        Ok(())
+    }
+
+    fn charge_result_str(&mut self, s: &str) -> XmlResult<()> {
+        self.charge_result_bytes(s.len())
+    }
+
+    fn charge_result_attr(&mut self, attr: &ResultAttr) -> XmlResult<()> {
+        self.charge_result_bytes(accounted_attr_bytes(attr))
+    }
+
+    fn charge_result_ns_decls(&mut self, ns_decls: &[(Option<String>, String)]) -> XmlResult<()> {
+        self.charge_result_bytes(accounted_ns_decls_bytes(ns_decls))
+    }
+
+    fn push_text_item(
+        &mut self,
+        out: &mut Vec<ResultItem>,
+        value: String,
+        disable_escaping: bool,
+    ) -> XmlResult<()> {
+        self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+        self.charge_result_str(&value)?;
+        out.push(ResultItem::Node(ResultNode::Text {
+            value,
+            disable_escaping,
+        }));
+        Ok(())
+    }
+
+    fn push_attr_item(&mut self, out: &mut Vec<ResultItem>, attr: ResultAttr) -> XmlResult<()> {
+        self.charge_result_attr(&attr)?;
+        out.push(ResultItem::Attr(attr));
+        Ok(())
+    }
+
+    fn push_comment_item(&mut self, out: &mut Vec<ResultItem>, text: String) -> XmlResult<()> {
+        self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+        self.charge_result_str(&text)?;
+        out.push(ResultItem::Node(ResultNode::Comment(text)));
+        Ok(())
+    }
+
+    fn push_pi_item(
+        &mut self,
+        out: &mut Vec<ResultItem>,
+        target: String,
+        data: String,
+    ) -> XmlResult<()> {
+        self.charge_result_bytes(
+            RESULT_NODE_ACCOUNTING_BYTES
+                .saturating_add(target.len())
+                .saturating_add(data.len()),
+        )?;
+        out.push(ResultItem::Node(ResultNode::Pi { target, data }));
+        Ok(())
+    }
+
+    fn push_element_item(
+        &mut self,
+        out: &mut Vec<ResultItem>,
+        element: ResultElement,
+    ) -> XmlResult<()> {
+        self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES.saturating_add(element.qname.len()))?;
+        self.charge_result_ns_decls(&element.ns_decls)?;
+        out.push(ResultItem::Node(ResultNode::Element(element)));
+        Ok(())
+    }
+
     /// Evaluate top-level variables/params into `self.globals`, in document
     /// order, so each can reference those declared before it.
     fn init_globals(&mut self) -> XmlResult<()> {
@@ -1172,15 +1367,15 @@ impl<'a, 'b> Engine<'a, 'b> {
                 self.apply_to_children(focus.node)
             }
             Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => {
-                Ok(vec![ResultItem::Node(ResultNode::Text {
-                    value: t.to_string(),
-                    disable_escaping: false,
-                })])
+                let mut out = Vec::new();
+                self.push_text_item(&mut out, t.to_string(), false)?;
+                Ok(out)
             }
-            Some(NodeKind::Attribute(_, v)) => Ok(vec![ResultItem::Node(ResultNode::Text {
-                value: v.to_string(),
-                disable_escaping: false,
-            })]),
+            Some(NodeKind::Attribute(_, v)) => {
+                let mut out = Vec::new();
+                self.push_text_item(&mut out, v.to_string(), false)?;
+                Ok(out)
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -1358,26 +1553,17 @@ impl<'a, 'b> Engine<'a, 'b> {
         out: &mut Vec<ResultItem>,
     ) -> XmlResult<()> {
         match instr {
-            Instruction::LiteralText(s) => out.push(ResultItem::Node(ResultNode::Text {
-                value: s.clone(),
-                disable_escaping: false,
-            })),
+            Instruction::LiteralText(s) => self.push_text_item(out, s.clone(), false)?,
             Instruction::XslText {
                 value,
                 disable_escaping,
-            } => out.push(ResultItem::Node(ResultNode::Text {
-                value: value.clone(),
-                disable_escaping: *disable_escaping,
-            })),
+            } => self.push_text_item(out, value.clone(), *disable_escaping)?,
             Instruction::ValueOf {
                 select,
                 disable_escaping,
             } => {
                 let val = self.eval(select, focus)?;
-                out.push(ResultItem::Node(ResultNode::Text {
-                    value: val.to_string_value(self.source),
-                    disable_escaping: *disable_escaping,
-                }));
+                self.push_text_item(out, val.to_string_value(self.source), *disable_escaping)?;
             }
             Instruction::LiteralElement {
                 qname,
@@ -1387,20 +1573,25 @@ impl<'a, 'b> Engine<'a, 'b> {
             } => {
                 let mut result_attrs = Vec::with_capacity(attrs.len());
                 for attr in attrs {
-                    result_attrs.push(ResultAttr {
+                    let result_attr = ResultAttr {
                         qname: attr.qname.clone(),
                         value: self.eval_avt(&attr.value, focus)?,
-                    });
+                    };
+                    self.charge_result_attr(&result_attr)?;
+                    result_attrs.push(result_attr);
                 }
                 let items = self.execute_sequence(body, focus)?;
                 let (body_attrs, children) = split_items(items);
                 result_attrs.extend(body_attrs);
-                out.push(ResultItem::Node(ResultNode::Element(ResultElement {
-                    qname: qname.clone(),
-                    ns_decls: ns_decls.clone(),
-                    attrs: result_attrs,
-                    children,
-                })));
+                self.push_element_item(
+                    out,
+                    ResultElement {
+                        qname: qname.clone(),
+                        ns_decls: ns_decls.clone(),
+                        attrs: result_attrs,
+                        children,
+                    },
+                )?;
             }
             Instruction::ApplyTemplates { select, params } => {
                 let nodes = match select {
@@ -1452,31 +1643,34 @@ impl<'a, 'b> Engine<'a, 'b> {
                 let ns_decls = self.element_ns_decls(&qname)?;
                 let items = self.execute_sequence(body, focus)?;
                 let (attrs, children) = split_items(items);
-                out.push(ResultItem::Node(ResultNode::Element(ResultElement {
-                    qname,
-                    ns_decls,
-                    attrs,
-                    children,
-                })));
+                self.push_element_item(
+                    out,
+                    ResultElement {
+                        qname,
+                        ns_decls,
+                        attrs,
+                        children,
+                    },
+                )?;
             }
             Instruction::Attribute { name, body } => {
                 let qname = self.eval_avt(name, focus)?;
                 validate_result_qname("xsl:attribute", &qname)?;
                 let items = self.execute_sequence(body, focus)?;
                 let value = rtf_string_value(&items_to_nodes(items));
-                out.push(ResultItem::Attr(ResultAttr { qname, value }));
+                self.push_attr_item(out, ResultAttr { qname, value })?;
             }
             Instruction::Comment { body } => {
                 let items = self.execute_sequence(body, focus)?;
                 let text = sanitize_comment_text(rtf_string_value(&items_to_nodes(items)))?;
-                out.push(ResultItem::Node(ResultNode::Comment(text)));
+                self.push_comment_item(out, text)?;
             }
             Instruction::Pi { name, body } => {
                 let target = self.eval_avt(name, focus)?;
                 validate_pi_target(&target)?;
                 let items = self.execute_sequence(body, focus)?;
                 let data = sanitize_pi_data(rtf_string_value(&items_to_nodes(items)))?;
-                out.push(ResultItem::Node(ResultNode::Pi { target, data }));
+                self.push_pi_item(out, target, data)?;
             }
             Instruction::CallTemplate { name, params } => {
                 let idx = self
@@ -1518,33 +1712,37 @@ impl<'a, 'b> Engine<'a, 'b> {
                 let ns_decls = element_ns_decls_from_source(e);
                 let items = self.execute_sequence(body, focus)?;
                 let (attrs, children) = split_items(items);
-                out.push(ResultItem::Node(ResultNode::Element(ResultElement {
-                    qname,
-                    ns_decls,
-                    attrs,
-                    children,
-                })));
+                self.push_element_item(
+                    out,
+                    ResultElement {
+                        qname,
+                        ns_decls,
+                        attrs,
+                        children,
+                    },
+                )?;
             }
             Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => {
-                out.push(ResultItem::Node(ResultNode::Text {
-                    value: t.to_string(),
-                    disable_escaping: false,
-                }));
+                self.push_text_item(out, t.to_string(), false)?;
             }
             Some(NodeKind::Comment(c)) => {
-                out.push(ResultItem::Node(ResultNode::Comment(c.to_string())));
+                self.push_comment_item(out, c.to_string())?;
             }
             Some(NodeKind::ProcessingInstruction(pi)) => {
-                out.push(ResultItem::Node(ResultNode::Pi {
-                    target: pi.target.to_string(),
-                    data: pi.data.as_ref().map(|d| d.to_string()).unwrap_or_default(),
-                }));
+                self.push_pi_item(
+                    out,
+                    pi.target.to_string(),
+                    pi.data.as_ref().map(|d| d.to_string()).unwrap_or_default(),
+                )?;
             }
             Some(NodeKind::Attribute(qn, v)) => {
-                out.push(ResultItem::Attr(ResultAttr {
-                    qname: qn.prefixed_name().to_string(),
-                    value: v.to_string(),
-                }));
+                self.push_attr_item(
+                    out,
+                    ResultAttr {
+                        qname: qn.prefixed_name().to_string(),
+                        value: v.to_string(),
+                    },
+                )?;
             }
             None => {}
         }
@@ -1561,9 +1759,19 @@ impl<'a, 'b> Engine<'a, 'b> {
     ) -> XmlResult<()> {
         // copy-of of a bare RTF variable copies the fragment, not its string.
         if let Some((prefix, local)) = select.as_variable() {
-            if let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local) {
+            if let Some(cloned_bytes) = self.lookup_var_ref(prefix, local).and_then(|value| {
+                if let VarValue::Rtf(nodes) = value {
+                    Some(accounted_node_forest_bytes(nodes))
+                } else {
+                    None
+                }
+            }) {
+                self.charge_result_bytes(cloned_bytes)?;
+                let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local) else {
+                    return Ok(());
+                };
                 for n in nodes {
-                    out.push(ResultItem::Node(n.clone()));
+                    out.push(ResultItem::Node(n));
                 }
                 return Ok(());
             }
@@ -1577,23 +1785,20 @@ impl<'a, 'b> Engine<'a, 'b> {
                     // empty node. A document has no single result-item form.
                     if let Some(NodeKind::Document) = self.source.node_kind(n) {
                         for child in self.source.children(n) {
-                            out.push(self.deep_copy_source(child));
+                            out.push(self.deep_copy_source(child)?);
                         }
                     } else {
-                        out.push(self.deep_copy_source(n));
+                        out.push(self.deep_copy_source(n)?);
                     }
                 }
             }
-            other => out.push(ResultItem::Node(ResultNode::Text {
-                value: other.to_string_value(self.source),
-                disable_escaping: false,
-            })),
+            other => self.push_text_item(out, other.to_string_value(self.source), false)?,
         }
         Ok(())
     }
 
     /// Deep-copy a source node into a result item.
-    fn deep_copy_source(&self, node: NodeId) -> ResultItem {
+    fn deep_copy_source(&mut self, node: NodeId) -> XmlResult<ResultItem> {
         match self.source.node_kind(node) {
             Some(NodeKind::Element(e)) => {
                 let qname = e.name.prefixed_name().to_string();
@@ -1603,50 +1808,75 @@ impl<'a, 'b> Engine<'a, 'b> {
                     if is_xmlns_attr(attr) {
                         continue;
                     }
-                    attrs.push(ResultAttr {
+                    let result_attr = ResultAttr {
                         qname: attr.name.prefixed_name().to_string(),
                         value: attr.value.to_string(),
-                    });
+                    };
+                    self.charge_result_attr(&result_attr)?;
+                    attrs.push(result_attr);
                 }
-                let children = self
-                    .source
-                    .children(node)
-                    .into_iter()
-                    .map(|c| match self.deep_copy_source(c) {
-                        ResultItem::Node(n) => n,
+                let mut children = Vec::new();
+                for child in self.source.children(node) {
+                    match self.deep_copy_source(child)? {
+                        ResultItem::Node(n) => children.push(n),
                         // Child attributes cannot appear; element children are nodes.
-                        ResultItem::Attr(a) => ResultNode::Text {
-                            value: a.value,
-                            disable_escaping: false,
-                        },
-                    })
-                    .collect();
-                ResultItem::Node(ResultNode::Element(ResultElement {
+                        ResultItem::Attr(a) => {
+                            self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+                            self.charge_result_str(&a.value)?;
+                            children.push(ResultNode::Text {
+                                value: a.value,
+                                disable_escaping: false,
+                            });
+                        }
+                    }
+                }
+                self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES.saturating_add(qname.len()))?;
+                self.charge_result_ns_decls(&ns_decls)?;
+                Ok(ResultItem::Node(ResultNode::Element(ResultElement {
                     qname,
                     ns_decls,
                     attrs,
                     children,
-                }))
+                })))
             }
             Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => {
-                ResultItem::Node(ResultNode::Text {
+                self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+                self.charge_result_str(t)?;
+                Ok(ResultItem::Node(ResultNode::Text {
                     value: t.to_string(),
                     disable_escaping: false,
-                })
+                }))
             }
-            Some(NodeKind::Comment(c)) => ResultItem::Node(ResultNode::Comment(c.to_string())),
-            Some(NodeKind::ProcessingInstruction(pi)) => ResultItem::Node(ResultNode::Pi {
-                target: pi.target.to_string(),
-                data: pi.data.as_ref().map(|d| d.to_string()).unwrap_or_default(),
-            }),
-            Some(NodeKind::Attribute(qn, v)) => ResultItem::Attr(ResultAttr {
-                qname: qn.prefixed_name().to_string(),
-                value: v.to_string(),
-            }),
-            Some(NodeKind::Document) | None => ResultItem::Node(ResultNode::Text {
-                value: String::new(),
-                disable_escaping: false,
-            }),
+            Some(NodeKind::Comment(c)) => {
+                self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+                self.charge_result_str(c)?;
+                Ok(ResultItem::Node(ResultNode::Comment(c.to_string())))
+            }
+            Some(NodeKind::ProcessingInstruction(pi)) => {
+                let target = pi.target.to_string();
+                let data = pi.data.as_ref().map(|d| d.to_string()).unwrap_or_default();
+                self.charge_result_bytes(
+                    RESULT_NODE_ACCOUNTING_BYTES
+                        .saturating_add(target.len())
+                        .saturating_add(data.len()),
+                )?;
+                Ok(ResultItem::Node(ResultNode::Pi { target, data }))
+            }
+            Some(NodeKind::Attribute(qn, v)) => {
+                let attr = ResultAttr {
+                    qname: qn.prefixed_name().to_string(),
+                    value: v.to_string(),
+                };
+                self.charge_result_attr(&attr)?;
+                Ok(ResultItem::Attr(attr))
+            }
+            Some(NodeKind::Document) | None => {
+                self.charge_result_bytes(RESULT_NODE_ACCOUNTING_BYTES)?;
+                Ok(ResultItem::Node(ResultNode::Text {
+                    value: String::new(),
+                    disable_escaping: false,
+                }))
+            }
         }
     }
 
@@ -1675,13 +1905,17 @@ impl<'a, 'b> Engine<'a, 'b> {
 
     /// Look up the raw (un-coerced) value of a variable in scope.
     fn lookup_var(&self, prefix: Option<&str>, local: &str) -> Option<VarValue> {
+        self.lookup_var_ref(prefix, local).cloned()
+    }
+
+    fn lookup_var_ref(&self, prefix: Option<&str>, local: &str) -> Option<&VarValue> {
         let key = var_key(prefix, local);
         self.locals
             .iter()
             .rev()
             .chain(self.globals.iter().rev())
             .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v)
     }
 
     /// Evaluate `xsl:with-param` bindings in the current (caller) context.
@@ -1832,6 +2066,52 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 // ─── Result serialization ─────────────────────────────────
 
+/// Serializer sink with an optional byte ceiling.
+///
+/// XSLT permits output amplification: a small stylesheet/source pair can
+/// produce a very large serialized document. Keeping the check at the sink
+/// makes every serializer path share the same limit, including escaped text,
+/// escaped attributes, namespace declarations, comments, and processing
+/// instructions. The production default is `None`; fuzz and hostile-input
+/// callers can opt in through [`Stylesheet::set_max_output_bytes`].
+struct LimitedOutput {
+    buf: String,
+    max_bytes: Option<usize>,
+}
+
+impl LimitedOutput {
+    fn new(max_bytes: Option<usize>) -> Self {
+        LimitedOutput {
+            buf: String::new(),
+            max_bytes,
+        }
+    }
+
+    fn into_string(self) -> String {
+        self.buf
+    }
+
+    fn push(&mut self, c: char) -> XmlResult<()> {
+        let mut encoded = [0; 4];
+        self.push_str(c.encode_utf8(&mut encoded))
+    }
+
+    fn push_str(&mut self, s: &str) -> XmlResult<()> {
+        if let Some(max_bytes) = self.max_bytes {
+            // `String::len` is already a byte count. Use saturating arithmetic so
+            // a near-`usize::MAX` buffer cannot wrap the comparison.
+            if self.buf.len().saturating_add(s.len()) > max_bytes {
+                return Err(XmlError::xpath(format!(
+                    "XSLT output exceeds maximum serialized size of {} bytes",
+                    max_bytes
+                )));
+            }
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+}
+
 /// A borrowed, parent-linked view of the in-scope namespace declarations during
 /// serialization. Mirrors [`crate::dom`]'s `NsScope`: rather than cloning the
 /// whole accumulated scope at every element (which is O(depth) string clones per
@@ -1859,12 +2139,16 @@ impl SerScope<'_> {
     }
 }
 
-fn serialize_result(nodes: &[ResultNode], out: &mut String, opts: &OutputOptions) {
+fn serialize_result(
+    nodes: &[ResultNode],
+    out: &mut LimitedOutput,
+    opts: &OutputOptions,
+) -> XmlResult<()> {
     if !opts.method_text && !opts.omit_xml_declaration {
         out.push_str(&format!(
             "<?xml version=\"1.0\" encoding=\"{}\"?>\n",
             opts.encoding
-        ));
+        ))?;
     }
     // The in-scope namespace bindings accumulated from ancestor elements, used to
     // suppress redundant `xmlns` declarations (a copied element re-declares its
@@ -1874,50 +2158,56 @@ fn serialize_result(nodes: &[ResultNode], out: &mut String, opts: &OutputOptions
         local: &[],
     };
     for node in nodes {
-        serialize_node(node, out, opts, &scope);
+        serialize_node(node, out, opts, &scope)?;
     }
+    Ok(())
 }
 
-fn serialize_node(node: &ResultNode, out: &mut String, opts: &OutputOptions, scope: &SerScope<'_>) {
+fn serialize_node(
+    node: &ResultNode,
+    out: &mut LimitedOutput,
+    opts: &OutputOptions,
+    scope: &SerScope<'_>,
+) -> XmlResult<()> {
     match node {
         ResultNode::Text {
             value,
             disable_escaping,
         } => {
             if opts.method_text || *disable_escaping {
-                out.push_str(value);
+                out.push_str(value)?;
             } else {
-                escape_text(value, out);
+                escape_text(value, out)?;
             }
         }
         ResultNode::Comment(c) => {
             if !opts.method_text {
-                out.push_str("<!--");
-                out.push_str(c);
-                out.push_str("-->");
+                out.push_str("<!--")?;
+                out.push_str(c)?;
+                out.push_str("-->")?;
             }
         }
         ResultNode::Pi { target, data } => {
             if !opts.method_text {
-                out.push_str("<?");
-                out.push_str(target);
+                out.push_str("<?")?;
+                out.push_str(target)?;
                 if !data.is_empty() {
-                    out.push(' ');
-                    out.push_str(data);
+                    out.push(' ')?;
+                    out.push_str(data)?;
                 }
-                out.push_str("?>");
+                out.push_str("?>")?;
             }
         }
         ResultNode::Element(el) => {
             if opts.method_text {
                 // text method: emit only descendant text.
                 for child in &el.children {
-                    serialize_node(child, out, opts, scope);
+                    serialize_node(child, out, opts, scope)?;
                 }
-                return;
+                return Ok(());
             }
-            out.push('<');
-            out.push_str(&el.qname);
+            out.push('<')?;
+            out.push_str(&el.qname)?;
             // Emit only namespace declarations not already in scope. The child
             // scope borrows this element's declarations and links to the parent
             // scope — no per-element clone of the inherited bindings.
@@ -1937,61 +2227,64 @@ fn serialize_node(node: &ResultNode, out: &mut String, opts: &OutputOptions, sco
                 }
                 match prefix {
                     Some(p) => {
-                        out.push_str(" xmlns:");
-                        out.push_str(p);
-                        out.push_str("=\"");
+                        out.push_str(" xmlns:")?;
+                        out.push_str(p)?;
+                        out.push_str("=\"")?;
                     }
-                    None => out.push_str(" xmlns=\""),
+                    None => out.push_str(" xmlns=\"")?,
                 }
-                escape_attr(uri, out);
-                out.push('"');
+                escape_attr(uri, out)?;
+                out.push('"')?;
             }
             for attr in &el.attrs {
-                out.push(' ');
-                out.push_str(&attr.qname);
-                out.push_str("=\"");
-                escape_attr(&attr.value, out);
-                out.push('"');
+                out.push(' ')?;
+                out.push_str(&attr.qname)?;
+                out.push_str("=\"")?;
+                escape_attr(&attr.value, out)?;
+                out.push('"')?;
             }
             if el.children.is_empty() {
-                out.push_str("/>");
+                out.push_str("/>")?;
             } else {
-                out.push('>');
+                out.push('>')?;
                 for child in &el.children {
-                    serialize_node(child, out, opts, &child_scope);
+                    serialize_node(child, out, opts, &child_scope)?;
                 }
-                out.push_str("</");
-                out.push_str(&el.qname);
-                out.push('>');
+                out.push_str("</")?;
+                out.push_str(&el.qname)?;
+                out.push('>')?;
             }
         }
     }
+    Ok(())
 }
 
-fn escape_text(s: &str, out: &mut String) {
+fn escape_text(s: &str, out: &mut LimitedOutput) -> XmlResult<()> {
     for c in s.chars() {
         match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
+            '&' => out.push_str("&amp;")?,
+            '<' => out.push_str("&lt;")?,
+            '>' => out.push_str("&gt;")?,
+            _ => out.push(c)?,
         }
     }
+    Ok(())
 }
 
-fn escape_attr(s: &str, out: &mut String) {
+fn escape_attr(s: &str, out: &mut LimitedOutput) -> XmlResult<()> {
     for c in s.chars() {
         match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\t' => out.push_str("&#x9;"),
-            '\n' => out.push_str("&#xA;"),
-            '\r' => out.push_str("&#xD;"),
-            _ => out.push(c),
+            '&' => out.push_str("&amp;")?,
+            '<' => out.push_str("&lt;")?,
+            '>' => out.push_str("&gt;")?,
+            '"' => out.push_str("&quot;")?,
+            '\t' => out.push_str("&#x9;")?,
+            '\n' => out.push_str("&#xA;")?,
+            '\r' => out.push_str("&#xD;")?,
+            _ => out.push(c)?,
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2555,6 +2848,55 @@ mod tests {
         let xml = r#"<r><i>a</i><i>b</i></r>"#;
         let result = transform(xslt, xml).unwrap();
         assert_eq!(result, "<out>a|b|</out>");
+    }
+
+    #[test]
+    fn result_tree_size_cap_errors() {
+        // This cap stops amplification while the transform is still building
+        // result nodes, before serialization has a chance to reject the final
+        // string. The accounting is conservative: node overhead plus payload
+        // bytes both count.
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="text"/>
+            <xsl:template match="/">abcdefghijklmnopqrstuvwxyz</xsl:template>
+        </xsl:stylesheet>"#;
+        let style_doc = Parser::new().parse(xslt).unwrap();
+        let stylesheet = Stylesheet::compile(&style_doc)
+            .unwrap()
+            .set_max_result_tree_bytes(8);
+        let mut source = Parser::new().parse("<r/>").unwrap();
+        source.prepare_xpath();
+
+        let err = stylesheet
+            .transform(&source)
+            .expect_err("result-tree cap must reject oversized result");
+        assert!(err
+            .to_string()
+            .contains("XSLT result tree exceeds maximum materialized size of 8 bytes"));
+    }
+
+    #[test]
+    fn output_size_cap_errors() {
+        // Hostile stylesheets can turn tiny inputs into very large serialized
+        // outputs. The cap is checked by the serializer sink, so this test
+        // covers the public opt-in API and the shared error path.
+        let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="text"/>
+            <xsl:template match="/">abcdefghijklmnopqrstuvwxyz</xsl:template>
+        </xsl:stylesheet>"#;
+        let style_doc = Parser::new().parse(xslt).unwrap();
+        let stylesheet = Stylesheet::compile(&style_doc)
+            .unwrap()
+            .set_max_output_bytes(8);
+        let mut source = Parser::new().parse("<r/>").unwrap();
+        source.prepare_xpath();
+
+        let err = stylesheet
+            .transform(&source)
+            .expect_err("output cap must reject oversized result");
+        assert!(err
+            .to_string()
+            .contains("XSLT output exceeds maximum serialized size of 8 bytes"));
     }
 
     /// M5 — `xsl:strip-space elements="*"` drops whitespace-only text between

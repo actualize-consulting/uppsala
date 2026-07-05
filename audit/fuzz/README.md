@@ -29,7 +29,7 @@ harnesses are chosen to drive every one of those routines with adversarial input
 | `fuzz_serialize` | **builds an arbitrary DOM** → serialize 3 ways | `scan_escape_sse2` at all alignments; name sanitizers |
 | `fuzz_dom_mutate` | arbitrary edit sequence + `prepare_xpath()` | attribute-node arena recycling; `is_linkable_node` guards |
 | `fuzz_xpath` | XPath lex/parse/eval | evaluator, doc-order index |
-| `fuzz_transform` | `transform(xslt, xml)` | XSLT engine + XPath + serializer |
+| `fuzz_transform` | `transform(xslt, xml)` | XSLT engine + XPath + serializer, with fuzz-only recursion/result-tree/output caps |
 | `fuzz_xsd_regex` | `XsdRegex::compile` + `is_match` | backtracking NFA matcher |
 | `fuzz_xsd_builder` | `XsdValidator::from_schema` plus optional instance validation | schema builder + identity constraints |
 
@@ -98,6 +98,21 @@ uses the first line as seed XML and the rest as edit opcodes; `fuzz_transform`
 splits on a NUL byte (`stylesheet\0source`) or the ASCII seed marker
 `\n---XML---\n`; `fuzz_xsd_builder` splits on NUL or
 `\n---INSTANCE---\n` when the input also carries an instance document.
+
+### Slow-artifact regression seeds
+
+Slow fuzz artifacts that expose library behavior are kept as seed inputs after
+the root cause is understood:
+
+- `seeds/fuzz_transform/slow-output-amplification-*` are legal XSLT
+  output-amplification cases. The harness opts into `Stylesheet`'s
+  materialized result-tree and serialized-output caps so they exercise the cap
+  paths instead of spending seconds and hundreds of MiB building and serializing
+  very large result documents.
+- `seeds/fuzz_xsd_builder/slow-duplicate-model-groups-*` reproduces duplicate
+  top-level `xs:group` definitions whose replacement bodies referenced the
+  previous definition. The schema builder now rejects duplicate top-level model
+  groups before parsing the replacement body.
 
 ## Quick start
 
@@ -240,6 +255,8 @@ The fuzz targets provide continuous coverage of the same surfaces the
 | XSLT computed-name injection | `security_regressions::xslt_computed_*_rejects_markup_injection` | `fuzz_transform` |
 | XPath trailing tokens and flat-chain depth | `security_regressions::xpath_public_evaluate_rejects_trailing_tokens`, `security_regressions::xpath_flat_operator_chains_observe_depth_limit` | `fuzz_xpath` |
 | XSD identity tuple lookup complexity | `security_regressions::xsd_identity_tuple_index_preserves_decimal_duplicate_detection`, `security_regressions::xsd_keyref_tuple_index_reports_missing_references` | `fuzz_xsd_builder` |
+| XSD duplicate group amplification | `security_regressions::xsd_duplicate_model_groups_fail_before_recursive_expansion`, `security_regressions::xsd_duplicate_attribute_groups_fail_closed` | `fuzz_xsd_builder` (seeded from `slow-duplicate-model-groups-*`) |
+| XSLT result/output amplification | `xslt::tests::result_tree_size_cap_errors`, `xslt::tests::output_size_cap_errors` | `fuzz_transform` (seeded from `slow-output-amplification-*`) |
 
 `fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`); it
 calls `llvm-cov` directly rather than the `cargo cov` wrapper, which panics on
