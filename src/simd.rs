@@ -16,8 +16,9 @@
 /// sole production consumer is the pull parser (`pull::parse_text_event`), which
 /// dispatches on the byte this scanner stops at. If the stop set ever changes,
 /// update that consumer's match arms to match; it degrades gracefully (appends
-/// the byte as content) rather than panicking on an unexpected stop byte, so a
-/// missed update is a correctness bug, not a crash — keep it that way.
+/// one UTF-8 character as content) rather than panicking on an unexpected stop
+/// byte, so a missed update is a correctness bug, not a crash -- keep it that
+/// way.
 #[inline(always)]
 pub(crate) fn scan_content_delimiters(data: &[u8]) -> (usize, bool) {
     #[cfg(target_arch = "x86_64")]
