@@ -1,0 +1,28 @@
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="item" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="code" type="xs:string" use="required"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ref" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="code" type="xs:string" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key name="item_codes">
+      <xs:selector xpath="item"/>
+      <xs:field xpath="@code"/>
+    </xs:key>
+    <xs:keyref name="ref_codes" refer="item_codes">
+      <xs:selector xpath="ref"/>
+      <xs:field xpath="@code"/>
+    </xs:keyref>
+  </xs:element>
+</xs:schema>
+---INSTANCE---
+<root><item code="known"/><ref code="missing"/></root>
