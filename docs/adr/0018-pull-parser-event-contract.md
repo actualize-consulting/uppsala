@@ -24,6 +24,10 @@ entry point or the parser-option wiring on that path.
 that contract, and tests must cover both the stable DOM API and the explicit
 pull-to-DOM API.
 
+The public `next_event()` API is fused after any parse error: once an error is
+returned, later calls return `Ok(None)`. This keeps direct pull-parser consumers
+from accidentally looping forever on an unchanged failing cursor state.
+
 Add differential fixture tests that parse the same regression-oriented XML
 corpus two ways:
 
@@ -42,6 +46,11 @@ fixtures used by higher-level tests.
 When a future parser, serializer, or security regression adds a new XML input,
 the minimized input should be added to the pull differential corpus unless the
 regression is unrelated to parsing or DOM construction.
+
+Do not retain inactive copies of the old recursive DOM parser loops beside the
+pull implementation. Shared token, DTD, entity, and scanner helpers remain in
+`parser.rs`, but element/content/prolog DOM construction should have one active
+implementation.
 
 ## Consequences
 
