@@ -28,10 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text, across all parser options) and additionally drives the scan-only
   event stream under the ADR 0018 stream invariants (element and namespace
   balance, matching names and depths, in-bounds byte ranges, fused iterator
-  after an error). The W3C runner gained
-  `w3c_pull_event_stream_agrees_with_dom_parser`, which sweeps every UTF-8
-  conformance file (~2250) asserting the raw event stream accepts/rejects
-  with the same error text as the DOM parser. During bring-up this sweep
+  after an error). Every hand-crafted conformance suite (XML, namespace,
+  XPath, XSD, XSD composition, serialization, ranges) now parses through a
+  shared checked helper (`tests/common/mod.rs`) that asserts pull/DOM
+  agreement on each fixture, and each W3C family has a pull-agreement
+  counterpart: `w3c_pull_event_stream_agrees_with_dom_parser` sweeps every
+  UTF-8 XML conformance file (~2250), and
+  `xsts_{nist_datatypes,ms_datatypes,sun_combined}_pull_agreement` sweep all
+  ~26,500 schema/instance documents of the three XSTS families, asserting
+  the raw event stream accepts/rejects with the same error text as the DOM
+  parser. All of these run in CI (the XSTS steps' substring filters pick up
+  the new sweeps; `--test pull_differential` was added to the hand-crafted
+  step; `just test-pull` and `just test-handcrafted` cover them locally).
+  During bring-up the xmlconf sweep
   caught (and this release fixes, before it ever shipped) an empty-entity
   end-of-document bug: `<!ENTITY e "">` expanded in content made
   `Parser::parse` fail with `UnexpectedEof` on valid documents (W3C

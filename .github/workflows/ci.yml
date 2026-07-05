@@ -43,9 +43,12 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      # Hand-crafted + unit test suites. Runs in seconds.
+      # Hand-crafted + unit test suites. Runs in seconds. The hand-crafted
+      # suites parse through a checked helper (tests/common/mod.rs) that
+      # asserts pull-parser/DOM agreement on every fixture, and
+      # pull_differential adds the dedicated pull-parser regression corpus.
       - name: Unit and hand-crafted tests
-        run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance
+        run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance --test xsd_composition --test pull_differential
 
       # Security regression coverage. The fail-closed assertions run by
       # default; `#[ignore]`-marked process-fatal reproducers in
@@ -56,7 +59,10 @@ jobs:
       # W3C conformance suites — the full XML test suite (~1 208 tests) and
       # the three XSD test suites (NIST ~19 217, MS ~1 213, Sun ~199). All
       # fully deterministic; split into named steps so the CI log shows
-      # per-suite pass counts instead of one opaque aggregate.
+      # per-suite pass counts instead of one opaque aggregate. Each family
+      # also runs a pull-parser agreement sweep: the substring filters below
+      # match both the validation test and its *_pull_agreement counterpart,
+      # and w3c_xmlconf includes w3c_pull_event_stream_agrees_with_dom_parser.
       - name: W3C XML conformance
         run: cargo test --test w3c_xmlconf -- --nocapture
 

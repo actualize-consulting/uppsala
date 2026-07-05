@@ -5,10 +5,13 @@
 //! tempdir and passes the schema path to `from_schema_with_base_path` so
 //! `schemaLocation` resolution works. No external test fixture files.
 
+mod common;
+use common::parse;
+
 use std::fs;
 use std::path::PathBuf;
 
-use uppsala::{parse, XsdValidator};
+use uppsala::XsdValidator;
 
 fn mkdir_unique(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -413,7 +416,7 @@ fn absolute_schema_location_is_rejected() {
     );
     fs::write(&schema_path, &schema).unwrap();
 
-    let schema_doc = uppsala::parse(&schema).unwrap();
+    let schema_doc = parse(&schema).unwrap();
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&schema_path));
 
     let _ = fs::remove_dir_all(&dir);
@@ -459,7 +462,7 @@ fn parent_traversal_schema_location_is_rejected() {
 </xs:schema>"#;
     fs::write(&schema_path, schema).unwrap();
 
-    let schema_doc = uppsala::parse(schema).unwrap();
+    let schema_doc = parse(schema).unwrap();
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&schema_path));
     fs::remove_dir_all(&dir).ok();
 
@@ -492,7 +495,7 @@ fn same_directory_include_is_allowed() {
 </xs:schema>"#;
     fs::write(&schema_path, schema).unwrap();
 
-    let schema_doc = uppsala::parse(schema).unwrap();
+    let schema_doc = parse(schema).unwrap();
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&schema_path));
     fs::remove_dir_all(&dir).ok();
 
@@ -528,7 +531,7 @@ fn circular_include_terminates() {
     .unwrap();
 
     let schema_src = fs::read_to_string(&a_path).unwrap();
-    let schema_doc = uppsala::parse(&schema_src).unwrap();
+    let schema_doc = parse(&schema_src).unwrap();
     // Without the visited set this call recurses until SIGABRT.
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&a_path));
     fs::remove_dir_all(&dir).ok();
@@ -570,7 +573,7 @@ fn deep_include_chain_rejected() {
 
     let entry = dir.join("s0.xsd");
     let schema_src = fs::read_to_string(&entry).unwrap();
-    let schema_doc = uppsala::parse(&schema_src).unwrap();
+    let schema_doc = parse(&schema_src).unwrap();
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&entry));
     fs::remove_dir_all(&dir).ok();
 
@@ -613,7 +616,7 @@ fn uncanonicalizable_base_path_fails_closed() {
   <xs:include schemaLocation="other.xsd"/>
   <xs:element name="x" type="xs:string"/>
 </xs:schema>"#;
-    let schema_doc = uppsala::parse(schema_src).expect("parse");
+    let schema_doc = parse(schema_src).expect("parse");
     let built = uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&bogus_schema));
 
     let err = built

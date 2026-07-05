@@ -1,12 +1,15 @@
 //! Integration tests for XSD 1.1 validation.
 
+mod common;
+use common::parse;
+
 // ─── Simple type validation ─────────────────────────────
 
 fn validate_xml_against_xsd(xml: &str, xsd: &str) -> Result<(), String> {
-    let schema_doc = uppsala::parse(xsd).map_err(|e| format!("Schema parse error: {}", e))?;
+    let schema_doc = parse(xsd).map_err(|e| format!("Schema parse error: {}", e))?;
     let validator = uppsala::XsdValidator::from_schema(&schema_doc)
         .map_err(|e| format!("Schema load error: {}", e))?;
-    let doc = uppsala::parse(xml).map_err(|e| format!("XML parse error: {}", e))?;
+    let doc = parse(xml).map_err(|e| format!("XML parse error: {}", e))?;
     let errors = validator.validate(&doc);
     if errors.is_empty() {
         Ok(())
@@ -804,14 +807,14 @@ fn import_with_unresolvable_hint_is_skipped_and_root_resolves() {
     let composite_path = dir.join("composite.xsd");
     std::fs::write(&composite_path, composite_src).unwrap();
 
-    let schema_doc = uppsala::parse(composite_src).expect("parse composite.xsd");
+    let schema_doc = parse(composite_src).expect("parse composite.xsd");
     // Build must succeed despite the unresolvable `classpath:` import hint.
     let validator =
         uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path))
             .expect("composite schema must build despite an unresolvable import hint");
 
     // The root element comes only from the resolvable `inner.xsd` import.
-    let doc = uppsala::parse(r#"<i:Thing xmlns:i="urn:inner" id="x"/>"#).expect("parse instance");
+    let doc = parse(r#"<i:Thing xmlns:i="urn:inner" id="x"/>"#).expect("parse instance");
     let errors = validator.validate(&doc);
     assert!(
         errors.is_empty(),
@@ -836,7 +839,7 @@ fn import_of_resolvable_malformed_schema_errors() {
     let composite_path = dir.join("composite.xsd");
     std::fs::write(&composite_path, composite_src).unwrap();
 
-    let schema_doc = uppsala::parse(composite_src).expect("parse composite.xsd");
+    let schema_doc = parse(composite_src).expect("parse composite.xsd");
     let result =
         uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path));
     assert!(
@@ -849,11 +852,11 @@ fn import_of_resolvable_malformed_schema_errors() {
 
 /// Validate with lenient mode toggled on the validator.
 fn validate_lenient(xml: &str, xsd: &str, lenient: bool) -> Result<(), String> {
-    let schema_doc = uppsala::parse(xsd).map_err(|e| format!("Schema parse error: {e}"))?;
+    let schema_doc = parse(xsd).map_err(|e| format!("Schema parse error: {e}"))?;
     let mut validator = uppsala::XsdValidator::from_schema(&schema_doc)
         .map_err(|e| format!("Schema load error: {e}"))?;
     validator.set_lenient(lenient);
-    let doc = uppsala::parse(xml).map_err(|e| format!("XML parse error: {e}"))?;
+    let doc = parse(xml).map_err(|e| format!("XML parse error: {e}"))?;
     let errors = validator.validate(&doc);
     if errors.is_empty() {
         Ok(())
@@ -955,14 +958,14 @@ fn cross_import_xsi_type_list_attribute_validates_per_item() {
     let composite_path = dir.join("list-composite.xsd");
     std::fs::write(&composite_path, composite_src).unwrap();
 
-    let schema_doc = uppsala::parse(composite_src).expect("parse list-composite.xsd");
+    let schema_doc = parse(composite_src).expect("parse list-composite.xsd");
     let validator =
         uppsala::XsdValidator::from_schema_with_base_path(&schema_doc, Some(&composite_path))
             .expect("composite schema builds");
 
     // Valid: every list item is a valid int — must pass. (If the list type were
     // collapsed to a single `int`, "1 2 3" would be rejected as one value.)
-    let ok_doc = uppsala::parse(
+    let ok_doc = parse(
         r#"<b:e xmlns:b="urn:list-base" xmlns:x="urn:list-ext"
               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
               xsi:type="x:Derived" nums="1 2 3" z="hi"/>"#,
@@ -976,7 +979,7 @@ fn cross_import_xsi_type_list_attribute_validates_per_item() {
 
     // Invalid: one bad item — must be reported per item ("abc"), proving the
     // value is split and each item validated against the list's item type.
-    let bad_doc = uppsala::parse(
+    let bad_doc = parse(
         r#"<b:e xmlns:b="urn:list-base" xmlns:x="urn:list-ext"
               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
               xsi:type="x:Derived" nums="1 abc 3" z="hi"/>"#,
