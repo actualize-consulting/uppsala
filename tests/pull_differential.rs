@@ -410,6 +410,10 @@ fn pull_dom_fails_like_parser_for_invalid_regression_corpus() {
         ("empty hex character reference", "<r>&#x;</r>"),
         ("invalid xml character", "<r>\u{0001}</r>"),
         (
+            "duplicate doctype declaration",
+            r#"<!DOCTYPE a SYSTEM "a.dtd"><!DOCTYPE b SYSTEM "b.dtd"><r/>"#,
+        ),
+        (
             "billion laughs fixture hits entity budget",
             include_str!("../audit/pocs/billion_laughs.xml"),
         ),

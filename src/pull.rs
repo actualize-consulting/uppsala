@@ -132,6 +132,7 @@ pub struct PullParser<'a> {
     max_depth: u32,
     forbid_dtd: bool,
     forbid_entities: bool,
+    seen_doctype: bool,
     ns_resolver: Option<NamespaceResolver<'a>>,
     entities: EntityMap,
     entity_cache: EntityCache,
@@ -157,6 +158,7 @@ impl<'a> PullParser<'a> {
             max_depth: DEFAULT_MAX_DEPTH,
             forbid_dtd: false,
             forbid_entities: false,
+            seen_doctype: false,
             ns_resolver: namespace_aware.then(NamespaceResolver::new),
             entities: EntityMap::new(),
             entity_cache: EntityCache::new(),
@@ -235,6 +237,13 @@ impl<'a> PullParser<'a> {
                                 self.cursor.column(),
                             ));
                         }
+                        if self.seen_doctype {
+                            return Err(XmlError::well_formedness(
+                                "Only one DOCTYPE declaration is allowed",
+                                self.cursor.line(),
+                                self.cursor.column(),
+                            ));
+                        }
                         let start = self.cursor.pos;
                         parse_doctype(
                             &mut self.cursor,
@@ -244,6 +253,7 @@ impl<'a> PullParser<'a> {
                             self.forbid_entities,
                             self.max_depth,
                         )?;
+                        self.seen_doctype = true;
                         return Ok(Some(PullEvent::Doctype(Cow::Borrowed(
                             &self.cursor.input[start..self.cursor.pos],
                         ))));
@@ -1012,6 +1022,14 @@ mod tests {
             .collect::<XmlResult<Vec<_>>>()
             .expect_err("mismatched tag should fail");
         assert!(err.to_string().contains("Mismatched end tag"));
+    }
+
+    #[test]
+    fn rejects_duplicate_doctype() {
+        let err = PullParser::new(r#"<!DOCTYPE a SYSTEM "a.dtd"><!DOCTYPE b SYSTEM "b.dtd"><r/>"#)
+            .collect::<XmlResult<Vec<_>>>()
+            .expect_err("duplicate DOCTYPE should fail");
+        assert!(err.to_string().contains("Only one DOCTYPE"));
     }
 
     #[test]
