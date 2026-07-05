@@ -512,7 +512,31 @@ impl<'a> PullParser<'a> {
                     }
                     self.cursor.advance_no_newlines(1);
                 }
-                _ => unreachable!(),
+                _ => {
+                    // `scan_content_delimiters` (src/simd.rs) is contracted to
+                    // stop only at `<`, `&`, `\r`, or `]`, so the arms above are
+                    // exhaustive for the current scanner. Don't encode that
+                    // cross-module invariant as `unreachable!()`: if the
+                    // scanner's delimiter set ever grows and this consumer is
+                    // missed, an `unreachable!()` here would turn every affected
+                    // document into a process-killing panic (a DoS on hostile
+                    // input). Degrade gracefully instead — validate and append
+                    // one whole character as ordinary content, then advance.
+                    let ch = self.cursor.input[self.cursor.pos..]
+                        .chars()
+                        .next()
+                        .expect("cursor.pos < input.len() checked above");
+                    if !is_xml_char(ch) {
+                        return Err(XmlError::well_formedness(
+                            format!("Invalid XML character U+{:04X}", ch as u32),
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        ));
+                    }
+                    let before_pos = self.cursor.pos;
+                    self.cursor.advance_no_newlines(ch.len_utf8());
+                    text_buf.push_char(self.cursor.input, before_pos, ch);
+                }
             }
         }
     }
@@ -654,75 +678,26 @@ impl<'a> PullParser<'a> {
             }
         }
 
-        let (prefix, local_name) = split_qname(&tag_name);
-        let qname = if let Some(resolver) = self.ns_resolver.as_ref() {
-            let ns: Option<Cow<'a, str>> = if let Some(p) = prefix {
-                let uri = resolver.resolve(p).ok_or_else(|| {
-                    XmlError::namespace(
-                        format!("Undeclared namespace prefix: {}", p),
-                        self.cursor.line(),
-                        self.cursor.column(),
-                    )
-                })?;
-                Some(uri.clone())
-            } else {
-                resolver.resolve_default().cloned()
-            };
-            QName {
-                namespace_uri: ns,
-                prefix: prefix.map(|s| borrow_from_cow(&tag_name, s)),
-                local_name: borrow_from_cow(&tag_name, local_name),
-            }
-        } else {
-            QName::local(tag_name.clone())
-        };
-
-        let mut resolved_attrs = Vec::with_capacity(raw_attrs.len());
-        for (attr_name, attr_value) in raw_attrs {
-            let (a_prefix, a_local) = split_qname(&attr_name);
-            let a_qname = if let Some(resolver) = self.ns_resolver.as_ref() {
-                if let Some(p) = a_prefix {
-                    let ns_uri = resolver.resolve(p).ok_or_else(|| {
-                        XmlError::namespace(
-                            format!("Undeclared namespace prefix: {}", p),
-                            self.cursor.line(),
-                            self.cursor.column(),
-                        )
-                    })?;
-                    QName {
-                        namespace_uri: Some(ns_uri.clone()),
-                        prefix: Some(borrow_from_cow(&attr_name, p)),
-                        local_name: borrow_from_cow(&attr_name, a_local),
+        // Resolve names and consume the tag close. Every step here is fallible
+        // (undeclared prefix, duplicate attribute, missing `>`), and we have
+        // already pushed a namespace scope above — so any error must unwind
+        // that scope to keep `push_scope`/`pop_scope` balanced. `next_event`
+        // fuses the parser to `Done` on error today, which hides an unbalanced
+        // resolver, but the balance must not depend on that: keep it correct so
+        // the resolver stays reusable and the parser could become resumable.
+        let (qname, resolved_attrs, self_closing, byte_end) =
+            match self.resolve_and_close_start_tag(&tag_name, raw_attrs) {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if pushed_ns_scope {
+                        self.ns_resolver
+                            .as_mut()
+                            .expect("namespace resolver exists")
+                            .pop_scope();
                     }
-                } else {
-                    QName::local(borrow_from_cow(&attr_name, a_local))
+                    return Err(err);
                 }
-            } else {
-                QName::local(attr_name)
             };
-            if resolved_attrs.iter().any(|existing: &Attribute<'a>| {
-                existing.name.local_name == a_qname.local_name
-                    && existing.name.namespace_uri.as_deref() == a_qname.namespace_uri.as_deref()
-            }) {
-                return Err(XmlError::well_formedness(
-                    format!("Duplicate attribute: {}", a_qname),
-                    self.cursor.line(),
-                    self.cursor.column(),
-                ));
-            }
-            resolved_attrs.push(Attribute {
-                name: a_qname,
-                value: attr_value,
-            });
-        }
-
-        let self_closing = self.cursor.peek_byte() == Some(b'/');
-        if self_closing {
-            self.cursor.expect("/>")?;
-        } else {
-            self.cursor.expect(">")?;
-        }
-        let byte_end = self.cursor.pos;
 
         if self.namespace_aware {
             for (prefix, uri) in &ns_decls {
@@ -775,6 +750,90 @@ impl<'a> PullParser<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Resolve the element and attribute QNames against the current namespace
+    /// scope and consume the tag's `>` or `/>`. Split out from
+    /// [`Self::parse_start_element`] so its single caller can unwind a
+    /// just-pushed namespace scope on any error (see the call site). Returns
+    /// the resolved name, resolved attributes, whether the tag self-closes, and
+    /// the byte offset immediately after the close.
+    #[allow(clippy::type_complexity)]
+    fn resolve_and_close_start_tag(
+        &mut self,
+        tag_name: &Cow<'a, str>,
+        raw_attrs: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> XmlResult<(QName<'a>, Vec<Attribute<'a>>, bool, usize)> {
+        let (prefix, local_name) = split_qname(tag_name);
+        let qname = if let Some(resolver) = self.ns_resolver.as_ref() {
+            let ns: Option<Cow<'a, str>> = if let Some(p) = prefix {
+                let uri = resolver.resolve(p).ok_or_else(|| {
+                    XmlError::namespace(
+                        format!("Undeclared namespace prefix: {}", p),
+                        self.cursor.line(),
+                        self.cursor.column(),
+                    )
+                })?;
+                Some(uri.clone())
+            } else {
+                resolver.resolve_default().cloned()
+            };
+            QName {
+                namespace_uri: ns,
+                prefix: prefix.map(|s| borrow_from_cow(tag_name, s)),
+                local_name: borrow_from_cow(tag_name, local_name),
+            }
+        } else {
+            QName::local(tag_name.clone())
+        };
+
+        let mut resolved_attrs = Vec::with_capacity(raw_attrs.len());
+        for (attr_name, attr_value) in raw_attrs {
+            let (a_prefix, a_local) = split_qname(&attr_name);
+            let a_qname = if let Some(resolver) = self.ns_resolver.as_ref() {
+                if let Some(p) = a_prefix {
+                    let ns_uri = resolver.resolve(p).ok_or_else(|| {
+                        XmlError::namespace(
+                            format!("Undeclared namespace prefix: {}", p),
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        )
+                    })?;
+                    QName {
+                        namespace_uri: Some(ns_uri.clone()),
+                        prefix: Some(borrow_from_cow(&attr_name, p)),
+                        local_name: borrow_from_cow(&attr_name, a_local),
+                    }
+                } else {
+                    QName::local(borrow_from_cow(&attr_name, a_local))
+                }
+            } else {
+                QName::local(attr_name)
+            };
+            if resolved_attrs.iter().any(|existing: &Attribute<'a>| {
+                existing.name.local_name == a_qname.local_name
+                    && existing.name.namespace_uri.as_deref() == a_qname.namespace_uri.as_deref()
+            }) {
+                return Err(XmlError::well_formedness(
+                    format!("Duplicate attribute: {}", a_qname),
+                    self.cursor.line(),
+                    self.cursor.column(),
+                ));
+            }
+            resolved_attrs.push(Attribute {
+                name: a_qname,
+                value: attr_value,
+            });
+        }
+
+        let self_closing = self.cursor.peek_byte() == Some(b'/');
+        if self_closing {
+            self.cursor.expect("/>")?;
+        } else {
+            self.cursor.expect(">")?;
+        }
+        let byte_end = self.cursor.pos;
+        Ok((qname, resolved_attrs, self_closing, byte_end))
     }
 
     fn parse_end_element(&mut self) -> XmlResult<()> {
@@ -1026,6 +1085,33 @@ mod tests {
         assert_eq!(
             event_names(r#"<!DOCTYPE r [<!ENTITY e "">]><r>&e;</r>"#),
             vec!["doctype", "start", "end"]
+        );
+    }
+
+    #[test]
+    fn ns_scope_unwinds_on_resolution_error() {
+        // Regression (F-2): a start tag that pushes a namespace scope
+        // (`xmlns:a`) and then fails name resolution (undeclared prefix `b` on
+        // an attribute) must pop that scope before returning the error, keeping
+        // push_scope/pop_scope balanced. Before the fix the scope leaked
+        // (depth 2 instead of the baseline 1).
+        let mut p = PullParser::new(r#"<r xmlns:a="urn:a" b:k="v"/>"#);
+        let mut errored = false;
+        loop {
+            match p.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        assert!(errored, "undeclared attribute prefix should error");
+        assert_eq!(
+            p.ns_resolver.as_ref().unwrap().scope_depth(),
+            1,
+            "namespace scope leaked after a resolution error"
         );
     }
 

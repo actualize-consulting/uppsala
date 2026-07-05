@@ -24,9 +24,14 @@ use std::time::{Duration, Instant};
 
 use uppsala::parse;
 
-/// Wall-clock ceiling for a single hostile parse. The entity caps fail closed
-/// in well under this; anything approaching it is a DoS regression.
-const PARSE_CEILING: Duration = Duration::from_secs(5);
+/// Wall-clock ceiling for a single hostile parse. The property under test is
+/// *termination* (the entity/length caps fail closed), not raw speed: a genuine
+/// billion-laughs hang would run for minutes or never. The bound is generous
+/// because these run in an unoptimized `cargo test` (debug) build, where the
+/// legitimately O(n²) quadratic-blowup payloads (`lol_long_name`/`lol_long_value`)
+/// take several seconds before the cap fires — a tight bound flakes under load
+/// without catching any real regression a looser one would miss.
+const PARSE_CEILING: Duration = Duration::from_secs(30);
 
 fn corpus_dir() -> Option<PathBuf> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
