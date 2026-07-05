@@ -31,7 +31,7 @@ harnesses are chosen to drive every one of those routines with adversarial input
 | `fuzz_xpath` | XPath lex/parse/eval | evaluator, doc-order index |
 | `fuzz_transform` | `transform(xslt, xml)` | XSLT engine + XPath + serializer |
 | `fuzz_xsd_regex` | `XsdRegex::compile` + `is_match` | backtracking NFA matcher |
-| `fuzz_xsd_builder` | `XsdValidator::from_schema` | schema builder |
+| `fuzz_xsd_builder` | `XsdValidator::from_schema` plus optional instance validation | schema builder + identity constraints |
 
 ### Differential harnesses & the `needs_validation` finding
 
@@ -81,9 +81,10 @@ invariants:
 - **`fuzz_pull`** — the scan-only `PullParser` event stream must satisfy the
   ADR 0018 stream invariants (start/end element balance with matching names
   and depths, namespace-event balance, in-bounds byte ranges, fused iterator
-  after an error) and must accept/reject the input exactly like the DOM
-  parser. This oracle class is what caught the empty-entity end-of-document
-  regression (W3C valid-sa-023) during the pull-parser bring-up.
+  after an error), direct `next_event()` must fuse after any returned error,
+  and the pull stream must accept/reject the input exactly like the DOM parser.
+  This oracle class is what caught the empty-entity end-of-document regression
+  (W3C valid-sa-023) during the pull-parser bring-up.
 - **`fuzz_roundtrip`** — serialization is a fixpoint: `parse(s).to_xml()` must
   equal `parse(parse(s).to_xml()).to_xml()`. The assert only fires when both
   parses succeed, so parser resource limits never cause false positives.
@@ -94,7 +95,9 @@ invariants:
 Input splitting for the multi-part harnesses: `fuzz_xpath` and `fuzz_xsd_regex`
 split on the first newline (`expr\nxml`, `pattern\ninput`); `fuzz_dom_mutate`
 uses the first line as seed XML and the rest as edit opcodes; `fuzz_transform`
-splits on a NUL byte (`stylesheet\0source`) since NUL never appears in XML.
+splits on a NUL byte (`stylesheet\0source`) or the ASCII seed marker
+`\n---XML---\n`; `fuzz_xsd_builder` splits on NUL or
+`\n---INSTANCE---\n` when the input also carries an instance document.
 
 ## Quick start
 
@@ -233,6 +236,10 @@ The fuzz targets provide continuous coverage of the same surfaces the
 | SIMD scalar/SSE2 divergence | `simd::tests::content_flag_matches_scalar_*` | `fuzz_simd_differential`, `fuzz_escape_differential` |
 | XSD regex ReDoS (F-04) | `hardening_regressions::xsd_regex_polynomial_redos` | `fuzz_xsd_regex` |
 | XPath axis budget (F-05) | `hardening_regressions::xpath_axis_expansion_is_budgeted` | `fuzz_xpath` |
+| Pull direct error fusion | `security_regressions::pull_next_event_fuses_after_direct_error` | `fuzz_pull` |
+| XSLT computed-name injection | `security_regressions::xslt_computed_*_rejects_markup_injection` | `fuzz_transform` |
+| XPath trailing tokens and flat-chain depth | `security_regressions::xpath_public_evaluate_rejects_trailing_tokens`, `security_regressions::xpath_flat_operator_chains_observe_depth_limit` | `fuzz_xpath` |
+| XSD identity tuple lookup complexity | `security_regressions::xsd_identity_tuple_index_preserves_decimal_duplicate_detection`, `security_regressions::xsd_keyref_tuple_index_reports_missing_references` | `fuzz_xsd_builder` |
 
 `fuzz-coverage` needs `llvm-tools-preview` (installed by `just fuzz-setup`); it
 calls `llvm-cov` directly rather than the `cargo cov` wrapper, which panics on

@@ -196,6 +196,22 @@ impl<'a> PullParser<'a> {
 
     /// Return the next event, or `Ok(None)` at end of document.
     pub fn next_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+        if self.phase == Phase::Done {
+            return Ok(None);
+        }
+
+        match self.next_event_inner() {
+            Ok(event) => Ok(event),
+            Err(err) => {
+                self.phase = Phase::Done;
+                self.pending.clear();
+                self.stack.clear();
+                Err(err)
+            }
+        }
+    }
+
+    fn next_event_inner(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));
@@ -814,10 +830,7 @@ impl<'a> Iterator for PullParser<'a> {
         match self.next_event() {
             Ok(Some(event)) => Some(Ok(event)),
             Ok(None) => None,
-            Err(err) => {
-                self.phase = Phase::Done;
-                Some(Err(err))
-            }
+            Err(err) => Some(Err(err)),
         }
     }
 }

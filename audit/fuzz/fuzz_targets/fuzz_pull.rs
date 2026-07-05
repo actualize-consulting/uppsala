@@ -12,6 +12,21 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    let mut direct = PullParser::new(s);
+    loop {
+        match direct.next_event() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                assert!(
+                    direct.next_event().unwrap().is_none(),
+                    "direct next_event not fused after error"
+                );
+                break;
+            }
+        }
+    }
+
     let mut parser = PullParser::new(s);
     let mut open: Vec<(String, u32)> = Vec::new();
     let mut ns_starts = 0usize;

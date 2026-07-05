@@ -12,6 +12,12 @@ use crate::error::ValidationError;
 
 use super::types::{IdentityConstraint, IdentityConstraintKind, XsdValidator};
 
+#[derive(Default)]
+struct IdentityTable {
+    tuples: Vec<Vec<String>>,
+    keys: HashSet<Vec<String>>,
+}
+
 impl XsdValidator {
     /// Evaluate identity constraints declared on an element.
     /// `context_node` is the element that declares the constraints (the scope).
@@ -23,7 +29,7 @@ impl XsdValidator {
         errors: &mut Vec<ValidationError>,
     ) {
         // Collect key/unique constraint values by constraint name, so keyrefs can look them up.
-        let mut key_tables: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut key_tables: HashMap<String, IdentityTable> = HashMap::new();
 
         // First pass: evaluate key and unique constraints
         for constraint in constraints {
@@ -45,7 +51,7 @@ impl XsdValidator {
                 selected.len()
             );
 
-            let mut tuples: Vec<Vec<String>> = Vec::new();
+            let mut table = IdentityTable::default();
 
             for &sel_node in &selected {
                 let mut field_values: Vec<Option<String>> = Vec::new();
@@ -133,16 +139,8 @@ impl XsdValidator {
                     })
                     .collect();
 
-                // Check for duplicate
-                let is_dup = tuples.iter().any(|existing| {
-                    existing.len() == tuple.len()
-                        && existing
-                            .iter()
-                            .zip(tuple.iter())
-                            .all(|(a, b)| idc_values_equal(a, b))
-                });
-
-                if is_dup {
+                let tuple_key = idc_tuple_key(&tuple);
+                if !table.keys.insert(tuple_key) {
                     let kind_str = match constraint.kind {
                         IdentityConstraintKind::Key => "Key",
                         IdentityConstraintKind::Unique => "Unique",
@@ -157,11 +155,11 @@ impl XsdValidator {
                         column: Some(doc.node_column(sel_node)),
                     });
                 } else {
-                    tuples.push(tuple);
+                    table.tuples.push(tuple);
                 }
             }
 
-            key_tables.insert(constraint.name.clone(), tuples);
+            key_tables.insert(constraint.name.clone(), table);
         }
 
         // Second pass: evaluate keyref constraints
@@ -175,8 +173,8 @@ impl XsdValidator {
                 None => continue,
             };
 
-            let referred_tuples = key_tables.get(refer_name);
-            if referred_tuples.is_none() {
+            let referred_table = key_tables.get(refer_name);
+            if referred_table.is_none() {
                 debug_log!(
                     "keyref '{}' refers to '{}' which was not found in this scope",
                     constraint.name,
@@ -184,7 +182,7 @@ impl XsdValidator {
                 );
                 continue;
             }
-            let referred_tuples = referred_tuples.unwrap();
+            let referred_table = referred_table.unwrap();
 
             let selected = idc_select_nodes(
                 doc,
@@ -198,7 +196,7 @@ impl XsdValidator {
                 constraint.selector,
                 selected.len(),
                 refer_name,
-                referred_tuples.len()
+                referred_table.tuples.len()
             );
 
             for &sel_node in &selected {
@@ -255,16 +253,8 @@ impl XsdValidator {
                     })
                     .collect();
 
-                // Check if tuple exists in the referred key table
-                let found = referred_tuples.iter().any(|key_tuple| {
-                    key_tuple.len() == tuple.len()
-                        && key_tuple
-                            .iter()
-                            .zip(tuple.iter())
-                            .all(|(a, b)| idc_values_equal(a, b))
-                });
-
-                if !found {
+                let tuple_key = idc_tuple_key(&tuple);
+                if !referred_table.keys.contains(&tuple_key) {
                     errors.push(ValidationError {
                         message: format!(
                             "KeyRef '{}': no matching key value {:?} in referred constraint '{}'",
@@ -277,6 +267,13 @@ impl XsdValidator {
             }
         }
     }
+}
+
+fn idc_tuple_key(tuple: &[String]) -> Vec<String> {
+    tuple
+        .iter()
+        .map(|value| idc_parse_decimal(value).unwrap_or_else(|| value.clone()))
+        .collect()
 }
 
 /// Evaluate a restricted XPath selector expression, returning selected nodes.
@@ -614,23 +611,6 @@ fn idc_resolve_prefix(doc: &Document, node: NodeId, prefix: &str) -> Option<Stri
         current = doc.parent(n);
     }
     None
-}
-
-/// Compare two identity constraint field values for equality.
-/// This needs to be type-aware for xs:decimal and xs:QName, but for the
-/// restricted XPath subset used in identity constraints, we primarily compare strings.
-/// We also normalize decimal values when both look like numbers.
-fn idc_values_equal(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-
-    // Try decimal comparison: if both parse as numbers, compare numerically
-    if let (Some(da), Some(db)) = (idc_parse_decimal(a), idc_parse_decimal(b)) {
-        return da == db;
-    }
-
-    false
 }
 
 /// Parse a decimal string into a normalized form for comparison.

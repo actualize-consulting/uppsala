@@ -6,7 +6,8 @@
 //!
 //! - the *same* document encoded six ways parses to the *same* tree;
 //! - a declared-vs-actual encoding mismatch has deterministic behavior
-//!   (content-based auto-detection wins; no smuggling past well-formedness);
+//!   (content-based auto-detection wins, and string serialization normalizes
+//!   any retained encoding declaration to UTF-8);
 //! - multi-script / astral / combining content survives a round trip;
 //! - malformed byte streams (odd UTF-16, lone surrogate, invalid UTF-8, NUL,
 //!   illegal control chars) produce a clean `Err`, never a panic.
@@ -118,8 +119,9 @@ fn declared_utf8_but_actually_utf16_uses_bom() {
 }
 
 /// Bytes are UTF-8 but the declaration says UTF-16. There is no BOM and the
-/// stream starts with `<?` (0x3C 0x3F), so detection stays UTF-8 and the
-/// (incorrect) declaration is inert metadata — deterministic, no crash.
+/// stream starts with `<?` (0x3C 0x3F), so detection stays UTF-8. The parsed
+/// declaration is normalized to UTF-8 for string serialization instead of
+/// preserving stale metadata.
 #[test]
 fn declared_utf16_but_actually_utf8_stays_utf8() {
     let src = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><doc>plain</doc>";
@@ -127,6 +129,10 @@ fn declared_utf16_but_actually_utf8_stays_utf8() {
     assert_eq!(
         doc.document_element().map(|r| doc.text_content_deep(r)),
         Some("plain".into())
+    );
+    assert_eq!(
+        doc.to_xml(),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><doc>plain</doc>"
     );
 }
 

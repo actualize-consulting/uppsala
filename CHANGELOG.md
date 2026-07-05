@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Hardened the pull parser fail-closed contract: direct `PullParser::next_event()`
+  now fuses after any parse error, matching the iterator adapter and preventing
+  post-error events or repeated errors from being observed by streaming
+  consumers.
+- XSLT computed `xsl:element` and `xsl:attribute` names are now validated as XML
+  QNames before serialization, rejecting markup-smuggling values from attribute
+  value templates.
+- XPath public evaluation now rejects trailing tokens, and flat binary operator
+  chains count against the configured expression-depth cap before they can build
+  deeply nested ASTs.
+- XSD identity constraint validation now indexes normalized key/unique/keyref
+  tuples instead of linearly scanning prior tuples, removing quadratic duplicate
+  and keyref lookup paths while preserving decimal-equivalent comparisons.
+- `parse_bytes()` now normalizes any retained XML declaration encoding to
+  `UTF-8`, so string serialization cannot emit stale metadata such as UTF-8
+  bytes declaring `UTF-16`.
+
+### Added
+
+- Regression and fuzz coverage for the security hardening above, including
+  direct pull error fusion, computed XSLT QName injection attempts, XPath
+  trailing-token and flat-chain depth checks, XSD identity tuple lookup, and
+  stale encoding declarations in `parse_bytes()`.
+
 ## [0.8.1] - 2026-07-05
 
 ### Added

@@ -9,7 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use uppsala::{
-    parse, Document, NodeId, Parser, QName, Stylesheet, XPathEvaluator, XmlWriter, XsdValidator,
+    parse, parse_bytes, transform, Document, NodeId, Parser, PullParser, QName, Stylesheet,
+    XPathEvaluator, XmlWriter, XsdValidator,
 };
 
 fn validate(schema: &str, instance: &str) -> Vec<String> {
@@ -57,6 +58,100 @@ fn parser_rejects_duplicate_expanded_attributes() {
     let err = parse(r#"<r xmlns:a="urn:x" xmlns:b="urn:x" a:id="first" b:id="second"/>"#)
         .expect_err("duplicate expanded attributes must be rejected");
     assert!(err.to_string().contains("Duplicate attribute"));
+}
+
+#[test]
+fn pull_next_event_fuses_after_direct_error() {
+    let mut parser = PullParser::new("<r></x><!--ok-->");
+    assert!(parser.next_event().unwrap().is_some());
+    let err = parser
+        .next_event()
+        .expect_err("mismatched end tag must fail");
+    assert!(err.to_string().contains("Mismatched end tag"));
+    assert!(
+        parser.next_event().unwrap().is_none(),
+        "direct next_event must fuse after an error"
+    );
+
+    let mut forbidden =
+        PullParser::new(r#"<!DOCTYPE r [<!ENTITY e "x">]><r/>"#).with_forbid_dtd(true);
+    let err = forbidden
+        .next_event()
+        .expect_err("forbid_dtd must reject DOCTYPE");
+    assert!(err
+        .to_string()
+        .contains("DOCTYPE declarations are not allowed"));
+    assert!(
+        forbidden.next_event().unwrap().is_none(),
+        "forbid_dtd errors must not repeat forever"
+    );
+}
+
+#[test]
+fn xslt_computed_element_name_rejects_markup_injection() {
+    let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="xml" omit-xml-declaration="yes"/>
+  <xsl:template match="/"><out><xsl:element name="{/r/@n}"/></out></xsl:template>
+</xsl:stylesheet>"#;
+    let err = transform(xslt, r#"<r n="a/&gt;&lt;evil/&gt;&lt;a"/>"#)
+        .expect_err("computed element name must be a QName");
+    assert!(err.to_string().contains("valid QName"));
+}
+
+#[test]
+fn xslt_computed_attribute_name_rejects_markup_injection() {
+    let xslt = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="xml" omit-xml-declaration="yes"/>
+  <xsl:template match="/"><out><xsl:attribute name="{/r/@n}">v</xsl:attribute></out></xsl:template>
+</xsl:stylesheet>"#;
+    let err = transform(xslt, r#"<r n="a=&quot;x&quot; injected"/>"#)
+        .expect_err("computed attribute name must be a QName");
+    assert!(err.to_string().contains("valid QName"));
+}
+
+#[test]
+fn xpath_public_evaluate_rejects_trailing_tokens() {
+    let doc = parse("<r><a/></r>").unwrap();
+    let root = doc.root();
+    for expr in ["1 trailing", "1 + 2 garbage", "/r/a ]"] {
+        let err = XPathEvaluator::new()
+            .evaluate(&doc, root, expr)
+            .expect_err("trailing XPath tokens must be rejected");
+        assert!(
+            err.to_string().contains("Unexpected trailing tokens"),
+            "{expr:?} produced {err}"
+        );
+    }
+}
+
+#[test]
+fn xpath_flat_operator_chains_observe_depth_limit() {
+    let doc = parse("<r/>").unwrap();
+    let root = doc.root();
+
+    XPathEvaluator::new()
+        .with_max_depth(1)
+        .evaluate(&doc, root, "1 + 2")
+        .expect("one binary operator fits depth 1");
+
+    let expr = ["1"; 10].join(" + ");
+    let err = XPathEvaluator::new()
+        .with_max_depth(4)
+        .evaluate(&doc, root, &expr)
+        .expect_err("flat binary chain must count against max_depth");
+    assert!(err
+        .to_string()
+        .contains("XPath expression nesting exceeds maximum depth of 4"));
+}
+
+#[test]
+fn parse_bytes_normalizes_declared_encoding_for_string_output() {
+    let src = r#"<?xml version="1.0" encoding="UTF-16"?><doc>plain</doc>"#;
+    let doc = parse_bytes(src.as_bytes()).expect("detected UTF-8 bytes parse");
+    assert_eq!(
+        doc.to_xml(),
+        r#"<?xml version="1.0" encoding="UTF-8"?><doc>plain</doc>"#
+    );
 }
 
 #[test]
@@ -806,6 +901,82 @@ fn xsd_keyref_field_uses_local_namespace_scope() {
     assert!(
         errors.iter().any(|e| e.contains("no matching key value")),
         "expected field-local namespace to expose bad keyref, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_identity_tuple_index_preserves_decimal_duplicate_detection() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="item" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="id" type="xs:decimal" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:unique name="item_ids">
+      <xs:selector xpath="item"/>
+      <xs:field xpath="@id"/>
+    </xs:unique>
+  </xs:element>
+</xs:schema>"#;
+
+    let errors = validate(schema, r#"<root><item id="01.0"/><item id="1.00"/></root>"#);
+    assert!(
+        errors.iter().any(|e| e.contains("duplicate value")),
+        "expected decimal-equivalent duplicate after tuple indexing, got {errors:?}"
+    );
+}
+
+#[test]
+fn xsd_keyref_tuple_index_reports_missing_references() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="item" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="code" type="xs:string" use="required"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ref" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="code" type="xs:string" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:key name="item_codes">
+      <xs:selector xpath="item"/>
+      <xs:field xpath="@code"/>
+    </xs:key>
+    <xs:keyref name="ref_codes" refer="item_codes">
+      <xs:selector xpath="ref"/>
+      <xs:field xpath="@code"/>
+    </xs:keyref>
+  </xs:element>
+</xs:schema>"#;
+
+    let mut instance = String::from("<root>");
+    for i in 0..128 {
+        instance.push_str(&format!(r#"<item code="k{i}"/>"#));
+    }
+    for i in 0..128 {
+        instance.push_str(&format!(r#"<ref code="k{i}"/>"#));
+    }
+    instance.push_str(r#"<ref code="missing"/></root>"#);
+
+    let errors = validate(schema, &instance);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|e| e.contains("no matching key value"))
+            .count(),
+        1,
+        "expected exactly one missing keyref with indexed lookup, got {errors:?}"
     );
 }
 

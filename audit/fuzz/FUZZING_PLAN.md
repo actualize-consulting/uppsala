@@ -11,7 +11,7 @@
 > | D `parse_bytes` | `fuzz_parse_bytes` | already present |
 > | E `dom_mutations` | `fuzz_dom_mutate` | already present, more complete (real tree-walk id enumeration + attribute-node/root misuse ops) |
 > | F `xpath_eval` | `fuzz_xpath` | already present |
-> | G `xsd_validate` | `fuzz_xsd_builder` (+ `fuzz_xsd_regex`) | present; schema build + regex engine |
+> | G `xsd_validate` | `fuzz_xsd_builder` (+ `fuzz_xsd_regex`) | present; schema build, optional instance validation, identity constraints, and regex engine |
 >
 > The internals are exposed through the crate's `fuzzing` Cargo feature
 > (`uppsala::fuzz_exports`), integrated into `src/simd.rs`/`src/lib.rs` — the
