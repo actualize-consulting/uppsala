@@ -41,6 +41,10 @@ test-serial:
 test-range:
     cargo test --test range_conformance
 
+# Run pull-parser differential regression tests
+test-pull:
+    cargo test --test pull_differential
+
 # Run W3C XML Conformance Suite (~1208 tests)
 test-w3c-xml:
     cargo test --test w3c_xmlconf -- --nocapture
@@ -62,7 +66,7 @@ test-sun:
     cargo test --test w3c_xsts xsts_sun_combined -- --nocapture
 
 # Run all hand-crafted test suites
-test-handcrafted: test-xml test-ns test-xpath test-xsd test-serial test-range
+test-handcrafted: test-xml test-ns test-xpath test-xsd test-serial test-range test-pull
 
 # Run all W3C conformance suites
 test-w3c: test-w3c-xml test-w3c-xsd

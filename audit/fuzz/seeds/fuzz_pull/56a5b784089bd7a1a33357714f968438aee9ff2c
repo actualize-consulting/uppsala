@@ -1,0 +1,15 @@
+<!DOCTYPE HHHHHHHHHHHHHHHHHHHHHr [
+
+
+
+
+
+
+
+
+<!ATTLIST a a IDREFS #REQUIRED><!ATTLIST a a IDREFS 'a'>
+
+
+
+<!ATTLIST a a ENTITY #IMPLIED>
+C  typeear'&

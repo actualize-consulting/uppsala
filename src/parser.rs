@@ -7,18 +7,15 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::dom::{
-    Attribute, Document, Element, NodeId, NodeKind, ProcessingInstruction, QName, XmlDeclaration,
-};
+use crate::dom::{Document, ProcessingInstruction, XmlDeclaration};
 use crate::error::{XmlError, XmlResult};
-use crate::namespace::NamespaceResolver;
 
 /// A map of general entity names to their replacement text.
-type EntityMap = HashMap<String, String>;
+pub(crate) type EntityMap = HashMap<String, String>;
 
 /// Cache of already-validated entity expansion results.
 /// Key: entity name, Value: expanded text.
-type EntityCache = HashMap<String, String>;
+pub(crate) type EntityCache = HashMap<String, String>;
 
 /// Default maximum element-nesting depth.
 ///
@@ -128,132 +125,17 @@ impl Parser {
 
     /// Parse an XML string into a [`Document`].
     pub fn parse<'a>(&self, input: &'a str) -> XmlResult<Document<'a>> {
-        let mut cursor = Cursor::new(input);
-        let mut doc = Document::new();
-        doc.input = input;
-
-        // Pre-allocate based on input size. Markup-heavy documents such as
-        // plist files can be closer to 14 bytes per node once whitespace text
-        // nodes are included, so larger inputs use a denser estimate to avoid
-        // repeated arena growth during parsing.
-        //
-        // Use `try_reserve` (not `reserve`) so a hostile or simply huge input
-        // cannot trigger an aborting upfront allocation via the global
-        // allocation-error handler. The reservation is only a hint: if the
-        // dense estimate fails on a memory-constrained host, fall back to the
-        // sparser estimate, and if that also fails just proceed — parsing still
-        // succeeds by regrowing the arena on demand.
-        let dense = if input.len() >= 256 * 1024 {
-            input.len() / 14
+        let mut pull = if self.namespace_aware {
+            crate::pull::PullParser::new(input)
         } else {
-            input.len() / 40
+            crate::pull::PullParser::with_namespace_aware(input, false)
         };
-        let sparse = input.len() / 40;
-        if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
-            let _ = doc.nodes.try_reserve(sparse);
-        }
-        let mut ns_resolver = if self.namespace_aware {
-            Some(NamespaceResolver::new())
-        } else {
-            None
-        };
-        let mut entities = EntityMap::new();
-        let mut entity_cache = EntityCache::new();
-        // Shared byte-budget for all entity expansion over this parse call.
-        // Decremented on every byte appended to an expansion buffer and on
-        // every `entity_cache` hit; returns a parse error on underflow.
-        let mut entity_budget: usize = self.max_entity_expansion;
-
-        // Skip BOM if present
-        cursor.skip_bom();
-
-        // Parse optional XML declaration (must be at very start, after BOM)
-        if cursor.starts_with("<?xml ")
-            || cursor.starts_with("<?xml\t")
-            || cursor.starts_with("<?xml\r")
-            || cursor.starts_with("<?xml\n")
-        {
-            let decl = parse_xml_declaration(&mut cursor)?;
-            doc.xml_declaration = Some(decl);
-        }
-
-        // Parse prolog content (comments, PIs, whitespace, DOCTYPE).
-        // The document-level `entity_budget` is threaded through DOCTYPE/
-        // internal-subset parsing so ATTLIST default values charge against
-        // the same cap as document content (closes the M-1 bypass).
-        let root_id = doc.root();
-        parse_misc(
-            &mut cursor,
-            &mut doc,
-            root_id,
-            &mut entities,
-            &mut entity_budget,
-            self.forbid_dtd,
-            self.forbid_entities,
-            self.max_depth,
-        )?;
-
-        // Parse document element and trailing misc
-        let mut found_root = false;
-        while !cursor.is_eof() {
-            cursor.skip_whitespace();
-            if cursor.is_eof() {
-                break;
-            }
-            if cursor.starts_with("<!--") {
-                let start = cursor.pos;
-                let comment = parse_comment(&mut cursor)?;
-                let id = doc.alloc_node(NodeKind::Comment(comment), start);
-                doc.set_byte_end_pos(id, cursor.pos);
-                doc.append_child_unchecked(root_id, id);
-            } else if cursor.starts_with("<?") {
-                let start = cursor.pos;
-                let pi = parse_pi(&mut cursor)?;
-                let id = doc.alloc_node(NodeKind::ProcessingInstruction(pi), start);
-                doc.set_byte_end_pos(id, cursor.pos);
-                doc.append_child_unchecked(root_id, id);
-            } else if cursor.starts_with("<") {
-                if found_root {
-                    return Err(XmlError::well_formedness(
-                        "Only one root element is allowed",
-                        cursor.line(),
-                        cursor.column(),
-                    ));
-                }
-                parse_element(
-                    &mut cursor,
-                    &mut doc,
-                    root_id,
-                    &mut ns_resolver,
-                    &entities,
-                    &mut entity_cache,
-                    &mut entity_budget,
-                    0,
-                    self.max_depth,
-                )?;
-                found_root = true;
-            } else {
-                // Non-whitespace text outside root element
-                return Err(XmlError::well_formedness(
-                    "Content found outside of root element",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-        }
-
-        if !found_root {
-            return Err(XmlError::well_formedness(
-                "Document must have a root element",
-                0,
-                0,
-            ));
-        }
-
-        // Set document node end position to end of input
-        doc.set_byte_end_pos(root_id, input.len());
-
-        Ok(doc)
+        pull = pull
+            .with_max_depth(self.max_depth)
+            .with_max_entity_expansion(self.max_entity_expansion)
+            .with_forbid_dtd(self.forbid_dtd)
+            .with_forbid_entities(self.forbid_entities);
+        crate::pull::document_from_pull(input, pull)
     }
 }
 
@@ -268,20 +150,20 @@ impl Default for Parser {
 /// A cursor over the input string that tracks byte position.
 /// Line/column are computed lazily from the byte position when needed
 /// (error reporting, node creation) to avoid scanning every byte for newlines.
-struct Cursor<'a> {
-    input: &'a str,
-    pos: usize,
+pub(crate) struct Cursor<'a> {
+    pub(crate) input: &'a str,
+    pub(crate) pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Cursor { input, pos: 0 }
     }
 
     /// Compute line number (1-based) from current byte position.
     /// Only called in error paths and node allocation, not in the hot parse loop.
     #[inline(never)]
-    fn line(&self) -> usize {
+    pub(crate) fn line(&self) -> usize {
         self.input.as_bytes()[..self.pos]
             .iter()
             .filter(|&&b| b == b'\n')
@@ -291,7 +173,7 @@ impl<'a> Cursor<'a> {
 
     /// Compute column number (1-based) from current byte position.
     #[inline(never)]
-    fn column(&self) -> usize {
+    pub(crate) fn column(&self) -> usize {
         let bytes = &self.input.as_bytes()[..self.pos];
         match bytes.iter().rposition(|&b| b == b'\n') {
             Some(nl_pos) => self.pos - nl_pos,
@@ -299,54 +181,54 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn is_eof(&self) -> bool {
+    pub(crate) fn is_eof(&self) -> bool {
         self.pos >= self.input.len()
     }
 
-    fn remaining(&self) -> &'a str {
+    pub(crate) fn remaining(&self) -> &'a str {
         &self.input[self.pos..]
     }
 
-    fn peek(&self) -> Option<char> {
+    pub(crate) fn peek(&self) -> Option<char> {
         self.remaining().chars().next()
     }
 
     /// Peek at the current byte without creating a char iterator.
     /// Much faster than peek() for ASCII-dominated XML content.
     #[inline(always)]
-    fn peek_byte(&self) -> Option<u8> {
+    pub(crate) fn peek_byte(&self) -> Option<u8> {
         self.input.as_bytes().get(self.pos).copied()
     }
 
-    fn starts_with(&self, prefix: &str) -> bool {
+    pub(crate) fn starts_with(&self, prefix: &str) -> bool {
         self.remaining().starts_with(prefix)
     }
 
     /// Advance by n bytes.
     #[inline(always)]
-    fn advance(&mut self, n: usize) {
+    pub(crate) fn advance(&mut self, n: usize) {
         self.pos += n;
     }
 
     /// Advance by n bytes (alias for advance, kept for compatibility).
     #[inline(always)]
-    fn advance_no_newlines(&mut self, n: usize) {
+    pub(crate) fn advance_no_newlines(&mut self, n: usize) {
         self.pos += n;
     }
 
-    fn advance_char(&mut self) -> Option<char> {
+    pub(crate) fn advance_char(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.pos += c.len_utf8();
         Some(c)
     }
 
-    fn skip_bom(&mut self) {
+    pub(crate) fn skip_bom(&mut self) {
         if self.remaining().starts_with('\u{FEFF}') {
             self.pos += '\u{FEFF}'.len_utf8();
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    pub(crate) fn skip_whitespace(&mut self) {
         let bytes = &self.input.as_bytes()[self.pos..];
         let mut i = 0;
         while i < bytes.len() {
@@ -358,7 +240,7 @@ impl<'a> Cursor<'a> {
         self.pos += i;
     }
 
-    fn expect(&mut self, expected: &str) -> XmlResult<()> {
+    pub(crate) fn expect(&mut self, expected: &str) -> XmlResult<()> {
         if self.starts_with(expected) {
             // Most expected strings are short ASCII with no newlines (e.g. "<", ">", "/>", "=")
             self.advance_no_newlines(expected.len());
@@ -374,7 +256,7 @@ impl<'a> Cursor<'a> {
 
     /// Read until the given delimiter is found. Returns the text before the delimiter
     /// as a borrowed slice. The delimiter is consumed.
-    fn read_until(&mut self, delimiter: &str) -> XmlResult<Cow<'a, str>> {
+    pub(crate) fn read_until(&mut self, delimiter: &str) -> XmlResult<Cow<'a, str>> {
         if let Some(idx) = self.remaining().find(delimiter) {
             let text = &self.input[self.pos..self.pos + idx];
             self.advance(idx + delimiter.len());
@@ -390,7 +272,7 @@ impl<'a> Cursor<'a> {
 
     /// Read until the given delimiter is found. Returns owned String.
     /// Used for DTD parsing where we don't need zero-copy.
-    fn read_until_owned(&mut self, delimiter: &str) -> XmlResult<String> {
+    pub(crate) fn read_until_owned(&mut self, delimiter: &str) -> XmlResult<String> {
         if let Some(idx) = self.remaining().find(delimiter) {
             let text = self.remaining()[..idx].to_string();
             self.advance(idx + delimiter.len());
@@ -407,7 +289,7 @@ impl<'a> Cursor<'a> {
 
 // ─── Character classifications (XML 1.0 Fifth Edition) ──
 
-fn is_xml_whitespace(c: char) -> bool {
+pub(crate) fn is_xml_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n')
 }
 
@@ -434,7 +316,7 @@ fn is_name_char(c: char) -> bool {
 }
 
 /// Check if a character is valid in XML 1.0 content.
-fn is_xml_char(c: char) -> bool {
+pub(crate) fn is_xml_char(c: char) -> bool {
     matches!(c,
         '\u{9}' | '\u{A}' | '\u{D}' |
         '\u{20}'..='\u{D7FF}' |
@@ -453,7 +335,7 @@ fn is_ascii_name_start(b: u8) -> bool {
 
 /// Parse an XML Name. Returns a borrowed slice (names never contain entities).
 /// Uses fast ASCII byte scanning with fallback to Unicode for non-ASCII.
-fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     let start = cursor.pos;
     let bytes = cursor.input.as_bytes();
 
@@ -513,7 +395,7 @@ fn parse_name<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 /// Convert a substring slice of a Cow into a Cow.
 /// If the source is Borrowed, the result is Borrowed; otherwise Owned.
 #[inline]
-fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
+pub(crate) fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
     match source {
         Cow::Borrowed(s) => {
             // slice is a sub-slice of s, so we can compute the offset
@@ -525,7 +407,7 @@ fn borrow_from_cow<'a>(source: &Cow<'a, str>, slice: &str) -> Cow<'a, str> {
 }
 
 /// Split a name into prefix and local parts.
-fn split_qname(name: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_qname(name: &str) -> (Option<&str>, &str) {
     if let Some(colon_pos) = name.find(':') {
         let prefix = &name[..colon_pos];
         let local = &name[colon_pos + 1..];
@@ -541,7 +423,7 @@ fn split_qname(name: &str) -> (Option<&str>, &str) {
 }
 
 /// Parse an XML declaration (`<?xml ... ?>`).
-fn parse_xml_declaration<'a>(cursor: &mut Cursor<'a>) -> XmlResult<XmlDeclaration<'a>> {
+pub(crate) fn parse_xml_declaration<'a>(cursor: &mut Cursor<'a>) -> XmlResult<XmlDeclaration<'a>> {
     cursor.expect("<?xml")?;
 
     // Must have whitespace after "<?xml"
@@ -734,7 +616,7 @@ fn parse_quoted_value<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 /// Parse a quoted attribute value with entity resolution.
 /// Returns Cow::Borrowed when no entity/char references are encountered,
 /// Cow::Owned when allocation is needed.
-fn parse_quoted_value_with_entities<'a>(
+pub(crate) fn parse_quoted_value_with_entities<'a>(
     cursor: &mut Cursor<'a>,
     entities: &EntityMap,
     entity_cache: &mut EntityCache,
@@ -848,7 +730,7 @@ fn parse_reference(cursor: &mut Cursor) -> XmlResult<String> {
 }
 
 /// Parse a character or entity reference with custom entity resolution.
-fn parse_reference_with_entities(
+pub(crate) fn parse_reference_with_entities(
     cursor: &mut Cursor,
     entities: &EntityMap,
     entity_cache: &mut EntityCache,
@@ -1274,7 +1156,7 @@ fn validate_entity_as_content(
 }
 
 /// Parse a comment (`<!-- ... -->`).
-fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     cursor.expect("<!--")?;
     let content = cursor.read_until("-->")?;
     // Well-formedness: comments must not contain "--"
@@ -1307,7 +1189,7 @@ fn parse_comment<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 }
 
 /// Parse a processing instruction (`<?target data?>`).
-fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>> {
+pub(crate) fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>> {
     cursor.expect("<?")?;
     let target = parse_name(cursor)?;
     // Well-formedness: target must not be "xml" (case-insensitive)
@@ -1351,69 +1233,12 @@ fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstruction<'a>>
     })
 }
 
-/// Parse prolog miscellaneous content (comments, PIs, whitespace, DOCTYPE).
-///
-/// `entity_budget` is the shared document-level budget; it is threaded through
-/// DOCTYPE / internal-subset parsing so any entity expansion that occurs while
-/// processing ATTLIST default values charges against the same cap as document
-/// content.
-#[allow(clippy::too_many_arguments)]
-fn parse_misc<'a>(
-    cursor: &mut Cursor<'a>,
-    doc: &mut Document<'a>,
-    parent: NodeId,
-    entities: &mut EntityMap,
-    entity_budget: &mut usize,
-    forbid_dtd: bool,
-    forbid_entities: bool,
-    max_depth: u32,
-) -> XmlResult<()> {
-    loop {
-        cursor.skip_whitespace();
-        if cursor.is_eof() {
-            break;
-        }
-        if cursor.starts_with("<!--") {
-            let start = cursor.pos;
-            let comment = parse_comment(cursor)?;
-            let id = doc.alloc_node(NodeKind::Comment(comment), start);
-            doc.set_byte_end_pos(id, cursor.pos);
-            doc.append_child_unchecked(parent, id);
-        } else if cursor.starts_with("<?") {
-            let start = cursor.pos;
-            let pi = parse_pi(cursor)?;
-            let id = doc.alloc_node(NodeKind::ProcessingInstruction(pi), start);
-            doc.set_byte_end_pos(id, cursor.pos);
-            doc.append_child_unchecked(parent, id);
-        } else if cursor.starts_with("<!DOCTYPE") {
-            if forbid_dtd {
-                return Err(XmlError::parse(
-                    "DOCTYPE declarations are not allowed (forbid_dtd)",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            parse_doctype(
-                cursor,
-                doc,
-                entities,
-                entity_budget,
-                forbid_entities,
-                max_depth,
-            )?;
-        } else {
-            break;
-        }
-    }
-    Ok(())
-}
-
 /// Parse a DOCTYPE declaration, including internal subset.
 ///
 /// `entity_budget` is the shared document-level expansion budget. It is
 /// threaded into the internal-subset parser so ATTLIST default values
 /// charge against the same cap as document content.
-fn parse_doctype<'a>(
+pub(crate) fn parse_doctype<'a>(
     cursor: &mut Cursor<'a>,
     doc: &mut Document<'a>,
     entities: &mut EntityMap,
@@ -2435,530 +2260,8 @@ fn parse_notation_decl(cursor: &mut Cursor) -> XmlResult<()> {
     Ok(())
 }
 
-/// Parse an element and its content recursively.
-///
-/// `depth` is the current nesting depth (0 for the document element); `max_depth`
-/// is the configured cap. When `depth >= max_depth` the parser returns an error
-/// instead of recursing further — this prevents stack overflow on maliciously
-/// deep input.
-#[allow(clippy::too_many_arguments)]
-fn parse_element<'a>(
-    cursor: &mut Cursor<'a>,
-    doc: &mut Document<'a>,
-    parent: NodeId,
-    ns_resolver: &mut Option<NamespaceResolver<'a>>,
-    entities: &EntityMap,
-    entity_cache: &mut EntityCache,
-    budget: &mut usize,
-    depth: u32,
-    max_depth: u32,
-) -> XmlResult<NodeId> {
-    if depth >= max_depth {
-        return Err(XmlError::parse(
-            format!("Element nesting exceeds maximum depth of {}", max_depth),
-            cursor.line(),
-            cursor.column(),
-        ));
-    }
-    let start_pos = cursor.pos;
-
-    cursor.expect("<")?;
-    let tag_name = parse_name(cursor)?;
-
-    // Parse attributes
-    let mut raw_attrs: Vec<(Cow<'a, str>, Cow<'a, str>)> = Vec::with_capacity(8);
-    let mut ns_decls: Vec<(Cow<'a, str>, Cow<'a, str>)> = Vec::new();
-
-    loop {
-        cursor.skip_whitespace();
-        if cursor.is_eof() {
-            return Err(XmlError::UnexpectedEof);
-        }
-        if matches!(cursor.peek_byte(), Some(b'>') | Some(b'/')) {
-            break;
-        }
-        let attr_name = parse_name(cursor)?;
-        cursor.skip_whitespace();
-        cursor.expect("=")?;
-        cursor.skip_whitespace();
-        let attr_value = parse_quoted_value_with_entities(cursor, entities, entity_cache, budget)?;
-
-        // Separate namespace declarations from regular attributes.
-        // xmlns attrs go only into ns_decls (not raw_attrs) to avoid cloning.
-        if &*attr_name == "xmlns" {
-            if ns_decls.iter().any(|(p, _)| p.is_empty()) {
-                return Err(XmlError::well_formedness(
-                    format!("Duplicate attribute: {}", attr_name),
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            // Namespaces in XML 1.0 §3: the XML and XMLNS namespace names must
-            // not be declared as the default namespace. Accepting them makes
-            // unprefixed names resolve to a reserved namespace, which the
-            // serializer can only represent by re-prefixing (`xml:`) — breaking
-            // the parse→serialize fixpoint (ADR 0017).
-            if &*attr_value == crate::namespace::XML_NAMESPACE
-                || &*attr_value == crate::namespace::XMLNS_NAMESPACE
-            {
-                return Err(XmlError::namespace(
-                    "Reserved namespace must not be declared as the default namespace",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            ns_decls.push((Cow::Borrowed(""), attr_value));
-        } else if let Some(prefix) = attr_name.strip_prefix("xmlns:") {
-            if prefix == "xmlns" {
-                return Err(XmlError::namespace(
-                    "The prefix 'xmlns' must not be declared",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            // The declared prefix must be an NCName: rejects the empty prefix
-            // (`xmlns:=`, which would otherwise masquerade as a default
-            // declaration) and multi-colon names (`xmlns:a:b=`).
-            if !crate::writer::is_valid_xml_ncname(prefix) {
-                return Err(XmlError::namespace(
-                    format!("Invalid namespace declaration name: {}", attr_name),
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            if prefix == "xml" && &*attr_value != crate::namespace::XML_NAMESPACE {
-                return Err(XmlError::namespace(
-                    "The prefix 'xml' must not be bound to any other namespace",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            // §3 again: no other prefix may bind the XML namespace, and the
-            // XMLNS namespace may not be bound at all.
-            if prefix != "xml" && &*attr_value == crate::namespace::XML_NAMESPACE {
-                return Err(XmlError::namespace(
-                    "The XML namespace must not be bound to another prefix",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            if &*attr_value == crate::namespace::XMLNS_NAMESPACE {
-                return Err(XmlError::namespace(
-                    "The xmlns namespace must not be declared",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            if ns_decls.iter().any(|(p, _)| &**p == prefix) {
-                return Err(XmlError::well_formedness(
-                    format!("Duplicate attribute: {}", attr_name),
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            let prefix_cow: Cow<'a, str> = match &attr_name {
-                Cow::Borrowed(s) => Cow::Borrowed(&s[6..]),
-                Cow::Owned(s) => Cow::Owned(s[6..].to_string()),
-            };
-            ns_decls.push((prefix_cow, attr_value));
-        } else {
-            // Regular attribute — check for duplicates among regular attrs only
-            if raw_attrs.iter().any(|(n, _)| *n == *attr_name) {
-                return Err(XmlError::well_formedness(
-                    format!("Duplicate attribute: {}", attr_name),
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-            raw_attrs.push((attr_name, attr_value));
-        }
-
-        // After an attribute value, must have whitespace, '>', or '/>'
-        if let Some(b) = cursor.peek_byte() {
-            if b != b'>' && b != b'/' && b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
-                return Err(XmlError::well_formedness(
-                    "Expected whitespace between attributes",
-                    cursor.line(),
-                    cursor.column(),
-                ));
-            }
-        }
-    }
-
-    // Push a namespace scope only when this element declares bindings. Empty
-    // scopes do not affect resolution and are common in ordinary XML.
-    let pushed_ns_scope = ns_resolver.is_some() && !ns_decls.is_empty();
-    if let Some(resolver) = ns_resolver.as_mut() {
-        if pushed_ns_scope {
-            resolver.push_scope();
-            for (prefix, uri) in &ns_decls {
-                resolver.declare(prefix.clone(), uri.clone());
-            }
-        }
-    }
-
-    // Resolve the element QName
-    // tag_name from parse_name is always Cow::Borrowed, so we can sub-borrow safely
-    let (prefix, local_name) = split_qname(&tag_name);
-    let qname = if let Some(resolver) = ns_resolver.as_ref() {
-        let ns: Option<Cow<'a, str>> = if let Some(p) = prefix {
-            let uri = resolver.resolve(p).ok_or_else(|| {
-                XmlError::namespace(
-                    format!("Undeclared namespace prefix: {}", p),
-                    cursor.line(),
-                    cursor.column(),
-                )
-            })?;
-            Some(uri.clone())
-        } else {
-            resolver.resolve_default().cloned()
-        };
-        // prefix and local_name are slices of tag_name which is Cow::Borrowed from input
-        QName {
-            namespace_uri: ns,
-            prefix: prefix.map(|s| borrow_from_cow(&tag_name, s)),
-            local_name: borrow_from_cow(&tag_name, local_name),
-        }
-    } else {
-        QName::local(tag_name.clone())
-    };
-
-    // Resolve attribute QNames — consume raw_attrs (xmlns already separated out)
-    let mut resolved_attrs = Vec::with_capacity(raw_attrs.len());
-    for (attr_name, attr_value) in raw_attrs {
-        let (a_prefix, a_local) = split_qname(&attr_name);
-        let a_qname = if let Some(resolver) = ns_resolver.as_ref() {
-            if let Some(p) = a_prefix {
-                let ns_uri = resolver.resolve(p).ok_or_else(|| {
-                    XmlError::namespace(
-                        format!("Undeclared namespace prefix: {}", p),
-                        cursor.line(),
-                        cursor.column(),
-                    )
-                })?;
-                QName {
-                    namespace_uri: Some(ns_uri.clone()),
-                    prefix: Some(borrow_from_cow(&attr_name, p)),
-                    local_name: borrow_from_cow(&attr_name, a_local),
-                }
-            } else {
-                QName::local(borrow_from_cow(&attr_name, a_local))
-            }
-        } else {
-            QName::local(attr_name)
-        };
-        if resolved_attrs.iter().any(|existing: &Attribute<'a>| {
-            existing.name.local_name == a_qname.local_name
-                && existing.name.namespace_uri.as_deref() == a_qname.namespace_uri.as_deref()
-        }) {
-            return Err(XmlError::well_formedness(
-                format!("Duplicate attribute: {}", a_qname),
-                cursor.line(),
-                cursor.column(),
-            ));
-        }
-        resolved_attrs.push(Attribute {
-            name: a_qname,
-            value: attr_value,
-        });
-    }
-
-    // Create element node
-    let elem = Element {
-        name: qname,
-        attributes: resolved_attrs,
-        namespace_declarations: ns_decls,
-    };
-    let elem_id = doc.alloc_node(NodeKind::Element(elem), start_pos);
-    doc.append_child_unchecked(parent, elem_id);
-
-    // Self-closing?
-    if cursor.peek_byte() == Some(b'/') {
-        cursor.expect("/>")?;
-        doc.set_byte_end_pos(elem_id, cursor.pos);
-        if pushed_ns_scope {
-            let resolver = ns_resolver.as_mut().expect("namespace resolver exists");
-            resolver.pop_scope();
-        }
-        return Ok(elem_id);
-    }
-
-    cursor.expect(">")?;
-
-    // Parse element content
-    parse_content(
-        cursor,
-        doc,
-        elem_id,
-        ns_resolver,
-        entities,
-        entity_cache,
-        budget,
-        depth,
-        max_depth,
-    )?;
-
-    // Parse end tag
-    cursor.expect("</")?;
-    let end_tag_name = parse_name(cursor)?;
-    cursor.skip_whitespace();
-    cursor.expect(">")?;
-    doc.set_byte_end_pos(elem_id, cursor.pos);
-
-    if *end_tag_name != *tag_name {
-        return Err(XmlError::well_formedness(
-            format!(
-                "Mismatched end tag: expected </{}>, found </{}>",
-                tag_name, end_tag_name
-            ),
-            cursor.line(),
-            cursor.column(),
-        ));
-    }
-
-    if pushed_ns_scope {
-        let resolver = ns_resolver.as_mut().expect("namespace resolver exists");
-        resolver.pop_scope();
-    }
-
-    Ok(elem_id)
-}
-
-/// Parse element content (text, child elements, CDATA, comments, PIs).
-/// Uses lazy allocation: text content is borrowed from input when possible.
-///
-/// `depth` is the depth of the *parent* element; any child element parsed here
-/// will be at `depth + 1` and is checked against `max_depth`.
-#[allow(clippy::too_many_arguments)]
-fn parse_content<'a>(
-    cursor: &mut Cursor<'a>,
-    doc: &mut Document<'a>,
-    parent: NodeId,
-    ns_resolver: &mut Option<NamespaceResolver<'a>>,
-    entities: &EntityMap,
-    entity_cache: &mut EntityCache,
-    budget: &mut usize,
-    depth: u32,
-    max_depth: u32,
-) -> XmlResult<()> {
-    // Lazy text buffer: tracks start position for borrowing, switches to owned on entity/\r
-    enum TextBuf {
-        Empty,
-        Borrowed { start: usize },
-        Owned(String),
-    }
-
-    impl TextBuf {
-        fn flush<'a>(
-            self,
-            input: &'a str,
-            doc: &mut Document<'a>,
-            parent: NodeId,
-            byte_pos: usize,
-            end_pos: usize,
-        ) {
-            match self {
-                TextBuf::Empty => {}
-                TextBuf::Borrowed { start } => {
-                    if start < end_pos {
-                        let text = Cow::Borrowed(&input[start..end_pos]);
-                        let id = doc.alloc_node(NodeKind::Text(text), start);
-                        doc.set_byte_end_pos(id, end_pos);
-                        doc.append_child_unchecked(parent, id);
-                    }
-                }
-                TextBuf::Owned(s) => {
-                    if !s.is_empty() {
-                        let id = doc.alloc_node(NodeKind::Text(Cow::Owned(s)), byte_pos);
-                        doc.set_byte_end_pos(id, end_pos);
-                        doc.append_child_unchecked(parent, id);
-                    }
-                }
-            }
-        }
-
-        fn switch_to_owned(&mut self, input: &str, end_pos: usize) {
-            match self {
-                TextBuf::Empty => {
-                    *self = TextBuf::Owned(String::new());
-                }
-                TextBuf::Borrowed { start } => {
-                    let s = input[*start..end_pos].to_string();
-                    *self = TextBuf::Owned(s);
-                }
-                TextBuf::Owned(_) => {} // already owned
-            }
-        }
-
-        fn push_str(&mut self, input: &str, end_pos: usize, s: &str) {
-            self.switch_to_owned(input, end_pos);
-            if let TextBuf::Owned(ref mut buf) = self {
-                buf.push_str(s);
-            }
-        }
-
-        fn push_char(&mut self, input: &str, end_pos: usize, c: char) {
-            self.switch_to_owned(input, end_pos);
-            if let TextBuf::Owned(ref mut buf) = self {
-                buf.push(c);
-            }
-        }
-    }
-
-    let text_start_pos = cursor.pos;
-    let mut text_buf: TextBuf = TextBuf::Empty;
-
-    loop {
-        if cursor.pos >= cursor.input.len() {
-            return Err(XmlError::UnexpectedEof);
-        }
-
-        // Batch scan: find the next interesting byte (<, &, \r, ])
-        let bytes = cursor.input.as_bytes();
-        let scan_start = cursor.pos;
-        let (advance, has_non_ascii_or_control) =
-            crate::simd::scan_content_delimiters(&bytes[scan_start..]);
-        let i = scan_start + advance;
-
-        // Accumulate clean bytes in bulk
-        if i > scan_start {
-            // Only validate XML chars if we saw non-ASCII or control bytes
-            if has_non_ascii_or_control {
-                let chunk = &cursor.input[scan_start..i];
-                for c in chunk.chars() {
-                    if !is_xml_char(c) {
-                        return Err(XmlError::well_formedness(
-                            format!("Invalid XML character U+{:04X}", c as u32),
-                            cursor.line(),
-                            cursor.column(),
-                        ));
-                    }
-                }
-            }
-            match &mut text_buf {
-                TextBuf::Empty => {
-                    text_buf = TextBuf::Borrowed { start: scan_start };
-                }
-                TextBuf::Borrowed { .. } => {
-                    // Just extend the borrowed range
-                }
-                TextBuf::Owned(ref mut buf) => {
-                    buf.push_str(&cursor.input[scan_start..i]);
-                }
-            }
-            cursor.pos = i;
-        }
-
-        if cursor.pos >= cursor.input.len() {
-            return Err(XmlError::UnexpectedEof);
-        }
-
-        // Dispatch on the found byte
-        match bytes[cursor.pos] {
-            b'<' => {
-                // Peek at next byte to determine what kind of markup
-                match bytes.get(cursor.pos + 1) {
-                    Some(b'/') => {
-                        // End tag - flush text and return
-                        text_buf.flush(cursor.input, doc, parent, text_start_pos, cursor.pos);
-                        return Ok(());
-                    }
-                    Some(b'!') => {
-                        text_buf.flush(cursor.input, doc, parent, text_start_pos, cursor.pos);
-                        text_buf = TextBuf::Empty;
-                        if cursor.starts_with("<![CDATA[") {
-                            let start = cursor.pos;
-                            let cdata = parse_cdata(cursor)?;
-                            let id = doc.alloc_node(NodeKind::CData(cdata), start);
-                            doc.set_byte_end_pos(id, cursor.pos);
-                            doc.append_child_unchecked(parent, id);
-                        } else if cursor.starts_with("<!--") {
-                            let start = cursor.pos;
-                            let comment = parse_comment(cursor)?;
-                            let id = doc.alloc_node(NodeKind::Comment(comment), start);
-                            doc.set_byte_end_pos(id, cursor.pos);
-                            doc.append_child_unchecked(parent, id);
-                        } else {
-                            return Err(XmlError::well_formedness(
-                                "Invalid markup in element content",
-                                cursor.line(),
-                                cursor.column(),
-                            ));
-                        }
-                    }
-                    Some(b'?') => {
-                        text_buf.flush(cursor.input, doc, parent, text_start_pos, cursor.pos);
-                        text_buf = TextBuf::Empty;
-                        let start = cursor.pos;
-                        let pi = parse_pi(cursor)?;
-                        let id = doc.alloc_node(NodeKind::ProcessingInstruction(pi), start);
-                        doc.set_byte_end_pos(id, cursor.pos);
-                        doc.append_child_unchecked(parent, id);
-                    }
-                    _ => {
-                        // Child element
-                        text_buf.flush(cursor.input, doc, parent, text_start_pos, cursor.pos);
-                        text_buf = TextBuf::Empty;
-                        parse_element(
-                            cursor,
-                            doc,
-                            parent,
-                            ns_resolver,
-                            entities,
-                            entity_cache,
-                            budget,
-                            depth + 1,
-                            max_depth,
-                        )?;
-                    }
-                }
-            }
-            b'&' => {
-                let before_pos = cursor.pos;
-                let resolved =
-                    parse_reference_with_entities(cursor, entities, entity_cache, budget)?;
-                text_buf.push_str(cursor.input, before_pos, &resolved);
-            }
-            b'\r' => {
-                // Normalize \r\n and standalone \r to \n (XML 1.0 section 2.11)
-                let before_pos = cursor.pos;
-                cursor.pos += 1; // skip the \r
-                if cursor.peek_byte() == Some(b'\n') {
-                    cursor.pos += 1; // skip the \n
-                }
-                text_buf.push_char(cursor.input, before_pos, '\n');
-            }
-            b']' => {
-                // Check for illegal ]]> in content
-                if cursor.starts_with("]]>") {
-                    return Err(XmlError::well_formedness(
-                        "']]>' not allowed in element content",
-                        cursor.line(),
-                        cursor.column(),
-                    ));
-                }
-                // Just a regular ] character
-                match &mut text_buf {
-                    TextBuf::Empty => {
-                        text_buf = TextBuf::Borrowed { start: cursor.pos };
-                        cursor.advance_no_newlines(1);
-                    }
-                    TextBuf::Borrowed { .. } => {
-                        cursor.advance_no_newlines(1);
-                    }
-                    TextBuf::Owned(ref mut buf) => {
-                        buf.push(']');
-                        cursor.advance_no_newlines(1);
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 /// Parse a CDATA section. Returns borrowed slice (CDATA never has entity expansion).
-fn parse_cdata<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
+pub(crate) fn parse_cdata<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     cursor.expect("<![CDATA[")?;
     let content = cursor.read_until("]]>")?;
     // Validate all characters are valid XML chars
@@ -2976,6 +2279,8 @@ fn parse_cdata<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::dom::NodeKind;
+
     use super::*;
 
     #[test]

@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Hardened the pull parser fail-closed contract: direct `PullParser::next_event()`
+  now fuses after any parse error, matching the iterator adapter and preventing
+  post-error events or repeated errors from being observed by streaming
+  consumers.
+- XSLT computed `xsl:element` and `xsl:attribute` names are now validated as XML
+  QNames before serialization, rejecting markup-smuggling values from attribute
+  value templates.
+- XPath public evaluation now rejects trailing tokens, and flat binary operator
+  chains count against the configured expression-depth cap before they can build
+  deeply nested ASTs.
+- XSD identity constraint validation now indexes normalized key/unique/keyref
+  tuples instead of linearly scanning prior tuples, removing quadratic duplicate
+  and keyref lookup paths while preserving decimal-equivalent comparisons.
+- `parse_bytes()` now normalizes any retained XML declaration encoding to
+  `UTF-8`, so string serialization cannot emit stale metadata such as UTF-8
+  bytes declaring `UTF-16`.
+
+### Added
+
+- Regression and fuzz coverage for the security hardening above, including
+  direct pull error fusion, computed XSLT QName injection attempts, XPath
+  trailing-token and flat-chain depth checks, XSD identity tuple lookup, and
+  stale encoding declarations in `parse_bytes()`.
+
+## [0.8.1] - 2026-07-05
+
+### Added
+
+- Pull-based XML event parser (`uppsala::pull`, ADR 0018): `PullParser`
+  iterates `PullEvent`s — XML declaration, DOCTYPE, start/end namespace,
+  start/end element (with resolved QNames, attributes, depth, and byte
+  ranges), text, CDATA, comment, and processing instruction — over a decoded
+  string without building a DOM. It carries the same namespace awareness,
+  nesting-depth cap, entity-expansion budget, and `forbid_dtd` /
+  `forbid_entities` hardening switches as `Parser`, and
+  `pull::document_from_pull` / `pull::parse_document` materialize a DOM from
+  the event stream. `Parser::parse` is now layered on the pull parser, so the
+  two surfaces share one scanner and one set of well-formedness checks.
+- Pull-parser regression coverage at parity with the DOM parser.
+  `tests/pull_differential.rs` runs the accepted and invalid regression
+  corpora through both `Parser::parse` and `document_from_pull` (comparing
+  serialized output, XML declaration, DOCTYPE, source ranges, and exact error
+  text, across all parser options) and additionally drives the scan-only
+  event stream under the ADR 0018 stream invariants (element and namespace
+  balance, matching names and depths, in-bounds byte ranges, fused iterator
+  after an error). Every hand-crafted conformance suite (XML, namespace,
+  XPath, XSD, XSD composition, serialization, ranges) now parses through a
+  shared checked helper (`tests/common/mod.rs`) that asserts pull/DOM
+  agreement on each fixture, and each W3C family has a pull-agreement
+  counterpart: `w3c_pull_event_stream_agrees_with_dom_parser` sweeps every
+  UTF-8 XML conformance file (~2250), and
+  `xsts_{nist_datatypes,ms_datatypes,sun_combined}_pull_agreement` sweep all
+  ~26,500 schema/instance documents of the three XSTS families, asserting
+  the raw event stream accepts/rejects with the same error text as the DOM
+  parser. All of these run in CI (the XSTS steps' substring filters pick up
+  the new sweeps; `--test pull_differential` was added to the hand-crafted
+  step; `just test-pull` and `just test-handcrafted` cover them locally).
+  During bring-up the xmlconf sweep
+  caught (and this release fixes, before it ever shipped) an empty-entity
+  end-of-document bug: `<!ENTITY e "">` expanded in content made
+  `Parser::parse` fail with `UnexpectedEof` on valid documents (W3C
+  valid-sa-023/085/086, rmt-e2e-15a), a divergence the suites' pass-rate
+  thresholds had let through.
+- New `fuzz_pull` libFuzzer harness (12th target): asserts the ADR 0018
+  event-stream invariants and the pull-vs-DOM accept/reject agreement on
+  arbitrary input. Wired into the fuzz scripts, dictionaries, seed import,
+  and the weekly CI fuzz smoke exactly like the existing parser targets, with
+  the empty-entity witness tracked as a regression seed.
+- `just bench-libxml2` now also reports pull scan-only and pull-to-DOM
+  timings alongside the DOM and libxml2 numbers.
+
 ## [0.8.0] - 2026-07-03
 
 ### Added

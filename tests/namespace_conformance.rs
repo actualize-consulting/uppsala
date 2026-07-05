@@ -3,12 +3,15 @@
 //! Tests cover namespace declarations, prefix resolution, default namespaces,
 //! namespace scoping, undeclaration, and error cases.
 
+mod common;
+use common::parse;
+
 // ─── Basic namespace declarations ────────────────────────
 
 #[test]
 fn default_namespace() {
     let xml = r#"<root xmlns="http://example.com">text</root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     assert_eq!(
@@ -22,7 +25,7 @@ fn default_namespace() {
 #[test]
 fn prefixed_namespace() {
     let xml = r#"<ns:root xmlns:ns="http://example.com"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     assert_eq!(
@@ -36,7 +39,7 @@ fn prefixed_namespace() {
 #[test]
 fn multiple_prefixes() {
     let xml = r#"<root xmlns:a="http://a.com" xmlns:b="http://b.com"><a:child/><b:child/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let children = doc.children(root);
     assert_eq!(children.len(), 2);
@@ -55,7 +58,7 @@ fn multiple_prefixes() {
 #[test]
 fn default_namespace_inherited_by_children() {
     let xml = r#"<root xmlns="http://example.com"><child><grandchild/></child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let child = doc.children(root)[0];
     let grandchild = doc.children(child)[0];
@@ -76,7 +79,7 @@ fn default_namespace_inherited_by_children() {
 #[test]
 fn prefixed_namespace_inherited_by_children() {
     let xml = r#"<ns:root xmlns:ns="http://example.com"><ns:child/></ns:root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let child = doc.children(root)[0];
     let child_elem = doc.element(child).unwrap();
@@ -91,7 +94,7 @@ fn prefixed_namespace_inherited_by_children() {
 #[test]
 fn namespace_shadowing() {
     let xml = r#"<root xmlns:ns="http://outer.com"><ns:child xmlns:ns="http://inner.com"><ns:grandchild/></ns:child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let child = doc.children(root)[0];
     let grandchild = doc.children(child)[0];
@@ -112,7 +115,7 @@ fn namespace_shadowing() {
 #[test]
 fn default_namespace_override() {
     let xml = r#"<root xmlns="http://outer.com"><child xmlns="http://inner.com"/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let child = doc.children(root)[0];
 
@@ -134,7 +137,7 @@ fn default_namespace_override() {
 #[test]
 fn default_namespace_undeclaration() {
     let xml = r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let child = doc.children(root)[0];
 
@@ -154,7 +157,7 @@ fn default_namespace_undeclaration() {
 #[test]
 fn prefixed_attribute() {
     let xml = r#"<root xmlns:ns="http://example.com" ns:attr="value"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     let attr = &elem.attributes[0];
@@ -171,7 +174,7 @@ fn prefixed_attribute() {
 fn unprefixed_attribute_no_namespace() {
     // Per the namespace spec, unprefixed attributes have no namespace
     let xml = r#"<root xmlns="http://example.com" attr="value"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     let attr = &elem.attributes[0];
@@ -184,7 +187,7 @@ fn unprefixed_attribute_no_namespace() {
 #[test]
 fn namespace_declarations_map() {
     let xml = r#"<root xmlns="http://default.com" xmlns:ns="http://ns.com"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     assert_eq!(
@@ -209,7 +212,7 @@ fn namespace_declarations_map() {
 fn xml_prefix_always_available() {
     // The xml: prefix is always bound to http://www.w3.org/XML/1998/namespace
     let xml = r#"<root xml:lang="en"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let elem = doc.element(root).unwrap();
     let attr = &elem.attributes[0];
@@ -246,7 +249,7 @@ fn saml_like_namespaces() {
     </saml:Subject>
   </saml:Assertion>
 </samlp:Response>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let root_elem = doc.element(root).unwrap();
     assert_eq!(root_elem.name.local_name, "Response");
@@ -270,14 +273,14 @@ fn saml_like_namespaces() {
 #[test]
 fn error_undeclared_prefix() {
     let xml = "<ns:root/>";
-    let result = uppsala::parse(xml);
+    let result = parse(xml);
     assert!(result.is_err(), "Undeclared prefix should be an error");
 }
 
 #[test]
 fn error_undeclared_prefix_on_attribute() {
     let xml = r#"<root ns:attr="val"/>"#;
-    let result = uppsala::parse(xml);
+    let result = parse(xml);
     assert!(
         result.is_err(),
         "Undeclared prefix on attribute should be an error"
@@ -296,7 +299,7 @@ fn error_reserved_namespace_as_default() {
         r#"<r xmlns="http://www.w3.org/2000/xmlns/"/>"#,
     ] {
         assert!(
-            uppsala::parse(xml).is_err(),
+            parse(xml).is_err(),
             "reserved namespace as default must be rejected: {xml}"
         );
     }
@@ -311,7 +314,7 @@ fn error_xml_namespace_bound_to_other_prefix() {
         r#"<r xmlns:foo="http://www.w3.org/2000/xmlns/"/>"#,
     ] {
         assert!(
-            uppsala::parse(xml).is_err(),
+            parse(xml).is_err(),
             "reserved namespace bound to a prefix must be rejected: {xml}"
         );
     }
@@ -325,7 +328,7 @@ fn error_xmlns_declaration_prefix_must_be_ncname() {
     // multi-colon prefix `a:b`.
     for xml in [r#"<r xmlns:="urn:x"/>"#, r#"<r xmlns:a:b="urn:x"/>"#] {
         assert!(
-            uppsala::parse(xml).is_err(),
+            parse(xml).is_err(),
             "non-NCName declaration prefix must be rejected: {xml}"
         );
     }
@@ -336,7 +339,7 @@ fn xml_prefix_may_be_declared_with_its_own_uri() {
     // §3: the `xml` prefix MAY be (redundantly) declared when bound to the XML
     // namespace; the stricter reserved-binding checks must not reject it.
     let xml = r#"<r xmlns:xml="http://www.w3.org/XML/1998/namespace"><xml:a/></r>"#;
-    let doc = uppsala::parse(xml).expect("redundant xml declaration is legal");
+    let doc = parse(xml).expect("redundant xml declaration is legal");
     let root = doc.document_element().unwrap();
     let child = doc.children_iter(root).next().unwrap();
     assert_eq!(

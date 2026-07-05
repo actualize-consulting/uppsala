@@ -16,5 +16,9 @@ fuzz_target!(|data: &[u8]| {
         let eval = XPathEvaluator::new();
         let root = doc.root();
         let _ = eval.evaluate(&doc, root, expr);
+        let tight = XPathEvaluator::new()
+            .with_max_depth(4)
+            .with_max_node_visits(256);
+        let _ = tight.evaluate(&doc, root, expr);
     }
 });

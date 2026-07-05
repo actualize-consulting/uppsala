@@ -15,7 +15,10 @@ fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else {
         return;
     };
-    let (xslt, xml) = match s.split_once('\0') {
+    let (xslt, xml) = match s
+        .split_once('\0')
+        .or_else(|| s.split_once("\n---XML---\n"))
+    {
         Some((a, b)) => (a, b),
         None => return,
     };

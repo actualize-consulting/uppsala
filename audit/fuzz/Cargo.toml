@@ -56,6 +56,15 @@ test = false
 doc = false
 bench = false
 
+# Pull parser event stream: scan-only stream invariants + differential oracle
+# (the raw event stream must accept/reject exactly like the DOM parser).
+[[bin]]
+name = "fuzz_pull"
+path = "fuzz_targets/fuzz_pull.rs"
+test = false
+doc = false
+bench = false
+
 # --- Serializer surface (drives SIMD scan_escape_sse2 + name sanitization) ---
 [[bin]]
 name = "fuzz_roundtrip"

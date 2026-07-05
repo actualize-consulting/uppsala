@@ -303,6 +303,99 @@ fn run_xsts_instance_tests(
     (passed, failed, skipped, failures)
 }
 
+/// Sweep every schema and instance document referenced by a testSet through
+/// the scan-only pull parser, asserting it accepts/rejects each file exactly
+/// like the DOM parser (with the same error text on rejection). One sweep per
+/// XSTS family so the pull parser gets the same per-suite regression coverage
+/// as `Parser::parse`.
+fn run_pull_agreement_sweep(test_set_path: &Path, family: &str) {
+    if !test_set_path.exists() {
+        eprintln!("XSTS test set not found, skipping pull agreement sweep.");
+        return;
+    }
+
+    let groups = parse_test_set(test_set_path);
+    let mut files: Vec<PathBuf> = Vec::new();
+    for group in &groups {
+        if let Some(path) = &group.schema_path {
+            files.push(path.clone());
+        }
+        for inst_test in &group.instance_tests {
+            files.push(inst_test.path.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+
+    let mut checked = 0;
+    let mut skipped = 0;
+    let mut divergences = Vec::new();
+
+    for path in &files {
+        // The pull parser is a &str surface; unreadable or non-UTF-8 files
+        // are out of scope.
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let dom_err = uppsala::parse(&content).err().map(|e| e.to_string());
+        let scan_err = uppsala::PullParser::new(&content)
+            .find_map(|event| event.err())
+            .map(|e| e.to_string());
+
+        checked += 1;
+        if dom_err != scan_err {
+            divergences.push(format!(
+                "  {}: DOM parser {:?} vs pull scan {:?}",
+                path.display(),
+                dom_err,
+                scan_err
+            ));
+        }
+    }
+
+    println!(
+        "XSTS {} pull-vs-DOM agreement: {} files checked, {} skipped, {} divergences",
+        family,
+        checked,
+        skipped,
+        divergences.len()
+    );
+    assert!(
+        divergences.is_empty(),
+        "pull event stream diverged from the DOM parser:\n{}",
+        divergences.join("\n")
+    );
+}
+
+#[test]
+fn xsts_nist_datatypes_pull_agreement() {
+    run_pull_agreement_sweep(
+        Path::new("test-data/xsts/xmlschema2006-11-06/nistMeta/NISTXMLSchemaDatatypes.testSet"),
+        "NIST Datatypes",
+    );
+}
+
+#[test]
+fn xsts_ms_datatypes_pull_agreement() {
+    run_pull_agreement_sweep(
+        Path::new("test-data/xsts/xmlschema2006-11-06/msMeta/DataTypes_w3c.xml"),
+        "MS DataTypes",
+    );
+}
+
+#[test]
+fn xsts_sun_combined_pull_agreement() {
+    run_pull_agreement_sweep(
+        Path::new("test-data/xsts/xmlschema2006-11-06/sunMeta/suntest.testSet"),
+        "Sun Combined",
+    );
+}
+
 #[test]
 fn xsts_nist_datatypes() {
     let test_set_path =

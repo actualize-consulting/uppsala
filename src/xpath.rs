@@ -237,6 +237,12 @@ impl XPathEvaluator {
         let tokens = tokenize(expr)?;
         let mut parser = XPathParser::new(&tokens, self.max_depth);
         let ast = parser.parse_expr()?;
+        if parser.peek().is_some() {
+            return Err(XmlError::xpath(format!(
+                "Unexpected trailing tokens in XPath expression: {:?}",
+                expr
+            )));
+        }
         let budget = EvalBudget::new(self.max_node_visits);
         let ctx = EvalContext {
             node: context,
@@ -1220,6 +1226,17 @@ impl<'a> XPathParser<'a> {
         let guard = DepthGuard::enter(self)?;
         guard.parser.parse_expr()
     }
+
+    fn charge_binary_chain(&self, chain_depth: &mut u32) -> XmlResult<()> {
+        if *chain_depth >= self.max_depth {
+            return Err(XmlError::xpath(format!(
+                "XPath expression nesting exceeds maximum depth of {}",
+                self.max_depth
+            )));
+        }
+        *chain_depth += 1;
+        Ok(())
+    }
 }
 
 /// RAII helper that bumps `XPathParser::depth` on construction and
@@ -1253,8 +1270,10 @@ impl<'p, 'a> Drop for DepthGuard<'p, 'a> {
 impl<'a> XPathParser<'a> {
     fn parse_or_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_and_expr()?;
+        let mut chain_depth = 0;
         while matches!(self.peek(), Some(Token::Or)) {
             self.advance();
+            self.charge_binary_chain(&mut chain_depth)?;
             let right = self.parse_and_expr()?;
             left = Expr::Or(Box::new(left), Box::new(right));
         }
@@ -1263,8 +1282,10 @@ impl<'a> XPathParser<'a> {
 
     fn parse_and_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_equality_expr()?;
+        let mut chain_depth = 0;
         while matches!(self.peek(), Some(Token::And)) {
             self.advance();
+            self.charge_binary_chain(&mut chain_depth)?;
             let right = self.parse_equality_expr()?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
@@ -1273,15 +1294,18 @@ impl<'a> XPathParser<'a> {
 
     fn parse_equality_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_relational_expr()?;
+        let mut chain_depth = 0;
         loop {
             match self.peek() {
                 Some(Token::Eq) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_relational_expr()?;
                     left = Expr::Eq(Box::new(left), Box::new(right));
                 }
                 Some(Token::NotEq) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_relational_expr()?;
                     left = Expr::NotEq(Box::new(left), Box::new(right));
                 }
@@ -1293,25 +1317,30 @@ impl<'a> XPathParser<'a> {
 
     fn parse_relational_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_additive_expr()?;
+        let mut chain_depth = 0;
         loop {
             match self.peek() {
                 Some(Token::Lt) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_additive_expr()?;
                     left = Expr::Lt(Box::new(left), Box::new(right));
                 }
                 Some(Token::Gt) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_additive_expr()?;
                     left = Expr::Gt(Box::new(left), Box::new(right));
                 }
                 Some(Token::LtEq) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_additive_expr()?;
                     left = Expr::LtEq(Box::new(left), Box::new(right));
                 }
                 Some(Token::GtEq) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_additive_expr()?;
                     left = Expr::GtEq(Box::new(left), Box::new(right));
                 }
@@ -1323,15 +1352,18 @@ impl<'a> XPathParser<'a> {
 
     fn parse_additive_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_multiplicative_expr()?;
+        let mut chain_depth = 0;
         loop {
             match self.peek() {
                 Some(Token::Plus) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_multiplicative_expr()?;
                     left = Expr::Add(Box::new(left), Box::new(right));
                 }
                 Some(Token::Minus) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_multiplicative_expr()?;
                     left = Expr::Sub(Box::new(left), Box::new(right));
                 }
@@ -1343,20 +1375,24 @@ impl<'a> XPathParser<'a> {
 
     fn parse_multiplicative_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_unary_expr()?;
+        let mut chain_depth = 0;
         loop {
             match self.peek() {
                 Some(Token::Star) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_unary_expr()?;
                     left = Expr::Mul(Box::new(left), Box::new(right));
                 }
                 Some(Token::Div) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_unary_expr()?;
                     left = Expr::Div(Box::new(left), Box::new(right));
                 }
                 Some(Token::Mod) => {
                     self.advance();
+                    self.charge_binary_chain(&mut chain_depth)?;
                     let right = self.parse_unary_expr()?;
                     left = Expr::Mod(Box::new(left), Box::new(right));
                 }
@@ -1384,8 +1420,10 @@ impl<'a> XPathParser<'a> {
 
     fn parse_union_expr(&mut self) -> XmlResult<Expr> {
         let mut left = self.parse_path_expr()?;
+        let mut chain_depth = 0;
         while matches!(self.peek(), Some(Token::Pipe)) {
             self.advance();
+            self.charge_binary_chain(&mut chain_depth)?;
             let right = self.parse_path_expr()?;
             left = Expr::Union(Box::new(left), Box::new(right));
         }

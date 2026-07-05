@@ -99,6 +99,8 @@
 //! [`Parser::with_max_entity_expansion`]) when a workload legitimately needs
 //! a different bound.
 
+use std::borrow::Cow;
+
 /// Arena-based DOM representation of XML documents.
 pub mod dom;
 /// Error types: [`XmlError`], [`XmlResult`], and per-domain error structs.
@@ -109,6 +111,8 @@ mod exslt;
 pub mod namespace;
 /// XML 1.0 (Fifth Edition) recursive-descent parser.
 pub mod parser;
+/// XML pull parser event stream.
+pub mod pull;
 /// Accelerated byte scanning for parser hot loops.
 mod simd;
 
@@ -138,6 +142,7 @@ pub use error::{
 };
 pub use namespace::NamespaceResolver;
 pub use parser::Parser;
+pub use pull::{NamespaceDeclaration, PullEvent, PullParser};
 pub use writer::XmlWriter;
 pub use xpath::{XPathEvaluator, XPathValue};
 pub use xsd::{XsdValidator, XSI_NAMESPACE, XS_NAMESPACE};
@@ -159,9 +164,17 @@ pub fn parse(input: &str) -> XmlResult<Document<'_>> {
 /// - No BOM with `00 3C`: UTF-16 BE without BOM
 /// - No BOM with `3C 00`: UTF-16 LE without BOM
 /// - Otherwise: UTF-8
+///
+/// The returned document serializes as a Rust UTF-8 string, so an XML
+/// declaration encoding parsed from the byte stream is normalized to `UTF-8`.
 pub fn parse_bytes(input: &[u8]) -> XmlResult<Document<'static>> {
     let text = decode_xml_bytes(input)?;
-    let doc = Parser::new().parse(&text)?;
+    let mut doc = Parser::new().parse(&text)?;
+    if let Some(decl) = doc.xml_declaration.as_mut() {
+        if decl.encoding.is_some() {
+            decl.encoding = Some(Cow::Borrowed("UTF-8"));
+        }
+    }
     Ok(doc.into_static())
 }
 

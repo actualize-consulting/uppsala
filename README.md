@@ -10,6 +10,9 @@ regex engine are built from scratch.
 
 - **XML 1.0 (Fifth Edition)** parsing and well-formedness checking
 - **Namespaces in XML 1.0 (Third Edition)** with prefix resolution and scoping
+- **Pull parser** (`PullParser`) — a streaming event API over the same
+  scanner and well-formedness checks as the DOM parser (the DOM parser is
+  layered on it), with the same hardening switches
 - **Arena-based DOM** with tree mutation (insert, remove, replace)
 - **XPath 1.0** evaluation (all axes, functions, predicates, operators)
 - **XSD 1.1 validation** (structures + datatypes, 40+ built-in types)
@@ -94,7 +97,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-uppsala = "0.6"
+uppsala = "0.8"
 ```
 
 ### Parse and query
@@ -138,6 +141,32 @@ if let Ok(XPathValue::NodeSet(nodes)) =
     }
 }
 ```
+
+### Stream events with the pull parser
+
+For scanning large documents without materializing a DOM, `PullParser`
+yields events (start/end element, text, CDATA, comments, processing
+instructions, namespace scopes) with resolved qualified names, element
+depth, and source byte ranges:
+
+```rust
+use uppsala::{PullEvent, PullParser};
+
+let xml = r#"<feed><entry id="1">Hello</entry></feed>"#;
+for event in PullParser::new(xml) {
+    match event.unwrap() {
+        PullEvent::StartElement { name, depth, .. } => {
+            println!("{:indent$}<{name}>", "", indent = depth as usize * 2);
+        }
+        PullEvent::Text { content, .. } => println!("  text: {content}"),
+        _ => {}
+    }
+}
+```
+
+The same safety limits and opt-in hardening as the DOM parser apply
+(`with_max_depth`, `with_max_entity_expansion`, `with_forbid_dtd`,
+`with_forbid_entities`), and external entities are never resolved.
 
 ### Validate against an XSD schema
 
@@ -207,6 +236,7 @@ src/
   error.rs          XmlError enum, XmlResult type alias
   dom.rs            Arena-based DOM: Document, NodeId, QName, serialization
   parser.rs         XML 1.0 recursive-descent parser with full DTD internal subset
+  pull.rs           Pull-based event parser (PullParser); the DOM parser is built on it
   simd.rs           SSE2-accelerated byte scanning (content + attribute delimiters)
   namespace.rs      Namespace prefix resolution with scope stack
   writer.rs         XmlWriter imperative builder

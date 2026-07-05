@@ -1,0 +1,1 @@
+<!DOCTYPE r [<!ENTITY e "<xs:element name='e'></xs:element>">]><r>&e;</r>

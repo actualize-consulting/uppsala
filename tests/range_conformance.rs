@@ -1,9 +1,12 @@
 //! Tests for node_range(), node_source(), and input_text() APIs.
 
+mod common;
+use common::parse;
+
 #[test]
 fn test_node_range_element() {
     let xml = r#"<root><child>text</child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     assert_eq!(
         &xml[doc.node_range(root).unwrap()],
@@ -16,7 +19,7 @@ fn test_node_range_element() {
 #[test]
 fn test_node_range_self_closing() {
     let xml = r#"<root><br/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let br = doc.children(root)[0];
     assert_eq!(&xml[doc.node_range(br).unwrap()], "<br/>");
@@ -25,7 +28,7 @@ fn test_node_range_self_closing() {
 #[test]
 fn test_node_range_with_attributes() {
     let xml = r#"<root><item id="1" class="foo">content</item></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let item = doc.children(root)[0];
     assert_eq!(
@@ -37,7 +40,7 @@ fn test_node_range_with_attributes() {
 #[test]
 fn test_node_range_with_namespaces() {
     let xml = r#"<root xmlns:ds="urn:ds"><ds:Sig xmlns:ds11="urn:11"/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let sig = doc.children(root)[0];
     assert_eq!(
@@ -49,7 +52,7 @@ fn test_node_range_with_namespaces() {
 #[test]
 fn test_node_range_text_node() {
     let xml = "<root>hello world</root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let text = doc.children(root)[0];
     let range = doc.node_range(text).unwrap();
@@ -59,7 +62,7 @@ fn test_node_range_text_node() {
 #[test]
 fn test_node_range_comment() {
     let xml = "<root><!-- a comment --></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let comment = doc.children(root)[0];
     let range = doc.node_range(comment).unwrap();
@@ -69,7 +72,7 @@ fn test_node_range_comment() {
 #[test]
 fn test_node_range_pi() {
     let xml = "<root><?target data?></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let pi = doc.children(root)[0];
     let range = doc.node_range(pi).unwrap();
@@ -89,7 +92,7 @@ fn test_node_range_programmatic_returns_none() {
 #[test]
 fn test_node_source() {
     let xml = r#"<root><item id="1">hello</item><br/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     assert_eq!(doc.node_source(root).unwrap(), xml);
     let children = doc.children(root);
@@ -103,14 +106,14 @@ fn test_node_source() {
 #[test]
 fn test_input_text() {
     let xml = "<root>test</root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.input_text(), xml);
 }
 
 #[test]
 fn test_node_range_nested_elements() {
     let xml = "<a><b><c>deep</c></b></a>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let a = doc.document_element().unwrap();
     let b = doc.children(a)[0];
     let c = doc.children(b)[0];
@@ -125,7 +128,7 @@ fn test_node_range_nested_elements() {
 #[test]
 fn test_node_range_mixed_content() {
     let xml = "<root>text1<child/>text2</root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let children = doc.children(root);
     // text1
@@ -139,7 +142,7 @@ fn test_node_range_mixed_content() {
 #[test]
 fn test_node_range_prolog_comment() {
     let xml = "<!-- prolog --><root/>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let doc_children = doc.children(doc.root());
     // First child of document node should be the comment
     let comment = doc_children[0];
@@ -149,7 +152,7 @@ fn test_node_range_prolog_comment() {
 #[test]
 fn test_node_range_prolog_pi() {
     let xml = "<?mypi data?><root/>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let doc_children = doc.children(doc.root());
     let pi = doc_children[0];
     assert_eq!(&xml[doc.node_range(pi).unwrap()], "<?mypi data?>");
@@ -158,7 +161,7 @@ fn test_node_range_prolog_pi() {
 #[test]
 fn test_node_range_with_xml_declaration() {
     let xml = r#"<?xml version="1.0"?><root><item>text</item></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     assert_eq!(
         &xml[doc.node_range(root).unwrap()],
@@ -169,7 +172,7 @@ fn test_node_range_with_xml_declaration() {
 #[test]
 fn test_node_range_cdata() {
     let xml = "<root><![CDATA[some <data>]]></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let cdata = doc.children(root)[0];
     let range = doc.node_range(cdata).unwrap();
@@ -180,7 +183,7 @@ fn test_node_range_cdata() {
 fn test_node_range_empty_text() {
     // An element with only whitespace text
     let xml = "<root> </root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let text = doc.children(root)[0];
     assert_eq!(&xml[doc.node_range(text).unwrap()], " ");
@@ -189,7 +192,7 @@ fn test_node_range_empty_text() {
 #[test]
 fn test_node_source_returns_none_for_static() {
     let xml = "<root>test</root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let static_doc = doc.into_static();
     let root = static_doc.document_element().unwrap();
     // into_static clears input, so node_source should return None

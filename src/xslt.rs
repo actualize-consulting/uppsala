@@ -205,6 +205,20 @@ fn validate_pi_target(target: &str) -> XmlResult<()> {
     Ok(())
 }
 
+fn validate_result_qname(kind: &str, qname: &str) -> XmlResult<()> {
+    if !crate::writer::is_valid_xml_qname(qname) {
+        return Err(XmlError::validation(format!(
+            "{kind} name is not a valid QName"
+        )));
+    }
+    if qname == "xmlns" || qname.starts_with("xmlns:") {
+        return Err(XmlError::validation(format!(
+            "{kind} name must not use the reserved xmlns prefix"
+        )));
+    }
+    Ok(())
+}
+
 fn sanitize_pi_data(data: String) -> XmlResult<String> {
     if data.contains("?>") {
         return Err(XmlError::validation(
@@ -1434,6 +1448,7 @@ impl<'a, 'b> Engine<'a, 'b> {
             Instruction::CopyOf { select } => self.execute_copy_of(select, focus, out)?,
             Instruction::Element { name, body } => {
                 let qname = self.eval_avt(name, focus)?;
+                validate_result_qname("xsl:element", &qname)?;
                 let ns_decls = self.element_ns_decls(&qname)?;
                 let items = self.execute_sequence(body, focus)?;
                 let (attrs, children) = split_items(items);
@@ -1446,6 +1461,7 @@ impl<'a, 'b> Engine<'a, 'b> {
             }
             Instruction::Attribute { name, body } => {
                 let qname = self.eval_avt(name, focus)?;
+                validate_result_qname("xsl:attribute", &qname)?;
                 let items = self.execute_sequence(body, focus)?;
                 let value = rtf_string_value(&items_to_nodes(items));
                 out.push(ResultItem::Attr(ResultAttr { qname, value }));

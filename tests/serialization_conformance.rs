@@ -5,6 +5,9 @@
 //! byte-for-byte behavior for parsed XML, while later sections cover security
 //! defaults, subtree serialization, writer escaping, and streaming output.
 
+mod common;
+use common::parse;
+
 // ─── Round-trip: to_xml() ───────────────────────────────────────────────────
 
 // These tests cover parsed XML that should serialize back to the same compact
@@ -14,112 +17,112 @@
 #[test]
 fn roundtrip_simple() {
     let xml = "<root><child>text</child></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_self_closing() {
     let xml = "<root><empty/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_attributes() {
     let xml = r#"<root attr="value"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_entities_in_text() {
     let xml = "<r>&lt;&amp;&gt;</r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_xml_declaration() {
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?><r/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_xml_declaration_standalone() {
     let xml = r#"<?xml version="1.0" standalone="yes"?><r/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_comment() {
     let xml = "<r><!-- a comment --></r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_processing_instruction() {
     let xml = "<r><?mypi some data?></r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_pi_no_data() {
     let xml = "<r><?mypi?></r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_cdata() {
     let xml = "<r><![CDATA[<not>xml</not>]]></r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_mixed_content() {
     let xml = "<r>text<b>bold</b>more</r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_deep_nesting() {
     let xml = "<a><b><c><d><e>deep</e></d></c></b></a>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_multiple_attributes() {
     let xml = r#"<r a="1" b="2" c="3"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_unicode_text() {
     let xml = "<r>日本語テキスト</r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_unicode_attribute() {
     let xml = r#"<r attr="日本語"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_empty_document_element() {
     let xml = "<root/>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
@@ -127,21 +130,21 @@ fn roundtrip_empty_document_element() {
 fn roundtrip_attr_with_quote() {
     // Attribute value containing &quot;
     let xml = r#"<r a="say &quot;hello&quot;"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_attr_with_amp() {
     let xml = r#"<r a="a &amp; b"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
 #[test]
 fn roundtrip_attr_with_lt() {
     let xml = r#"<r a="a &lt; b"/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
@@ -154,7 +157,7 @@ fn roundtrip_attr_with_lt() {
 #[test]
 fn doctype_omitted_by_default_system() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE root SYSTEM "root.dtd"><root/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(
         doc.doctype.as_deref(),
         Some(r#"<!DOCTYPE root SYSTEM "root.dtd">"#)
@@ -167,7 +170,7 @@ fn doctype_omitted_by_default_system() {
 #[test]
 fn doctype_omitted_by_default_public() {
     let xml = r#"<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html/>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert!(doc.doctype.is_some());
     assert_eq!(doc.to_xml(), r#"<?xml version="1.0"?><html/>"#);
     let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
@@ -178,7 +181,7 @@ fn doctype_omitted_by_default_public() {
 fn doctype_omitted_by_default_internal_subset() {
     let xml =
         "<?xml version=\"1.0\"?><!DOCTYPE root [\n<!ELEMENT root (#PCDATA)>\n]><root>hello</root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert!(doc.doctype.is_some());
     assert_eq!(doc.to_xml(), "<?xml version=\"1.0\"?><root>hello</root>");
     let opts = uppsala::XmlWriteOptions::compact().with_doctype(true);
@@ -188,7 +191,7 @@ fn doctype_omitted_by_default_internal_subset() {
 #[test]
 fn no_doctype_is_none() {
     let xml = "<root/>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert!(doc.doctype.is_none());
 }
 
@@ -199,14 +202,14 @@ fn no_doctype_is_none() {
 
 #[test]
 fn text_escaping_amp_lt_gt() {
-    let doc = uppsala::parse("<r>&amp;&lt;&gt;</r>").unwrap();
+    let doc = parse("<r>&amp;&lt;&gt;</r>").unwrap();
     let output = doc.to_xml();
     assert_eq!(output, "<r>&amp;&lt;&gt;</r>");
 }
 
 #[test]
 fn attr_escaping_quote() {
-    let doc = uppsala::parse(r#"<r a="&quot;"/>"#).unwrap();
+    let doc = parse(r#"<r a="&quot;"/>"#).unwrap();
     let output = doc.to_xml();
     assert_eq!(output, r#"<r a="&quot;"/>"#);
 }
@@ -220,13 +223,13 @@ fn attr_escaping_quote() {
 fn display_matches_to_xml() {
     let xml =
         r#"<?xml version="1.0" encoding="UTF-8"?><root attr="val"><child>text</child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(format!("{}", doc), doc.to_xml());
 }
 
 #[test]
 fn display_simple() {
-    let doc = uppsala::parse("<r>hello</r>").unwrap();
+    let doc = parse("<r>hello</r>").unwrap();
     assert_eq!(format!("{}", doc), "<r>hello</r>");
 }
 
@@ -238,7 +241,7 @@ fn display_simple() {
 #[test]
 fn node_to_xml_document_element() {
     let xml = r#"<?xml version="1.0"?><root><child>text</child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root_elem = doc.document_element().unwrap();
     // node_to_xml should NOT include XML declaration
     assert_eq!(
@@ -250,7 +253,7 @@ fn node_to_xml_document_element() {
 #[test]
 fn node_to_xml_subtree() {
     let xml = "<root><a><b>inner</b></a><c/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root_elem = doc.document_element().unwrap();
     let children = doc.children(root_elem);
     // First child is <a>
@@ -262,7 +265,7 @@ fn node_to_xml_subtree() {
 #[test]
 fn node_to_xml_text_node() {
     let xml = "<r>hello &amp; world</r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root_elem = doc.document_element().unwrap();
     let children = doc.children(root_elem);
     assert_eq!(doc.node_to_xml(children[0]), "hello &amp; world");
@@ -276,7 +279,7 @@ fn node_to_xml_text_node() {
 #[test]
 fn write_to_vec() {
     let xml = "<root><child>text</child></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let mut buf: Vec<u8> = Vec::new();
     doc.write_to(&mut buf).unwrap();
     assert_eq!(String::from_utf8(buf).unwrap(), xml);
@@ -286,7 +289,7 @@ fn write_to_vec() {
 fn write_to_matches_to_xml() {
     let xml =
         r#"<?xml version="1.0" encoding="UTF-8"?><root attr="val"><child>text</child></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let mut buf: Vec<u8> = Vec::new();
     doc.write_to(&mut buf).unwrap();
     assert_eq!(String::from_utf8(buf).unwrap(), doc.to_xml());
@@ -300,7 +303,7 @@ fn write_to_matches_to_xml() {
 #[test]
 fn expand_empty_elements() {
     let xml = "<root><empty/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::compact().with_expand_empty_elements(true);
     assert_eq!(
         doc.to_xml_with_options(&opts),
@@ -311,7 +314,7 @@ fn expand_empty_elements() {
 #[test]
 fn expand_empty_root() {
     let xml = "<root/>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::compact().with_expand_empty_elements(true);
     assert_eq!(doc.to_xml_with_options(&opts), "<root></root>");
 }
@@ -319,7 +322,7 @@ fn expand_empty_root() {
 #[test]
 fn self_closing_default() {
     let xml = "<root><empty/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
@@ -331,7 +334,7 @@ fn self_closing_default() {
 #[test]
 fn pretty_print_simple() {
     let xml = "<root><a/><b/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ");
     let expected = "<root>\n  <a/>\n  <b/>\n</root>\n";
     assert_eq!(doc.to_xml_with_options(&opts), expected);
@@ -340,7 +343,7 @@ fn pretty_print_simple() {
 #[test]
 fn pretty_print_nested() {
     let xml = "<root><a><b/></a></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ");
     let expected = "<root>\n  <a>\n    <b/>\n  </a>\n</root>\n";
     assert_eq!(doc.to_xml_with_options(&opts), expected);
@@ -350,7 +353,7 @@ fn pretty_print_nested() {
 fn pretty_print_mixed_content_not_indented() {
     // Mixed content (text + elements) should NOT be indented
     let xml = "<r>text<b>bold</b>more</r>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ");
     // Mixed content preserved exactly
     assert_eq!(
@@ -362,7 +365,7 @@ fn pretty_print_mixed_content_not_indented() {
 #[test]
 fn pretty_print_with_tab_indent() {
     let xml = "<root><a/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("\t");
     assert_eq!(doc.to_xml_with_options(&opts), "<root>\n\t<a/>\n</root>\n");
 }
@@ -370,7 +373,7 @@ fn pretty_print_with_tab_indent() {
 #[test]
 fn pretty_print_with_declaration() {
     let xml = r#"<?xml version="1.0"?><root><a/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ");
     let expected = "<?xml version=\"1.0\"?><root>\n  <a/>\n</root>\n";
     assert_eq!(doc.to_xml_with_options(&opts), expected);
@@ -379,7 +382,7 @@ fn pretty_print_with_declaration() {
 #[test]
 fn pretty_print_expand_empty() {
     let xml = "<root><a/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ").with_expand_empty_elements(true);
     let expected = "<root>\n  <a></a>\n</root>\n";
     assert_eq!(doc.to_xml_with_options(&opts), expected);
@@ -393,7 +396,7 @@ fn pretty_print_expand_empty() {
 #[test]
 fn node_to_xml_with_expand_empty() {
     let xml = "<root><a/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let root = doc.document_element().unwrap();
     let children = doc.children(root);
     let opts = uppsala::XmlWriteOptions::compact().with_expand_empty_elements(true);
@@ -408,7 +411,7 @@ fn node_to_xml_with_expand_empty() {
 #[test]
 fn namespace_declarations_preserved() {
     let xml = r#"<root xmlns="http://example.com"><child/></root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let output = doc.to_xml();
     assert!(output.contains(r#"xmlns="http://example.com""#));
 }
@@ -416,7 +419,7 @@ fn namespace_declarations_preserved() {
 #[test]
 fn prefixed_namespace_preserved() {
     let xml = r#"<ns:root xmlns:ns="http://example.com"><ns:child/></ns:root>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let output = doc.to_xml();
     assert!(output.contains(r#"xmlns:ns="http://example.com""#));
     assert!(output.contains("<ns:root"));
@@ -661,7 +664,7 @@ fn writer_into_bytes() {
 #[test]
 fn write_to_with_pretty_options() {
     let xml = "<root><a/><b/></root>";
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     let opts = uppsala::XmlWriteOptions::pretty("  ");
     let mut buf: Vec<u8> = Vec::new();
     doc.write_to_with_options(&mut buf, &opts).unwrap();
@@ -685,7 +688,7 @@ fn ns_prefixless_element_emits_default_declaration() {
     let out = doc.to_xml();
     assert_eq!(out, r#"<Foo xmlns="urn:example"/>"#);
     // Output must re-parse and preserve the namespace.
-    let re = uppsala::parse(&out).unwrap();
+    let re = parse(&out).unwrap();
     let root = re.document_element().unwrap();
     assert!(re
         .element(root)
@@ -700,7 +703,7 @@ fn ns_prefixed_element_emits_prefix_declaration() {
     let el = doc.create_element(QName::full("p", "urn:foo", "Foo"));
     doc.append_child(doc.root(), el);
     assert_eq!(doc.to_xml(), r#"<p:Foo xmlns:p="urn:foo"/>"#);
-    assert!(uppsala::parse(&doc.to_xml()).is_ok());
+    assert!(parse(&doc.to_xml()).is_ok());
 }
 
 #[test]
@@ -743,7 +746,7 @@ fn ns_attribute_with_prefix_declared() {
         .unwrap()
         .set_attribute(QName::full("x", "urn:x", "attr"), Cow::Borrowed("v"));
     assert_eq!(doc.to_xml(), r#"<Foo xmlns:x="urn:x" x:attr="v"/>"#);
-    assert!(uppsala::parse(&doc.to_xml()).is_ok());
+    assert!(parse(&doc.to_xml()).is_ok());
 }
 
 #[test]
@@ -759,7 +762,7 @@ fn ns_attribute_without_prefix_gets_synthetic_prefix() {
         .unwrap()
         .set_attribute(QName::with_namespace("urn:x", "attr"), Cow::Borrowed("v"));
     let out = doc.to_xml();
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.document_element().unwrap();
     assert_eq!(
         re.element(root).unwrap().get_attribute_ns("urn:x", "attr"),
@@ -779,7 +782,7 @@ fn ns_no_namespace_child_undeclares_default() {
     let out = doc.to_xml();
     assert_eq!(out, r#"<Parent xmlns="urn:p"><Child xmlns=""/></Parent>"#);
     // The child must round-trip back to no namespace.
-    let re = uppsala::parse(&out).unwrap();
+    let re = parse(&out).unwrap();
     let proot = re.document_element().unwrap();
     let pchild = re
         .children(proot)
@@ -809,7 +812,7 @@ fn ns_parsed_document_roundtrips_byte_identical() {
     // The synthesis path must be a no-op for parsed documents: stored
     // declarations already satisfy every QName.
     let xml = r#"<p:Foo xmlns:p="urn:foo" xmlns="urn:def"><p:Bar/><Baz/></p:Foo>"#;
-    let doc = uppsala::parse(xml).unwrap();
+    let doc = parse(xml).unwrap();
     assert_eq!(doc.to_xml(), xml);
 }
 
@@ -831,7 +834,7 @@ fn ns_same_prefix_conflict_does_not_misbind() {
 
     let out = doc.to_xml();
     // Output must re-parse and the element must actually be in urn:new.
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.document_element().unwrap();
     assert_eq!(
         re.element(root).unwrap().name.namespace_uri.as_deref(),
@@ -863,7 +866,7 @@ fn ns_stored_default_does_not_capture_no_namespace_element() {
 
     let out = doc.to_xml();
     assert_eq!(out, r#"<Foo xmlns=""/>"#);
-    let re = uppsala::parse(&out).unwrap();
+    let re = parse(&out).unwrap();
     let root = re.document_element().unwrap();
     assert!(
         re.element(root).unwrap().name.namespace_uri.is_none(),
@@ -885,7 +888,7 @@ fn ns_xml_prefix_with_foreign_uri_is_reassigned() {
         !out.contains("<xml:Foo"),
         "reserved xml prefix misused: {out}"
     );
-    let re = uppsala::parse(&out).unwrap();
+    let re = parse(&out).unwrap();
     let root = re.document_element().unwrap();
     assert_eq!(
         re.element(root).unwrap().name.namespace_uri.as_deref(),
@@ -909,7 +912,7 @@ fn ns_xml_namespace_uses_reserved_prefix_without_declaration() {
     );
     let out = doc.to_xml();
     assert_eq!(out, r#"<r xml:lang="en"/>"#);
-    assert!(uppsala::parse(&out).is_ok());
+    assert!(parse(&out).is_ok());
 }
 
 #[test]
@@ -927,7 +930,7 @@ fn ns_xml_prefixed_attribute_with_foreign_uri_is_reassigned() {
         !out.contains("xml:a="),
         "reserved xml prefix misused on attribute: {out}"
     );
-    let re = uppsala::parse(&out).unwrap();
+    let re = parse(&out).unwrap();
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.get_attribute_ns("urn:custom", "a"), Some("v"), "{out}");
 }
@@ -947,7 +950,7 @@ fn ns_two_attributes_same_prefix_distinct_uris() {
         e.set_attribute(QName::full("p", "urn:b", "two"), Cow::Borrowed("2"));
     }
     let out = doc.to_xml();
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.get_attribute_ns("urn:a", "one"), Some("1"), "{out}");
     assert_eq!(root.get_attribute_ns("urn:b", "two"), Some("2"), "{out}");
@@ -970,7 +973,7 @@ fn ns_xmlns_prefix_does_not_masquerade_as_declaration() {
         !out.contains("<xmlns:Foo"),
         "reserved xmlns prefix misused as element name: {out}"
     );
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.document_element().unwrap();
     assert_eq!(
         re.element(root).unwrap().name.namespace_uri.as_deref(),
@@ -994,7 +997,7 @@ fn ns_xmlns_prefixed_attribute_does_not_masquerade_as_declaration() {
         !out.contains("xmlns:a="),
         "reserved xmlns prefix misused as attribute name: {out}"
     );
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.get_attribute_ns("urn:custom", "a"), Some("v"), "{out}");
 }
@@ -1014,8 +1017,8 @@ fn ns_reserved_prefix_strip_is_single_pass_idempotent() {
         "<a><xmlns:xmlns:V/></a>",
         "<xml:xml:foo/>",
     ] {
-        let out1 = uppsala::parse(input).unwrap().to_xml();
-        let out2 = uppsala::parse(&out1).unwrap().to_xml();
+        let out1 = parse(input).unwrap().to_xml();
+        let out2 = parse(&out1).unwrap().to_xml();
         assert_eq!(
             out1, out2,
             "serialization not a one-pass fixpoint for {input:?}: {out1:?} -> {out2:?}"
@@ -1054,7 +1057,7 @@ fn ns_xmlns_namespace_uri_is_dropped_on_serialization() {
         "XMLNS namespace serialized as a declaration: {out}"
     );
     // Output must be well-formed and re-parse with the namespace dropped.
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.document_element().unwrap();
     assert_eq!(
         re.element(root).unwrap().name.local_name.as_ref(),
@@ -1080,7 +1083,7 @@ fn ns_xmlns_namespace_attribute_is_dropped_on_serialization() {
         "forbidden XMLNS binding emitted on attribute: {out}"
     );
     // Well-formed and re-parses; the bare attribute survives without a namespace.
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
 }
@@ -1109,10 +1112,7 @@ fn ns_stored_reserved_declarations_are_filtered() {
     }
     let out = doc.to_xml();
     assert_eq!(out, "<r/>", "reserved declarations were emitted: {out}");
-    assert!(
-        uppsala::parse(&out).is_ok(),
-        "output not well-formed: {out}"
-    );
+    assert!(parse(&out).is_ok(), "output not well-formed: {out}");
 }
 
 #[test]
@@ -1136,7 +1136,7 @@ fn ns_invalid_inscope_prefix_is_not_reused() {
         e.set_attribute(QName::with_namespace("urn:x", "attr"), Cow::Borrowed("v"));
     }
     let out = doc.to_xml();
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(
         root.get_attribute_ns("urn:x", "attr"),
@@ -1163,7 +1163,7 @@ fn ns_reserved_element_prefix_without_uri_is_stripped() {
             out, "<Foo/>",
             "reserved prefix {prefix} not stripped: {out}"
         );
-        let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+        let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
         let root = re.element(re.document_element().unwrap()).unwrap();
         assert!(
             root.name.namespace_uri.is_none(),
@@ -1190,7 +1190,7 @@ fn ns_reserved_attribute_prefix_without_uri_is_stripped() {
             out, r#"<r a="v"/>"#,
             "reserved prefix {prefix} not stripped: {out}"
         );
-        let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+        let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
         let root = re.element(re.document_element().unwrap()).unwrap();
         assert_eq!(root.get_attribute("a"), Some("v"), "{out}");
     }
@@ -1207,7 +1207,7 @@ fn declare_namespace_emits_prefixed_declaration() {
     assert!(doc.declare_namespace(el, Some("p"), "urn:ex"));
     let out = doc.to_xml();
     assert_eq!(out, r#"<p:Foo xmlns:p="urn:ex"/>"#, "{out}");
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.name.namespace_uri.as_deref(), Some("urn:ex"), "{out}");
 }
@@ -1223,7 +1223,7 @@ fn declare_namespace_default_on_element_in_that_namespace() {
     assert!(doc.declare_namespace(el, None, "urn:ex"));
     let out = doc.to_xml();
     assert_eq!(out, r#"<kml xmlns="urn:ex"/>"#, "{out}");
-    let re = uppsala::parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
+    let re = parse(&out).unwrap_or_else(|e| panic!("must re-parse: {out} ({e})"));
     let root = re.element(re.document_element().unwrap()).unwrap();
     assert_eq!(root.name.namespace_uri.as_deref(), Some("urn:ex"), "{out}");
 }
@@ -1253,12 +1253,12 @@ fn ns_reserved_prefix_strip_undeclares_default_namespace() {
     // changing the element's namespace (and, when the default was the XML
     // namespace, breaking the byte-level fixpoint via `xml:` re-prefixing).
     let input = r#"<r xmlns="urn:x"><xmlns:c/></r>"#;
-    let out1 = uppsala::parse(input).unwrap().to_xml();
+    let out1 = parse(input).unwrap().to_xml();
     assert!(
         out1.contains(r#"<c xmlns=""/>"#),
         "stripped name must undeclare the default namespace: {out1}"
     );
-    let doc2 = uppsala::parse(&out1).unwrap();
+    let doc2 = parse(&out1).unwrap();
     assert_eq!(out1, doc2.to_xml(), "not a one-pass fixpoint: {out1}");
     let root = doc2.document_element().unwrap();
     let child = doc2.children_iter(root).next().unwrap();
@@ -1281,5 +1281,5 @@ fn ns_default_declaration_of_xml_namespace_is_never_emitted() {
     doc.declare_namespace(el, None, "http://www.w3.org/XML/1998/namespace");
     let out = doc.to_xml();
     assert_eq!(out, "<r/>", "forbidden default declaration must be dropped");
-    uppsala::parse(&out).expect("output must re-parse");
+    parse(&out).expect("output must re-parse");
 }
