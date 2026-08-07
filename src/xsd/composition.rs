@@ -774,13 +774,14 @@ fn reresolve_types_after_redefine(validator: &mut XsdValidator) {
             }
             // Re-resolve attribute group references
             if !ct.attribute_group_refs.is_empty() {
-                // Rebuild attributes: start with non-attributeGroup attributes.
-                // For simplicity, we re-derive all attributes from the attribute
-                // group refs. Any directly declared attributes on the complexType
-                // that aren't from group refs would need to be preserved, but
-                // in practice the external schema complexTypes only get attributes
-                // from attributeGroup refs (which are what we're re-resolving).
-                let mut new_attrs = Vec::new();
+                // Rebuild attributes starting from the attributes declared directly
+                // on this type (bare `<xsd:attribute>` children, preserved in
+                // `own_attributes`), then re-append the (possibly updated)
+                // attribute group contributions. Previously this rebuilt
+                // `attributes` from only the group refs, silently discarding any
+                // attributes declared directly on the type alongside an
+                // attributeGroup ref.
+                let mut new_attrs = ct.own_attributes.clone();
                 let mut new_wildcard = ct.attribute_wildcard.clone();
                 for ag_key in &ct.attribute_group_refs {
                     if let Some(ag) = validator.attribute_groups.get(ag_key) {
