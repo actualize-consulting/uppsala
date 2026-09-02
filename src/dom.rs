@@ -1417,10 +1417,11 @@ impl<'a> Document<'a> {
 
     /// Replace the attached document tree with a deep copy of another document.
     ///
-    /// The destination arena is kept alive: its previously attached top-level
-    /// nodes are detached, not overwritten. Any [`NodeId`] values previously
-    /// issued by this document therefore continue to identify the same old
-    /// nodes instead of aliasing nodes from the replacement tree.
+    /// The destination arena is kept alive. When both documents have a document
+    /// element, the existing document element's [`NodeId`] is reused and its
+    /// payload and children are replaced. This keeps root-level live views
+    /// attached to the replacement tree. Other previously attached nodes are
+    /// detached, not overwritten, so their ids cannot alias replacement nodes.
     ///
     /// XML declaration and DOCTYPE metadata are copied from `src`. Imported
     /// nodes contain owned strings and have no source byte ranges because those
@@ -1429,10 +1430,43 @@ impl<'a> Document<'a> {
         // Import first so the attached tree remains unchanged if a future
         // fallible import path is introduced. Document children can never be
         // virtual attribute nodes, so every valid child is importable.
-        let replacements: Vec<NodeId> = src
+        let mut replacements: Vec<NodeId> = src
             .children_iter(src.root())
             .filter_map(|child| self.import_subtree(src, child))
             .collect();
+
+        // Preserve the existing document element id so bindings with a live
+        // root proxy continue to observe the replacement. Descendant handles
+        // are detached because matching arbitrary old and new subtrees by
+        // position would make stale ids silently identify unrelated nodes.
+        if let (Some(old_root), Some((new_root_index, new_root))) = (
+            self.document_element(),
+            replacements
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, id)| matches!(self.node_kind(*id), Some(NodeKind::Element(_)))),
+        ) {
+            let new_element = self
+                .element(new_root)
+                .expect("replacement document element must be an element")
+                .clone();
+            for child in self.children(old_root) {
+                self.detach(child);
+            }
+            for child in self.children(new_root) {
+                self.append_child(old_root, child);
+            }
+            *self
+                .node_kind_mut(old_root)
+                .expect("existing document element id must remain valid") =
+                NodeKind::Element(new_element);
+            // The imported payload does not refer to the destination's source
+            // text; ensure source APIs report it as programmatically replaced.
+            self.nodes[old_root.0].byte_pos = 0;
+            self.nodes[old_root.0].byte_end_pos = 0;
+            replacements[new_root_index] = old_root;
+        }
 
         for child in self.children(self.root) {
             self.detach(child);
@@ -2608,7 +2642,7 @@ mod dom_tests {
     }
 
     #[test]
-    fn replace_tree_from_keeps_old_node_ids_detached() {
+    fn replace_tree_from_preserves_root_id_and_detaches_old_descendants() {
         let mut dst = crate::parse("<old><child/></old>").unwrap().into_static();
         let old_root = dst.document_element().unwrap();
         let old_child = dst.children(old_root)[0];
@@ -2619,23 +2653,22 @@ mod dom_tests {
                 .unwrap();
         dst.replace_tree_from(&src);
 
-        assert_eq!(dst.parent(old_root), None);
-        assert_eq!(dst.parent(old_child), Some(old_root));
-        assert_eq!(dst.element(old_root).unwrap().name.local_name, "old");
+        assert_eq!(dst.document_element(), Some(old_root));
+        assert_eq!(dst.parent(old_root), Some(dst.root()));
+        assert_eq!(dst.parent(old_child), None);
+        assert_eq!(dst.element(old_root).unwrap().name.local_name, "new");
         assert_eq!(
             dst.to_xml(),
             r#"<?xml version="1.0"?><new><value>42</value></new>"#
         );
         assert_eq!(dst.doctype.as_deref(), Some("<!DOCTYPE new>"));
 
-        let new_root = dst.document_element().unwrap();
-        assert_ne!(new_root, old_root);
-        assert_eq!(dst.node_range(new_root), None);
+        assert_eq!(dst.node_range(old_root), None);
 
         // Replacement invalidates the old XPath caches and rebuilding them
         // indexes only the newly attached tree.
         dst.prepare_xpath();
-        assert!(dst.parent(old_root).is_none());
+        assert_eq!(dst.parent(old_root), Some(dst.root()));
     }
 
     /// Without a mutation, a second `prepare_xpath()` is a no-op: it does not
