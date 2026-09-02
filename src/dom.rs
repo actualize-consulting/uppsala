@@ -1415,6 +1415,43 @@ impl<'a> Document<'a> {
         Some(new_id)
     }
 
+    /// Replace the attached document tree with a deep copy of another document.
+    ///
+    /// The destination arena is kept alive: its previously attached top-level
+    /// nodes are detached, not overwritten. Any [`NodeId`] values previously
+    /// issued by this document therefore continue to identify the same old
+    /// nodes instead of aliasing nodes from the replacement tree.
+    ///
+    /// XML declaration and DOCTYPE metadata are copied from `src`. Imported
+    /// nodes contain owned strings and have no source byte ranges because those
+    /// ranges belong to `src`'s input buffer.
+    pub fn replace_tree_from<'b>(&mut self, src: &Document<'b>) {
+        // Import first so the attached tree remains unchanged if a future
+        // fallible import path is introduced. Document children can never be
+        // virtual attribute nodes, so every valid child is importable.
+        let replacements: Vec<NodeId> = src
+            .children_iter(src.root())
+            .filter_map(|child| self.import_subtree(src, child))
+            .collect();
+
+        for child in self.children(self.root) {
+            self.detach(child);
+        }
+        for child in replacements {
+            self.append_child(self.root, child);
+        }
+
+        self.xml_declaration = src
+            .xml_declaration
+            .as_ref()
+            .cloned()
+            .map(XmlDeclaration::into_static);
+        self.doctype = src
+            .doctype
+            .as_ref()
+            .map(|doctype| Cow::Owned(doctype.to_string()));
+    }
+
     /// Recursive worker for [`import_subtree`](Self::import_subtree). Creates the
     /// node for `src_id` in this document, then imports each child and appends it.
     fn import_node_rec<'b>(&mut self, src: &Document<'b>, src_id: NodeId) -> Option<NodeId> {
@@ -2568,6 +2605,37 @@ mod dom_tests {
             Some("1"),
             "source must be untouched by destination mutation"
         );
+    }
+
+    #[test]
+    fn replace_tree_from_keeps_old_node_ids_detached() {
+        let mut dst = crate::parse("<old><child/></old>").unwrap().into_static();
+        let old_root = dst.document_element().unwrap();
+        let old_child = dst.children(old_root)[0];
+        dst.prepare_xpath();
+
+        let src =
+            crate::parse(r#"<?xml version="1.0"?><!DOCTYPE new><new><value>42</value></new>"#)
+                .unwrap();
+        dst.replace_tree_from(&src);
+
+        assert_eq!(dst.parent(old_root), None);
+        assert_eq!(dst.parent(old_child), Some(old_root));
+        assert_eq!(dst.element(old_root).unwrap().name.local_name, "old");
+        assert_eq!(
+            dst.to_xml(),
+            r#"<?xml version="1.0"?><new><value>42</value></new>"#
+        );
+        assert_eq!(dst.doctype.as_deref(), Some("<!DOCTYPE new>"));
+
+        let new_root = dst.document_element().unwrap();
+        assert_ne!(new_root, old_root);
+        assert_eq!(dst.node_range(new_root), None);
+
+        // Replacement invalidates the old XPath caches and rebuilding them
+        // indexes only the newly attached tree.
+        dst.prepare_xpath();
+        assert!(dst.parent(old_root).is_none());
     }
 
     /// Without a mutation, a second `prepare_xpath()` is a no-op: it does not

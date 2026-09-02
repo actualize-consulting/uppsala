@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-02
+
+### Added
+
+- Added `Document::replace_tree_from()` for replacing a document's attached
+  tree from another DOM while keeping the existing arena alive. Previously
+  issued `NodeId` handles therefore remain valid and refer to detached old
+  nodes rather than aliasing unrelated nodes in the replacement tree. This
+  enables bindings to replace documents safely after a serialize/process/parse
+  boundary without sharing Rust-owned DOM pointers between dynamic libraries.
+
 ## [0.9.0] - 2026-07-05
 
 ### Security
