@@ -691,6 +691,11 @@ pub(super) fn parse_complex_type(
                                                             doc, gc_child, ref_name, target_ns,
                                                         );
                                                         let key = (ag_ns, ag_local.to_string());
+                                                        // Track the unresolved reference for
+                                                        // potential re-resolution after redefine,
+                                                        // matching the top-level attributeGroup
+                                                        // branch above.
+                                                        attribute_group_refs.push(key.clone());
                                                         if let Some(ag) = attribute_groups.get(&key)
                                                         {
                                                             attributes.extend(
