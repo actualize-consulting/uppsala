@@ -783,24 +783,27 @@ fn nested_attribute_group_ref_in_extension_is_reresolved_after_redefine() {
     let valid_instance = r#"<Root xmlns="urn:test:redefine-nested-ag" id="w1" token="abc">
   <Name>Widget One</Name>
 </Root>"#;
-    let errors = validate(wrapper_schema, &wrapper_path, valid_instance);
-    assert!(
-        errors.is_empty(),
-        "Widget should accept the redefined group's 'token' attribute and no \
-         longer require the stale 'legacy' attribute, got: {:?}",
-        errors
-    );
+    let errors_valid = validate(wrapper_schema, &wrapper_path, valid_instance);
 
     let stale_instance = r#"<Root xmlns="urn:test:redefine-nested-ag" id="w1" legacy="old">
   <Name>Widget One</Name>
 </Root>"#;
-    let errors = validate(wrapper_schema, &wrapper_path, stale_instance);
+    let errors_stale = validate(wrapper_schema, &wrapper_path, stale_instance);
+
     fs::remove_dir_all(&dir).ok();
+
     assert!(
-        !errors.is_empty(),
+        errors_valid.is_empty(),
+        "Widget should accept the redefined group's 'token' attribute and no \
+         longer require the stale 'legacy' attribute, got: {:?}",
+        errors_valid
+    );
+
+    assert!(
+        !errors_stale.is_empty(),
         "Widget should reject the stale pre-redefine 'legacy' attribute and \
-         report the missing required 'token' attribute, got no errors which \
-         means the nested attributeGroup ref was never re-resolved"
+         report the missing required 'token' attribute, got: {:?}",
+        errors_stale
     );
 }
 
