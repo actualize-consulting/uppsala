@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-02
+
+### Fixed
+
+- Preserve the existing document element `NodeId` in
+  `Document::replace_tree_from()` so live root views observe the replacement.
+  Removed descendants are detached and replacement nodes have no stale source
+  ranges.
+
 ## [0.10.0] - 2026-09-02
 
 ### Added
