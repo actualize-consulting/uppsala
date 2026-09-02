@@ -551,6 +551,12 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
                 }
             }
             chameleon_fixup_attribute_decls(&mut ct.attributes, target_ns);
+            chameleon_fixup_attribute_decls(&mut ct.own_attributes, target_ns);
+            for ag_key in &mut ct.attribute_group_refs {
+                if ag_key.0.is_none() {
+                    ag_key.0 = target_ns.clone();
+                }
+            }
             chameleon_fixup_content_model(&mut ct.content, target_ns);
         }
         TypeDef::Simple(_) => {
