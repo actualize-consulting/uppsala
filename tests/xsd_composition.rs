@@ -807,6 +807,76 @@ fn nested_attribute_group_ref_in_extension_is_reresolved_after_redefine() {
     );
 }
 
+/// Regression: `reresolve_types_after_redefine` used to rebuild a complex
+/// type's attribute wildcard by starting from the type's *stale*
+/// `attribute_wildcard` (already seeded with the OLD attributeGroup's
+/// `anyAttribute`) and intersecting in the redefined group's wildcard. When a
+/// redefine removes the wildcard entirely (or narrows its namespace
+/// constraint), that stale starting point survives the intersection, so the
+/// type never actually adopts the redefined group — a foreign-namespace
+/// attribute that the redefine was meant to disallow remains (incorrectly)
+/// valid. The fix rebuilds the wildcard from the type's own directly-declared
+/// `anyAttribute` (`own_wildcard`, `None` here) plus the *live* groups, so
+/// removing the wildcard in the redefine takes effect.
+///
+/// Schema layout:
+///   base.xsd — declares attributeGroup "Extensible" with an `##other`
+///     wildcard, and complexType "Widget" with `attributeGroup ref="Extensible"`.
+///   wrapper.xsd — `xs:redefine`s base.xsd, redefining "Extensible" to drop
+///     the wildcard entirely (no `anyAttribute`).
+#[test]
+fn redefine_removes_attribute_group_wildcard() {
+    let dir = mkdir_unique("redefine-wildcard-remove");
+
+    let base_path = dir.join("base.xsd");
+    fs::write(
+        &base_path,
+        r###"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:redefine-wildcard"
+           xmlns="urn:test:redefine-wildcard"
+           elementFormDefault="qualified">
+  <xs:attributeGroup name="Extensible">
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:attributeGroup>
+  <xs:complexType name="Widget">
+    <xs:sequence>
+      <xs:element name="Name" type="xs:string"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="Extensible"/>
+  </xs:complexType>
+  <xs:element name="Root" type="Widget"/>
+</xs:schema>"###,
+    )
+    .unwrap();
+
+    let wrapper_path = dir.join("wrapper.xsd");
+    let wrapper_schema = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:redefine-wildcard"
+           xmlns="urn:test:redefine-wildcard"
+           elementFormDefault="qualified">
+  <xs:redefine schemaLocation="base.xsd">
+    <xs:attributeGroup name="Extensible">
+    </xs:attributeGroup>
+  </xs:redefine>
+</xs:schema>"#;
+    fs::write(&wrapper_path, wrapper_schema).unwrap();
+
+    let instance = r#"<Root xmlns="urn:test:redefine-wildcard" xmlns:f="urn:test:foreign" f:extra="1">
+  <Name>Widget One</Name>
+</Root>"#;
+
+    let errors = validate(wrapper_schema, &wrapper_path, instance);
+    fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        !errors.is_empty(),
+        "foreign-namespace attribute should be rejected once the redefine \
+         removes the attributeGroup's wildcard, but validation reported no errors"
+    );
+}
+
 /// Regression test: a chameleon-included (no-namespace) module's complex
 /// type must have both `own_attributes` and `attribute_group_refs` re-keyed
 /// into the including schema's target namespace, not just `attributes`.

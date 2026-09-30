@@ -787,8 +787,15 @@ fn reresolve_types_after_redefine(validator: &mut XsdValidator) {
                 // `attributes` from only the group refs, silently discarding any
                 // attributes declared directly on the type alongside an
                 // attributeGroup ref.
+                //
+                // The wildcard is rebuilt the same way: starting from the type's own
+                // directly-declared `anyAttribute` (`own_wildcard`), not from the stale
+                // `attribute_wildcard`, which already has the OLD group's wildcard baked
+                // in. Starting from the stale value would intersect the redefined
+                // group's wildcard with the one it's replacing, so a redefine that
+                // removes or broadens the wildcard would never take effect.
                 let mut new_attrs = ct.own_attributes.clone();
-                let mut new_wildcard = ct.attribute_wildcard.clone();
+                let mut new_wildcard = ct.own_wildcard.clone();
                 for ag_key in &ct.attribute_group_refs {
                     if let Some(ag) = validator.attribute_groups.get(ag_key) {
                         new_attrs.extend(ag.attributes.iter().cloned());

@@ -441,6 +441,11 @@ pub(super) fn parse_complex_type(
     // after `xs:redefine` without discarding attributes declared directly on the type.
     let mut own_attributes: Vec<AttributeDecl> = Vec::new();
     let mut attribute_wildcard: Option<AttributeWildcard> = None;
+    // The `xs:anyAttribute` declared directly on this type (not contributed by an
+    // `<xsd:attributeGroup ref="...">`). Tracked separately, mirroring `own_attributes`,
+    // so `reresolve_types_after_redefine` can rebuild `attribute_wildcard` after
+    // `xs:redefine` without starting from the stale group-derived wildcard.
+    let mut own_wildcard: Option<AttributeWildcard> = None;
     let mut base_type: Option<(Option<String>, String)> = None;
     let mut derived_by_extension: Option<bool> = None;
     let mut group_ref: Option<(Option<String>, String)> = None;
@@ -542,6 +547,10 @@ pub(super) fn parse_complex_type(
                     // Intersect with existing wildcard if present
                     attribute_wildcard = match attribute_wildcard {
                         Some(existing_wc) => existing_wc.intersect(&new_wc),
+                        None => Some(new_wc.clone()),
+                    };
+                    own_wildcard = match own_wildcard {
+                        Some(existing_wc) => existing_wc.intersect(&new_wc),
                         None => Some(new_wc),
                     };
                 }
@@ -596,6 +605,10 @@ pub(super) fn parse_complex_type(
                                     }
                                     // Parse attributes and anyAttribute within extension/restriction
                                     let mut local_wildcard: Option<AttributeWildcard> = None;
+                                    // The `xs:anyAttribute` declared directly within this
+                                    // extension/restriction, excluding any attributeGroup-derived
+                                    // wildcard. Mirrors `own_wildcard` at the top level.
+                                    let mut local_own_wildcard: Option<AttributeWildcard> = None;
                                     for gc_child in doc.children(grandchild) {
                                         if let Some(NodeKind::Element(gc_child_elem)) =
                                             doc.node_kind(gc_child)
@@ -619,10 +632,12 @@ pub(super) fn parse_complex_type(
                                                     attributes.push(decl);
                                                 }
                                                 "anyAttribute" => {
-                                                    local_wildcard = Some(parse_any_attribute(
+                                                    let wc = parse_any_attribute(
                                                         gc_child_elem,
                                                         target_ns,
-                                                    ));
+                                                    );
+                                                    local_wildcard = Some(wc.clone());
+                                                    local_own_wildcard = Some(wc);
                                                 }
                                                 "sequence" => {
                                                     let min_occ = gc_child_elem
@@ -731,6 +746,7 @@ pub(super) fn parse_complex_type(
                                         // If no wildcard in restriction, it means no wildcard
                                         attribute_wildcard = local_wildcard;
                                     }
+                                    own_wildcard = local_own_wildcard;
                                 }
                                 _ => {}
                             }
@@ -749,6 +765,7 @@ pub(super) fn parse_complex_type(
         own_attributes,
         mixed,
         attribute_wildcard,
+        own_wildcard,
         base_type,
         derived_by_extension,
         block_extension: block_ext,

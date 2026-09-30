@@ -298,6 +298,14 @@ pub(crate) struct ComplexTypeDef {
     pub(super) own_attributes: Vec<AttributeDecl>,
     pub(super) mixed: bool,
     pub(super) attribute_wildcard: Option<AttributeWildcard>,
+    /// The `xs:anyAttribute` declared directly on this type (bare child of
+    /// `complexType`/`extension`/`restriction`), excluding any wildcard contributed by
+    /// an `<xsd:attributeGroup ref="...">`. Preserved separately so
+    /// `reresolve_types_after_redefine` can rebuild `attribute_wildcard` from this plus
+    /// the live attribute groups after `xs:redefine`, instead of intersecting the
+    /// replacement group's wildcard with the stale one already baked into
+    /// `attribute_wildcard`.
+    pub(super) own_wildcard: Option<AttributeWildcard>,
     /// Base type reference (namespace, local_name) if derived.
     pub(super) base_type: Option<(Option<String>, String)>,
     /// Whether this type was derived by extension (true) or restriction (false).
