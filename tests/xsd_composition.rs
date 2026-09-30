@@ -877,6 +877,100 @@ fn redefine_removes_attribute_group_wildcard() {
     );
 }
 
+/// Regression: exercises the wildcard *intersection* path in
+/// `reresolve_types_after_redefine` (as opposed to the previous test, where
+/// the type had no directly-declared `anyAttribute` and so only tested the
+/// group's wildcard in isolation). Here the type has its own `##any`
+/// `anyAttribute` (`own_wildcard`) alongside an `attributeGroup ref` whose
+/// wildcard changes across the redefine, so the effective, post-redefine
+/// wildcard must be recomputed as `own_wildcard.intersect(live_group_wildcard)`
+/// — not the type's own wildcard alone, and not the stale pre-redefine
+/// intersection.
+///
+/// Schema layout:
+///   base.xsd — complexType "Widget" declares its own `##any` `anyAttribute`
+///     directly, plus `attributeGroup ref="Extensible"`, whose own wildcard is
+///     `##other` (so the pre-redefine effective constraint is
+///     `##any ∩ ##other` = "any namespace except the target namespace and
+///     except unqualified" — a foreign-namespace attribute is allowed, a
+///     target-namespace-qualified one is not).
+///   wrapper.xsd — `xs:redefine`s base.xsd, replacing "Extensible"'s wildcard
+///     with `##targetNamespace` (so the post-redefine effective constraint is
+///     `##any ∩ ##targetNamespace` = "only the target namespace" — the
+///     opposite polarity: a target-namespace attribute is now allowed, a
+///     foreign-namespace one is not).
+#[test]
+fn redefine_recomputes_wildcard_intersection_with_own_anyattribute() {
+    let dir = mkdir_unique("redefine-wildcard-intersect");
+
+    let base_path = dir.join("base.xsd");
+    fs::write(
+        &base_path,
+        r###"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:redefine-wildcard-intersect"
+           xmlns="urn:test:redefine-wildcard-intersect"
+           elementFormDefault="qualified">
+  <xs:attributeGroup name="Extensible">
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:attributeGroup>
+  <xs:complexType name="Widget">
+    <xs:sequence>
+      <xs:element name="Name" type="xs:string"/>
+    </xs:sequence>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
+    <xs:attributeGroup ref="Extensible"/>
+  </xs:complexType>
+  <xs:element name="Root" type="Widget"/>
+</xs:schema>"###,
+    )
+    .unwrap();
+
+    let wrapper_path = dir.join("wrapper.xsd");
+    let wrapper_schema = r###"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test:redefine-wildcard-intersect"
+           xmlns="urn:test:redefine-wildcard-intersect"
+           elementFormDefault="qualified">
+  <xs:redefine schemaLocation="base.xsd">
+    <xs:attributeGroup name="Extensible">
+      <xs:anyAttribute namespace="##targetNamespace" processContents="lax"/>
+    </xs:attributeGroup>
+  </xs:redefine>
+</xs:schema>"###;
+    fs::write(&wrapper_path, wrapper_schema).unwrap();
+
+    let target_ns_instance = r#"<Root xmlns="urn:test:redefine-wildcard-intersect"
+      xmlns:t="urn:test:redefine-wildcard-intersect" t:extra="1">
+  <Name>Widget One</Name>
+</Root>"#;
+    let errors_target_ns = validate(wrapper_schema, &wrapper_path, target_ns_instance);
+
+    let foreign_ns_instance = r#"<Root xmlns="urn:test:redefine-wildcard-intersect"
+      xmlns:f="urn:test:foreign" f:extra="1">
+  <Name>Widget One</Name>
+</Root>"#;
+    let errors_foreign_ns = validate(wrapper_schema, &wrapper_path, foreign_ns_instance);
+
+    fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        errors_target_ns.is_empty(),
+        "a target-namespace-qualified attribute should be valid under the \
+         post-redefine intersection of the type's own '##any' anyAttribute \
+         and the redefined group's '##targetNamespace' wildcard, got: {:?}",
+        errors_target_ns
+    );
+    assert!(
+        !errors_foreign_ns.is_empty(),
+        "a foreign-namespace attribute should be rejected under the \
+         post-redefine intersection ('##any' ∩ '##targetNamespace'), since \
+         the redefined group's wildcard no longer allows foreign namespaces \
+         — got no errors, meaning the stale pre-redefine '##other' \
+         intersection was incorrectly retained"
+    );
+}
+
 /// Regression test: a chameleon-included (no-namespace) module's complex
 /// type must have both `own_attributes` and `attribute_group_refs` re-keyed
 /// into the including schema's target namespace, not just `attributes`.
