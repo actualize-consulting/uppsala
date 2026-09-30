@@ -962,3 +962,81 @@ fn chameleon_include_attribute_group_ref_survives_unrelated_redefine() {
         errors
     );
 }
+
+/// Regression test: a chameleon-included (no-namespace) module's complex
+/// type must have its `group_ref` (model group reference from a bare
+/// `<xs:group ref="...">`) re-keyed into the including schema's target
+/// namespace, just like `attribute_group_refs` is. Otherwise, once the
+/// referenced model group is redefined, `reresolve_types_after_redefine`'s
+/// `validator.model_groups.get(mg_key)` lookup uses the stale `None`-keyed
+/// reference, misses the group (which was itself re-keyed to the target
+/// namespace during chameleon merge), and silently leaves the type's content
+/// model stuck on the pre-redefine group definition.
+///
+/// Schema layout:
+///   module.xsd — no `targetNamespace`; declares model group "Body"
+///     (element `Name`) and complexType "Widget" whose content is a bare
+///     `<xs:group ref="Body"/>`.
+///   wrapper.xsd — `xs:redefine`s module.xsd, chameleon-including it into
+///     `urn:cham-redefine-group`, and redefines "Body" to replace its
+///     content with element `Title` instead of `Name`.
+#[test]
+fn chameleon_include_group_ref_survives_redefine() {
+    let dir = mkdir_unique("chameleon-redefine-group");
+
+    let module_path = dir.join("module.xsd");
+    fs::write(
+        &module_path,
+        r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified">
+  <xs:group name="Body">
+    <xs:sequence>
+      <xs:element name="Name" type="xs:string"/>
+    </xs:sequence>
+  </xs:group>
+  <xs:complexType name="Widget">
+    <xs:group ref="Body"/>
+  </xs:complexType>
+  <xs:element name="Root" type="Widget"/>
+</xs:schema>"#,
+    )
+    .unwrap();
+
+    let wrapper_path = dir.join("wrapper.xsd");
+    let wrapper_schema = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:cham-redefine-group"
+           xmlns="urn:cham-redefine-group"
+           elementFormDefault="qualified">
+  <xs:redefine schemaLocation="module.xsd">
+    <xs:group name="Body">
+      <xs:sequence>
+        <xs:element name="Title" type="xs:string"/>
+      </xs:sequence>
+    </xs:group>
+  </xs:redefine>
+</xs:schema>"#;
+    fs::write(&wrapper_path, wrapper_schema).unwrap();
+
+    let redefined_instance = r#"<t:Root xmlns:t="urn:cham-redefine-group"><t:Title>Foo</t:Title></t:Root>"#;
+    let errors_redefined = validate(wrapper_schema, &wrapper_path, redefined_instance);
+
+    let stale_instance = r#"<t:Root xmlns:t="urn:cham-redefine-group"><t:Name>Foo</t:Name></t:Root>"#;
+    let errors_stale = validate(wrapper_schema, &wrapper_path, stale_instance);
+
+    fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        errors_redefined.is_empty(),
+        "chameleon-included Widget should accept the redefined group's \
+         'Title' element, got: {:?}",
+        errors_redefined
+    );
+    assert!(
+        !errors_stale.is_empty(),
+        "chameleon-included Widget should reject the stale pre-redefine \
+         'Name' element once its group has been redefined, got: {:?}",
+        errors_stale
+    );
+}

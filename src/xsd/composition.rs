@@ -557,6 +557,19 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
                     ag_key.0 = target_ns.clone();
                 }
             }
+            // Fix up the unresolved model group reference the same way as
+            // attribute_group_refs above: model groups themselves are re-keyed
+            // into the including schema's target namespace during chameleon
+            // merge (see the `model_groups` re-keying loop), so a bare
+            // `<xsd:group ref="Foo"/>` recorded with a `None` namespace must
+            // follow suit. Otherwise, `reresolve_types_after_redefine`'s
+            // `model_groups.get(mg_key)` lookup would miss after a later
+            // `xs:redefine` of that group, silently leaving `ct.content` stale.
+            if let Some((ref mut ns, _)) = ct.group_ref {
+                if ns.is_none() {
+                    *ns = target_ns.clone();
+                }
+            }
             chameleon_fixup_content_model(&mut ct.content, target_ns);
         }
         TypeDef::Simple(_) => {
